@@ -1186,6 +1186,7 @@ from rocq_mcp.interactive import (  # noqa: E402
     run_query,
     run_start,
     run_check,
+    run_check_proof,
     run_step_multi,
     run_toc,
     run_notations,
@@ -2022,6 +2023,52 @@ async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
             "error": "Internal error: no MCP context.",
         }
     return _build_diag_snapshot(ctx.lifespan_context)
+
+
+# ---------------------------------------------------------------------------
+# Tool: rocq_check_proof
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+async def rocq_check_proof(
+    file: str,
+    theorem: str,
+    workspace: str = "",
+    timeout: int = 0,
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Verify a theorem's proof by replaying it from the .v file.
+
+    Reads the proof body from the file, starts an interactive session for
+    the theorem, and replays each proof step.  Much faster than
+    rocq_compile_file for checking a single theorem: coq-lsp caches
+    imports and prior definitions, so only the target proof is re-checked.
+
+    Use this instead of rocq_compile_file when you only need to verify
+    that one specific theorem's proof is correct after editing it.
+
+    On error, returns which tactic failed and the goals at that point.
+
+    Args:
+        file: Path to the .v file (relative to workspace).
+        theorem: Name of the theorem to check.
+        workspace: Directory to use as workspace (default: ROCQ_WORKSPACE env var).
+        timeout: Timeout in seconds (default: ROCQ_PET_TIMEOUT env var).
+    """
+    workspace = workspace or ROCQ_WORKSPACE
+    timeout = timeout if timeout is not None and timeout > 0 else ROCQ_PET_TIMEOUT
+
+    if ctx is None:
+        return {"success": False, "error": "Internal error: no MCP context."}
+
+    return await run_check_proof(
+        file=file,
+        theorem=theorem,
+        workspace=workspace,
+        timeout=float(timeout),
+        lifespan_state=ctx.lifespan_context,
+    )
 
 
 # ---------------------------------------------------------------------------

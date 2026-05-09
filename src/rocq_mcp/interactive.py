@@ -44,8 +44,9 @@ from rocq_mcp.verify import _check_forbidden_commands
 # ``from server import _pet_lock`` would capture a stale reference.
 import rocq_mcp.server as _server
 
-# _split_rocq_sentences is in compile — import directly (no cycle).
-from rocq_mcp.compile import _split_rocq_sentences
+# _split_rocq_sentences and _extract_source_range are in compile — import
+# directly (no cycle).
+from rocq_mcp.compile import _split_rocq_sentences, _extract_source_range
 
 # ---------------------------------------------------------------------------
 # Goal formatting helper (shared by run_check, run_step_multi)
@@ -1914,4 +1915,212 @@ async def run_step_multi(
         "rocq_step_multi",
         timeout=hard_timeout,
         partial_state=partial_state,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: rocq_check_proof — replay a theorem's proof from a .v file
+# ---------------------------------------------------------------------------
+
+
+def _find_toc_element(toc_result: list[Any], theorem: str) -> Any | None:
+    """Find a TocElement by theorem name, searching recursively."""
+    for _section_name, elements in toc_result:
+        for elem in elements:
+            if elem.name and elem.name.v == theorem:
+                return elem
+            if elem.children:
+                for child in elem.children:
+                    if child.name and child.name.v == theorem:
+                        return child
+    return None
+
+
+def _extract_proof_body(
+    content: str, toc_elem: Any
+) -> tuple[list[str], str | None]:
+    """Extract proof body sentences from file content using toc range.
+
+    The toc range covers the theorem *statement* only (up to the ``.``
+    terminator).  The proof body is everything after the statement until
+    ``Qed.``, ``Defined.``, or ``Admitted.``.
+
+    Returns (sentences, error).  On success error is None.
+    """
+    lines = content.splitlines()
+    stmt_end_line = toc_elem.range.end.line if toc_elem.range else 0
+    stmt_end_char = toc_elem.range.end.character if toc_elem.range else 0
+
+    # Extract everything from after the statement to end of file
+    if stmt_end_line >= len(lines):
+        return [], f"Theorem range ends beyond file (line {stmt_end_line})"
+
+    # Text after the statement's terminating '.'
+    after_stmt = lines[stmt_end_line][stmt_end_char:]
+    remaining_lines = [after_stmt] + lines[stmt_end_line + 1 :]
+    remaining_text = "\n".join(remaining_lines)
+
+    # Split into sentences
+    all_sentences = _split_rocq_sentences(remaining_text)
+    if not all_sentences:
+        return [], "No proof body found after theorem statement"
+
+    # Collect sentences up to and including Qed./Defined./Admitted.
+    proof_sentences: list[str] = []
+    for s in all_sentences:
+        proof_sentences.append(s)
+        stripped = s.strip().rstrip(".")
+        if stripped in ("Qed", "Defined", "Admitted"):
+            break
+
+    return proof_sentences, None
+
+
+async def run_check_proof(
+    file: str,
+    theorem: str,
+    workspace: str,
+    timeout: float,
+    lifespan_state: dict[str, Any],
+) -> dict[str, Any]:
+    """Replay a theorem's proof from a .v file via pet.start + pet.run.
+
+    Reads the proof body from the file, starts a pet session for the
+    theorem, and executes each proof sentence.  This verifies the proof
+    without running coqc on the entire file, benefiting from coq-lsp's
+    incremental caching of imports and prior definitions.
+
+    Returns success/failure with detailed error information on which
+    tactic failed.
+    """
+    # Validate inputs
+    if not file:
+        return {"success": False, "error": "file is required."}
+    if not theorem:
+        return {"success": False, "error": "theorem is required."}
+
+    try:
+        resolved_file = _server._resolve_file_in_workspace(file, workspace)
+    except (ValueError, FileNotFoundError) as e:
+        return {"success": False, "error": str(e)}
+
+    try:
+        content = Path(resolved_file).read_text()
+    except (OSError, PermissionError) as e:
+        return {"success": False, "error": f"Cannot read file: {e}"}
+
+    if len(content) > _server.ROCQ_MAX_SOURCE_SIZE:
+        return {
+            "success": False,
+            "error": (
+                f"File too large ({len(content)} bytes, "
+                f"max {_server.ROCQ_MAX_SOURCE_SIZE})."
+            ),
+        }
+
+    _timeout = timeout if timeout > 0 else lifespan_state["pet_timeout"]
+
+    def _execute(pet: Any) -> dict[str, Any]:
+        try:
+            from pytanque import PetanqueError
+        except ImportError:
+            return {
+                "success": False,
+                "error": (
+                    "pytanque is not installed. "
+                    "Install with: pip install 'rocq-mcp[interactive]'"
+                ),
+            }
+
+        # Force workspace re-set so coq-lsp re-reads the file from disk
+        lifespan_state["current_workspace"] = None
+        _server._set_workspace_if_needed(pet, workspace, lifespan_state)
+
+        # Get toc to find theorem range
+        try:
+            toc_result = pet.toc(resolved_file)
+        except PetanqueError as e:
+            return {
+                "success": False,
+                "error": f"Failed to get file structure: {e.message}",
+            }
+
+        toc_elem = _find_toc_element(toc_result, theorem)
+        if toc_elem is None:
+            return {
+                "success": False,
+                "error": f"Theorem '{theorem}' not found in file table of contents.",
+            }
+
+        # Extract proof body from the current file content
+        proof_sentences, extract_err = _extract_proof_body(content, toc_elem)
+        if extract_err:
+            return {"success": False, "error": extract_err}
+
+        # Check for forbidden commands in the proof body
+        proof_text = " ".join(proof_sentences)
+        forbidden = _check_forbidden_commands(proof_text)
+        if forbidden:
+            return {"success": False, "error": forbidden}
+
+        # Start proof session
+        try:
+            state = pet.start(resolved_file, theorem)
+        except PetanqueError as e:
+            return {
+                "success": False,
+                "error": f"Failed to start proof for '{theorem}': {e.message}",
+            }
+
+        start_time = time.monotonic()
+
+        # Replay each sentence
+        for i, cmd in enumerate(proof_sentences):
+            try:
+                if _is_timeout_eligible(cmd) and _timeout >= 1:
+                    rocq_timeout = max(1, int(_timeout / len(proof_sentences)))
+                else:
+                    rocq_timeout = None
+                state = pet.run(state, cmd, timeout=rocq_timeout)
+            except PetanqueError as e:
+                if not _server._pet_alive(lifespan_state.get("pet_client")):
+                    raise
+                goals = _try_get_goals(pet, state)
+                return {
+                    "success": False,
+                    "error": e.message,
+                    "failed_command": cmd,
+                    "command_index": i,
+                    "commands_run": i,
+                    "goals_at_failure": goals,
+                }
+
+        elapsed = time.monotonic() - start_time
+
+        # Get final goals
+        try:
+            complete = pet.complete_goals(state)
+            goals_list = complete.goals if complete else []
+            goals_text = _format_goals(goals_list)
+        except Exception:
+            goals_text = "(goals unavailable)"
+
+        return {
+            "success": True,
+            "proof_finished": state.proof_finished,
+            "goals": goals_text or "No goals remaining.",
+            "commands_run": len(proof_sentences),
+            "check_time_ms": int(elapsed * 1000),
+        }
+
+    if _timeout >= 1:
+        hard_timeout = _compute_hard_timeout(_timeout)
+    else:
+        hard_timeout = _timeout
+
+    return await _server._run_with_pet(
+        _execute,
+        lifespan_state,
+        "Check proof from file",
+        timeout=hard_timeout,
     )
