@@ -32,6 +32,15 @@ ROCQ_PET_TIMEOUT: float = float(os.environ.get("ROCQ_PET_TIMEOUT", "30"))
 ROCQ_COQC_BINARY: str = os.environ.get("ROCQ_COQC_BINARY", "coqc")
 ROCQ_MAX_SOURCE_SIZE: int = int(os.environ.get("ROCQ_MAX_SOURCE_SIZE", "1000000"))
 
+# Pet connection mode.  "stdio" (default) spawns a pet subprocess that
+# is killed on MCP server shutdown.  "socket" or "http" connect to an
+# external pet server that persists across sessions, keeping coq-lsp
+# caches warm.  Set ROCQ_PET_HOST and ROCQ_PET_PORT accordingly.
+ROCQ_PET_MODE: str = os.environ.get("ROCQ_PET_MODE", "stdio").lower()
+ROCQ_PET_HOST: str = os.environ.get("ROCQ_PET_HOST", "127.0.0.1")
+ROCQ_PET_PORT: int = int(os.environ.get("ROCQ_PET_PORT", "8765"))
+_PET_IS_EXTERNAL: bool = ROCQ_PET_MODE in ("socket", "http")
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -51,7 +60,10 @@ async def app_lifespan(server: Any) -> Any:
     finally:
         client = state.get("pet_client")
         if client:
-            _kill_pet(client)
+            if _PET_IS_EXTERNAL:
+                _close_pet(client)
+            else:
+                _kill_pet(client)
         # Clean up cache file
         ws = state.get("workspace")
         if ws:
@@ -414,7 +426,12 @@ async def _force_release_pet_lock() -> None:
 
 
 def _ensure_pet(lifespan_state: dict[str, Any]) -> Any:
-    """Lazy-initialize pet subprocess. Must be called with _pet_lock held."""
+    """Lazy-initialize pet connection. Must be called with _pet_lock held.
+
+    In stdio mode (default), spawns a pet subprocess.  In socket/http
+    mode, connects to an external pet server that persists across MCP
+    sessions.
+    """
     try:
         from pytanque import Pytanque, PytanqueMode
     except ImportError:
@@ -425,29 +442,47 @@ def _ensure_pet(lifespan_state: dict[str, Any]) -> Any:
     pet = lifespan_state.get("pet_client")
     if pet is None or not _pet_alive(pet):
         if pet is not None:
-            _kill_pet(pet)  # Full cleanup: kill + wait + close FDs
+            if _PET_IS_EXTERNAL:
+                _close_pet(pet)
+            else:
+                _kill_pet(pet)  # Full cleanup: kill + wait + close FDs
             for hook in _pet_invalidation_hooks:
                 hook()
-        pet = Pytanque(mode=PytanqueMode.STDIO)
+        mode_map = {
+            "stdio": PytanqueMode.STDIO,
+            "socket": PytanqueMode.SOCKET,
+            "http": PytanqueMode.HTTP,
+        }
+        mode = mode_map.get(ROCQ_PET_MODE, PytanqueMode.STDIO)
+        if _PET_IS_EXTERNAL:
+            pet = Pytanque(host=ROCQ_PET_HOST, port=ROCQ_PET_PORT, mode=mode)
+        else:
+            pet = Pytanque(mode=mode)
         pet.connect()
-        # Attempt process group setup for clean kill.
-        # May fail on macOS if child already exec'd -- that's OK,
-        # os.getpgid at kill time handles it.
-        if pet.process:
+        pet._own_pgrp = False
+        # Attempt process group setup for clean kill (stdio only).
+        if not _PET_IS_EXTERNAL and pet.process:
             try:
                 os.setpgid(pet.process.pid, pet.process.pid)
                 pet._own_pgrp = True
             except OSError:
-                pet._own_pgrp = False
-        else:
-            pet._own_pgrp = False
+                pass
         lifespan_state["pet_client"] = pet
     return pet
 
 
 def _pet_alive(pet: Any) -> bool:
-    """Check if the pet subprocess is still running."""
-    return pet is not None and pet.process is not None and pet.process.poll() is None
+    """Check if the pet connection is still usable.
+
+    For stdio mode, checks that the subprocess is running.
+    For socket/http mode (external pet), assumes alive if the client
+    object exists — connection errors are caught at call time.
+    """
+    if pet is None:
+        return False
+    if _PET_IS_EXTERNAL:
+        return True  # No subprocess; errors surface on next RPC call
+    return pet.process is not None and pet.process.poll() is None
 
 
 def _kill_pet(pet: Any) -> None:
@@ -500,6 +535,19 @@ def _try_close_pet(pet: Any) -> None:
             pass
 
 
+def _close_pet(pet: Any) -> None:
+    """Close the connection to an external pet server without killing it.
+
+    Used in socket/http mode where the pet process is managed externally.
+    """
+    if pet is None:
+        return
+    try:
+        pet.close()
+    except Exception:
+        pass
+
+
 def _invalidate_pet(lifespan_state: dict[str, Any]) -> None:
     """Kill pet and set to None so next call respawns.
 
@@ -517,7 +565,10 @@ def _invalidate_pet(lifespan_state: dict[str, Any]) -> None:
     """
     pet = lifespan_state.get("pet_client")
     if pet:
-        _kill_pet(pet)
+        if _PET_IS_EXTERNAL:
+            _close_pet(pet)
+        else:
+            _kill_pet(pet)
     lifespan_state["pet_client"] = None
     lifespan_state["current_workspace"] = None
     for hook in _pet_invalidation_hooks:
