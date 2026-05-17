@@ -54,6 +54,7 @@ async def app_lifespan(server: Any) -> Any:
         "workspace": ROCQ_WORKSPACE,
         "pet_timeout": ROCQ_PET_TIMEOUT,
         "current_workspace": None,
+        "coqtop_checker": None,
     }
     try:
         yield state
@@ -64,6 +65,9 @@ async def app_lifespan(server: Any) -> Any:
                 _close_pet(client)
             else:
                 _kill_pet(client)
+        checker = state.get("coqtop_checker")
+        if checker:
+            checker.stop()
         # Clean up cache file
         ws = state.get("workspace")
         if ws:
@@ -1250,6 +1254,66 @@ async def rocq_check(
         lifespan_state=ctx.lifespan_context,
         from_state=from_state,
     )
+
+
+# ---------------------------------------------------------------------------
+# Tool: rocq_coqtop_compile
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+def rocq_coqtop_compile(
+    file: str,
+    workspace: str = "",
+    timeout: int = 0,
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Incrementally check a .v file using a persistent coqtop process.
+
+    Much faster than rocq_compile_file for iterative development:
+    keeps a coqtop process alive and only re-checks from the first
+    changed line.  Everything before the change is cached in coqtop's
+    state — not re-processed.
+
+    Typical speedup: if you edit one tactic near the end of a heavy
+    file, only that tactic (and everything after it) is re-checked.
+    The slow imports and definitions above are instant.
+
+    Use this instead of rocq_compile_file when iterating on a proof.
+    Use rocq_compile_file for final authoritative verification.
+
+    Args:
+        file: Path to the .v file (relative to workspace).
+        workspace: Directory to use as workspace (default: ROCQ_WORKSPACE env var).
+        timeout: Timeout in seconds (default: ROCQ_COQC_TIMEOUT env var).
+    """
+    workspace = workspace or ROCQ_WORKSPACE
+    timeout = timeout if timeout is not None and timeout > 0 else ROCQ_COQC_TIMEOUT
+
+    if ctx is None:
+        return {"success": False, "error": "Internal error: no MCP context."}
+
+    ws_err = _validate_workspace(workspace)
+    if ws_err:
+        return {"success": False, "error": ws_err}
+
+    try:
+        resolved = _resolve_file_in_workspace(file, workspace)
+    except (ValueError, FileNotFoundError) as e:
+        return {"success": False, "error": str(e)}
+
+    lifespan_state = ctx.lifespan_context
+
+    # Lazy-initialize the checker
+    from rocq_mcp.coqtop_checker import CoqtopChecker
+
+    checker = lifespan_state.get("coqtop_checker")
+    if checker is None or not checker._is_alive():
+        checker = CoqtopChecker()
+        lifespan_state["coqtop_checker"] = checker
+
+    result = checker.check_file(resolved, workspace=workspace, timeout=float(timeout))
+    return result
 
 
 # ---------------------------------------------------------------------------
