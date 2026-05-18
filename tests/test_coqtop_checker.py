@@ -42,6 +42,8 @@ def _make_file(admitted_from: int | None = None, bad_at: int | None = None) -> s
 
     admitted_from: if set, use 'admit' for tactics from this index
     bad_at: if set, insert 'exact 42.' at this tactic index
+
+    Always closes with Admitted. to avoid Qed kernel re-check cost.
     """
     parts = [_PREAMBLE, "Lemma big : True.\n", "Proof.\n"]
     for i in range(10):
@@ -51,12 +53,7 @@ def _make_file(admitted_from: int | None = None, bad_at: int | None = None) -> s
             parts.append(f"  assert (H{i} : slow 20 = 0) by admit.\n")
         else:
             parts.append(f"  assert (H{i} : slow 20 = 0) by reflexivity.\n")
-    if admitted_from is not None:
-        parts.append("  exact I.\nAdmitted.\n")
-    elif bad_at is not None:
-        parts.append("  exact I.\nQed.\n")
-    else:
-        parts.append("  exact I.\nQed.\n")
+    parts.append("  exact I.\nAdmitted.\n")
     return "".join(parts)
 
 

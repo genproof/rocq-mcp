@@ -27,111 +27,95 @@ class CoqtopChecker:
     def __init__(self, coqc_binary: str = "coqtop", coqc_flags: list[str] | None = None):
         self._binary = coqc_binary
         self._flags = coqc_flags or []
+        self._cwd: str | None = None
         self._process: subprocess.Popen | None = None
         self._lock = threading.Lock()
         # State tracking: list of sentences successfully fed to coqtop
         self._fed_sentences: list[str] = []
+        # Actual coqtop state number after each sentence (from -emacs prompt)
+        self._state_ids: list[int] = []
         # The file content that produced _fed_sentences
         self._last_content: str | None = None
         self._last_file: str | None = None
 
+    # Regex to parse coqtop -emacs prompts: <prompt>NAME < N |...| M < </prompt>
+    _PROMPT_RE = __import__("re").compile(r"<prompt>[^<]*<\s*(\d+)\s*\|[^|]*\|\s*\d+\s*<\s*</prompt>")
+
     def _start(self) -> None:
-        """Start or restart coqtop."""
+        """Start or restart coqtop in -emacs mode."""
         if self._process and self._process.poll() is None:
             self._process.kill()
             self._process.wait(timeout=3)
         self._process = subprocess.Popen(
-            [self._binary] + self._flags,
+            [self._binary, "-emacs"] + self._flags,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            cwd=self._cwd,
         )
-        # Consume the welcome message using the sentinel approach
-        self._process.stdin.write(self._SENTINEL_CMD + "\n")
-        self._process.stdin.flush()
-        self._read_until_sentinel()
+        # Consume the welcome message + initial prompt
+        self._read_until_prompt()
         self._fed_sentences = []
+        self._state_ids = []
         self._last_content = None
         self._last_file = None
 
     def _is_alive(self) -> bool:
         return self._process is not None and self._process.poll() is None
 
-    # Unique marker used to delimit command output boundaries.
-    _SENTINEL = "ROCQ_MCP_SENTINEL_7f3a9b2e"
-    _SENTINEL_CMD = f'About {_SENTINEL}.'
+    def _send(self, sentence: str) -> tuple[str, int]:
+        """Send a sentence to coqtop and return (output, state_id).
 
-    def _send(self, sentence: str) -> str:
-        """Send a sentence to coqtop and return its output.
-
-        Uses a sentinel command to reliably detect the end of output.
-        After sending the real sentence, we send 'About SENTINEL.'
-        which always produces a recognizable error containing our
-        sentinel string.  Everything before the sentinel error is
-        the real sentence's output.
+        Reads output until the next <prompt> tag, extracts the state
+        number from the prompt, and returns the output text plus the
+        new state ID.
         """
         if not self._is_alive():
             raise RuntimeError("coqtop is not running")
-        # Send the real sentence + sentinel
         self._process.stdin.write(sentence + "\n")
-        self._process.stdin.write(self._SENTINEL_CMD + "\n")
         self._process.stdin.flush()
-        return self._read_until_sentinel()
+        output, state_id = self._read_until_prompt()
+        return output, state_id
 
-    def _read_until_sentinel(self) -> str:
-        """Read until we see our sentinel marker in the output."""
+    def _read_until_prompt(self) -> tuple[str, int]:
+        """Read coqtop output until we see a <prompt>...</prompt> tag.
+
+        Returns (output_text, state_id).
+        """
         buf = []
         while True:
             ch = self._process.stdout.read(1)
             if not ch:
                 break
             buf.append(ch)
-            # Check if we've seen the sentinel
             text = "".join(buf)
-            if self._SENTINEL in text:
-                # Found sentinel — extract everything before it.
-                # The sentinel produces output like:
-                #   "Error: The reference ROCQ_MCP_SENTINEL_... was not found..."
-                # or on the prompt line before it.  Find the sentinel
-                # and take everything before the line containing it.
-                lines = text.split("\n")
-                result_lines = []
-                for line in lines:
-                    if self._SENTINEL in line:
-                        break
-                    result_lines.append(line)
-                # Also read until the next prompt (consume sentinel's prompt)
-                # Read remaining bytes until we see "< " prompt
-                tail = []
-                while True:
-                    c = self._process.stdout.read(1)
-                    if not c:
-                        break
-                    tail.append(c)
-                    if "".join(tail).endswith("< "):
-                        break
-                # Clean up: remove prompt lines from result
-                cleaned = []
-                for line in result_lines:
-                    stripped = line.rstrip()
-                    if stripped.endswith("<") and len(stripped.split()) <= 2:
-                        continue
-                    cleaned.append(line)
-                return "\n".join(cleaned).strip()
-
-        return "".join(buf).strip()
+            # Check for complete prompt tag
+            if "</prompt>" in text:
+                m = self._PROMPT_RE.search(text)
+                state_id = int(m.group(1)) if m else 0
+                # Remove all <prompt>...</prompt> tags and other XML noise
+                import re
+                clean = re.sub(r"<prompt>.*?</prompt>", "", text)
+                clean = re.sub(r"<infomsg>\n?", "", clean)
+                clean = re.sub(r"</infomsg>\n?", "", clean)
+                return clean.strip(), state_id
+        return "".join(buf).strip(), 0
 
     def _backto(self, reuse_count: int) -> None:
         """Rewind coqtop to keep only the first *reuse_count* sentences.
 
-        Uses ``BackTo N`` where N = reuse_count + 1 (state 1 is initial,
-        state 2 is after sentence 1, etc.).  Error commands (like our
-        sentinel) do NOT advance state, so the mapping is exact.
+        Uses the actual state ID recorded after sentence[reuse_count - 1]
+        was processed.  This accounts for bullets/braces advancing state
+        by more than 1 per sentence.
         """
-        # State = reuse_count + 1 means "keep reuse_count sentences"
-        self._send(f"BackTo {reuse_count + 1}.")
+        if reuse_count <= 0:
+            target_state = 1
+        else:
+            target_state = self._state_ids[reuse_count - 1]
+        self._send(f"BackTo {target_state}.")
         self._fed_sentences = self._fed_sentences[:reuse_count]
+        self._state_ids = self._state_ids[:reuse_count]
 
     def stop(self) -> None:
         """Kill the coqtop process."""
@@ -145,6 +129,7 @@ class CoqtopChecker:
                 self._process.wait(timeout=3)
         self._process = None
         self._fed_sentences = []
+        self._state_ids = []
         self._last_content = None
 
     def check_file(
@@ -221,7 +206,7 @@ class CoqtopChecker:
 
         for i, sentence in enumerate(sentences_to_check):
             global_idx = reuse_count + i
-            output = self._send(sentence)
+            output, state_id = self._send(sentence)
 
             if "Error:" in output or "Error :" in output:
                 # Parse error
@@ -232,11 +217,13 @@ class CoqtopChecker:
                     "failed_command": sentence,
                     "message": self._extract_error(output),
                 })
-                # After an error, coqtop state is uncertain for proofs.
-                # We can continue to collect more errors, but state tracking
-                # becomes unreliable.  For now, stop and report.
-                # Truncate fed_sentences to what was successfully processed.
+                # After an error, coqtop state may be dirty (e.g., failed
+                # tactic left partial proof state).  BackTo the last good
+                # state to ensure clean state for future calls.
                 self._fed_sentences = self._fed_sentences[:reuse_count + i]
+                self._state_ids = self._state_ids[:reuse_count + i]
+                if self._state_ids:
+                    self._send(f"BackTo {self._state_ids[-1]}.")
                 self._last_content = content
                 self._last_file = resolved
                 elapsed = time.monotonic() - start_time
@@ -249,6 +236,7 @@ class CoqtopChecker:
                 }
 
             self._fed_sentences.append(sentence)
+            self._state_ids.append(state_id)
 
         self._last_content = content
         self._last_file = resolved
@@ -271,6 +259,7 @@ class CoqtopChecker:
             project_flags = _parse_project_flags(ws)
             if project_flags:
                 flags.extend(project_flags)
+            self._cwd = str(ws)
         self._flags = flags
         self._start()
 
