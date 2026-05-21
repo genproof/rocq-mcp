@@ -55,7 +55,7 @@ class CoqtopChecker:
             cwd=self._cwd,
         )
         # Consume the welcome message + initial prompt
-        self._read_until_prompt()
+        self._read_until_last_prompt()
         self._fed_sentences = []
         self._state_ids = []
         self._last_content = None
@@ -67,40 +67,58 @@ class CoqtopChecker:
     def _send(self, sentence: str) -> tuple[str, int]:
         """Send a sentence to coqtop and return (output, state_id).
 
-        Reads output until the next <prompt> tag, extracts the state
-        number from the prompt, and returns the output text plus the
-        new state ID.
+        Reads all output until the next ``</prompt>`` tag.  In -emacs
+        mode, the format is::
+
+            <prompt>OLD < N |OLD| 0 < </prompt>RESPONSE...<prompt>NEW < M |NEW| 0 < </prompt>
+
+        The first ``</prompt>`` is from the PREVIOUS command's prompt
+        (already consumed by the last ``_send``).  The response text
+        follows, ending with the NEW prompt.  We return the response
+        text and the state ID from the NEW (last) prompt.
         """
         if not self._is_alive():
             raise RuntimeError("coqtop is not running")
         self._process.stdin.write(sentence + "\n")
         self._process.stdin.flush()
-        output, state_id = self._read_until_prompt()
-        return output, state_id
+        return self._read_until_last_prompt()
 
-    def _read_until_prompt(self) -> tuple[str, int]:
-        """Read coqtop output until we see a <prompt>...</prompt> tag.
+    def _read_until_last_prompt(self) -> tuple[str, int]:
+        """Read until ``</prompt>`` and return (response_text, state_id).
 
-        Returns (output_text, state_id).
+        When a command is sent, coqtop outputs::
+
+            RESPONSE_TEXT<prompt>NAME < N |NAME| 0 < </prompt>
+
+        The response text comes first, followed by the prompt indicating
+        coqtop is ready for the next command.  We read until we see
+        ``</prompt>``, extract the state ID from the prompt, and return
+        the response text (everything before ``<prompt>``).
         """
-        buf = []
+        import re
+
+        buf = ""
         while True:
             ch = self._process.stdout.read(1)
             if not ch:
                 break
-            buf.append(ch)
-            text = "".join(buf)
-            # Check for complete prompt tag
-            if "</prompt>" in text:
-                m = self._PROMPT_RE.search(text)
-                state_id = int(m.group(1)) if m else 0
-                # Remove all <prompt>...</prompt> tags and other XML noise
-                import re
-                clean = re.sub(r"<prompt>.*?</prompt>", "", text)
+            buf += ch
+            if buf.endswith("</prompt>"):
+                # Find the LAST <prompt>...</prompt> in the buffer
+                # (there should be exactly one per command)
+                all_prompts = list(self._PROMPT_RE.finditer(buf))
+                if not all_prompts:
+                    continue  # Malformed — keep reading
+                last_prompt = all_prompts[-1]
+                state_id = int(last_prompt.group(1))
+                # Response is everything before the last <prompt> tag
+                response = buf[: last_prompt.start()]
+                # Also strip any earlier prompts (from startup or BackTo)
+                clean = re.sub(r"<prompt>.*?</prompt>", "", response)
                 clean = re.sub(r"<infomsg>\n?", "", clean)
                 clean = re.sub(r"</infomsg>\n?", "", clean)
                 return clean.strip(), state_id
-        return "".join(buf).strip(), 0
+        return buf.strip(), 0
 
     def _backto(self, reuse_count: int) -> None:
         """Rewind coqtop to keep only the first *reuse_count* sentences.

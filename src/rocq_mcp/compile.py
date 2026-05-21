@@ -1114,20 +1114,72 @@ def _find_sentence_end(text: str) -> int | None:
     return None
 
 
+def _find_next_sentence(text: str) -> tuple[str, int] | None:
+    """Find the next Rocq sentence in *text*.
+
+    Handles three kinds of sentence boundaries:
+    - Dot-terminated sentences (``.`` followed by whitespace/EOF)
+    - Standalone ``{`` (focusing command)
+    - Standalone ``}`` (unfocusing command)
+
+    ``{`` and ``}`` are sentence boundaries only at parenthesis depth 0.
+    Inside ``(...)``, braces are part of the term syntax (e.g., record
+    patterns ``{| field := val |}``), not focusing commands.
+
+    Returns ``(sentence, end_index)`` or ``None`` if no sentence found.
+    *end_index* is the index in *text* past the sentence.
+    """
+    # Skip leading whitespace and comments to find the first real content
+    for idx, ch, in_comment, in_str in _rocq_scan(text):
+        if in_comment or in_str:
+            continue
+        if ch in (" ", "\t", "\n", "\r"):
+            continue
+        # First non-whitespace, non-comment character
+        if ch in ("{", "}"):
+            return ch, idx + 1
+        break
+    else:
+        return None
+
+    # Scan for the earliest sentence boundary: dot or top-level brace.
+    # Track parenthesis depth so braces inside (...) are ignored.
+    paren_depth = 0
+    for idx2, ch2, in_comment2, in_str2 in _rocq_scan(text):
+        if in_comment2 or in_str2:
+            continue
+        if ch2 == "(":
+            paren_depth += 1
+        elif ch2 == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif ch2 in ("{", "}") and paren_depth == 0:
+            # Top-level brace — sentence boundary.
+            before = text[:idx2].strip()
+            if before:
+                return before, idx2
+            return ch2, idx2 + 1
+        elif ch2 == "." and paren_depth == 0:
+            if idx2 + 1 >= len(text) or text[idx2 + 1] in (" ", "\t", "\n", "\r"):
+                sentence = text[: idx2 + 1].strip()
+                if sentence:
+                    return sentence, idx2 + 1
+    return None
+
+
 def _split_rocq_sentences(source: str) -> list[str]:
     """Split Rocq source into individual sentences.
 
-    Uses :func:`_find_sentence_end` repeatedly to split on
-    sentence-terminating dots (handling comments and strings correctly).
+    Handles dot-terminated sentences and standalone ``{``/``}``
+    (focusing/unfocusing commands).  Comments and strings are
+    handled correctly.
     """
     sentences: list[str] = []
     remaining = source
     while remaining.strip():
-        dot = _find_sentence_end(remaining)
-        if dot is None:
+        result = _find_next_sentence(remaining)
+        if result is None:
             break
-        sentence = remaining[: dot + 1].strip()
-        if sentence:
-            sentences.append(sentence)
-        remaining = remaining[dot + 1 :]
+        sentence, end_idx = result
+        sentences.append(sentence)
+        remaining = remaining[end_idx:]
     return sentences
