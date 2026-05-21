@@ -69,6 +69,7 @@ async def app_lifespan(server: Any) -> Any:
         "workspace": ROCQ_WORKSPACE,
         "pet_timeout": ROCQ_PET_TIMEOUT,
         "current_workspace": None,
+        "lsp_checker": None,
         # Diagnostics (rocq_diag tool, see _build_diag_snapshot).
         "pet_started_at": None,
         # Count of successful spawns; pet_restarts is derived as
@@ -86,6 +87,9 @@ async def app_lifespan(server: Any) -> Any:
         client = state.get("pet_client")
         if client:
             _kill_pet(client)
+        lsp = state.get("lsp_checker")
+        if lsp:
+            lsp.stop()
         # Clean up cache file
         ws = state.get("workspace")
         if ws:
@@ -2022,6 +2026,68 @@ async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
             "error": "Internal error: no MCP context.",
         }
     return _build_diag_snapshot(ctx.lifespan_context)
+
+
+# ---------------------------------------------------------------------------
+# Tool: rocq_compile_lsp
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+def rocq_compile_lsp(
+    file: str,
+    workspace: str = "",
+    timeout: int = 0,
+    include_warnings: bool = False,
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Incrementally check a .v file using coq-lsp diagnostics.
+
+    Much faster than rocq_compile_file for iterative development:
+    keeps a coq-lsp process alive and only re-checks from the first
+    edit point.  Everything before the change is cached internally
+    by coq-lsp — not re-processed.
+
+    Returns errors (and optionally warnings) reported by coq-lsp.
+    Use this instead of rocq_compile_file when iterating on a proof.
+    Use rocq_compile_file for final authoritative verification with coqc.
+
+    Args:
+        file: Path to the .v file (relative to workspace).
+        workspace: Directory to use as workspace (default: ROCQ_WORKSPACE env var).
+        timeout: Timeout in seconds (default: ROCQ_COQC_TIMEOUT env var).
+        include_warnings: Include warnings in the result (default: False).
+    """
+    workspace = workspace or ROCQ_WORKSPACE
+    timeout = timeout if timeout is not None and timeout > 0 else ROCQ_COQC_TIMEOUT
+
+    if ctx is None:
+        return _fail(ctx, "rocq_compile_lsp", "Internal error: no MCP context.")
+
+    ws_err = _validate_workspace(workspace)
+    if ws_err:
+        return _fail(ctx, "rocq_compile_lsp", ws_err)
+
+    try:
+        resolved = _resolve_file_in_workspace(file, workspace)
+    except (ValueError, FileNotFoundError) as e:
+        return _fail(ctx, "rocq_compile_lsp", str(e))
+
+    lifespan_state = ctx.lifespan_context
+
+    from rocq_mcp.lsp_checker import LspChecker
+
+    checker = lifespan_state.get("lsp_checker")
+    if checker is None or not checker._is_alive():
+        checker = LspChecker(workspace=workspace)
+        lifespan_state["lsp_checker"] = checker
+
+    result = checker.check_file(resolved, workspace=workspace, timeout=float(timeout))
+
+    if not include_warnings:
+        result.pop("warnings", None)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
