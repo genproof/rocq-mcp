@@ -2059,7 +2059,7 @@ def rocq_compile_lsp(
         include_warnings: Include warnings in the result (default: False).
     """
     workspace = workspace or ROCQ_WORKSPACE
-    timeout = timeout if timeout is not None and timeout > 0 else ROCQ_COQC_TIMEOUT
+    timeout = timeout if timeout is not None and timeout > 0 else 0  # 0 = no timeout
 
     if ctx is None:
         return _fail(ctx, "rocq_compile_lsp", "Internal error: no MCP context.")

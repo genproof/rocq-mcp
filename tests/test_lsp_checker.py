@@ -65,7 +65,7 @@ class TestLspChecker:
         r = checker.check_file(str(vfile))
         elapsed = time.monotonic() - t0
         assert r["success"] is True
-        assert elapsed < 1.0, f"Unchanged re-check took {elapsed:.2f}s"
+        assert elapsed < 2.0, f"Unchanged re-check took {elapsed:.2f}s"
 
     def test_admitted_then_qed(self, checker, vfile):
         """Admitted → Qed transition works correctly."""

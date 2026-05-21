@@ -36,6 +36,10 @@ class LspChecker:
         self._initialized = False
         # Track open documents: uri -> version
         self._open_docs: dict[str, int] = {}
+        # Track last content sent per uri (to skip no-op didChange)
+        self._last_content: dict[str, str] = {}
+        # Cached diagnostics from last check
+        self._last_diags: dict[str, list[dict[str, Any]]] = {}
 
     def _start(self) -> None:
         """Start coq-lsp and perform LSP handshake."""
@@ -52,6 +56,8 @@ class LspChecker:
         )
         self._initialized = False
         self._open_docs.clear()
+        self._last_content.clear()
+        self._last_diags.clear()
 
         # LSP initialize
         root_uri = Path(self._workspace).as_uri() if self._workspace else None
@@ -88,12 +94,14 @@ class LspChecker:
         self._process = None
         self._initialized = False
         self._open_docs.clear()
+        self._last_content.clear()
+        self._last_diags.clear()
 
     def check_file(
         self,
         file_path: str,
         workspace: str = "",
-        timeout: float = 60.0,
+        timeout: float = 0,
     ) -> dict[str, Any]:
         """Check a file and return diagnostics.
 
@@ -139,6 +147,19 @@ class LspChecker:
             }
 
         uri = Path(resolved).as_uri()
+
+        # Skip if content hasn't changed — return cached result
+        if uri in self._last_content and self._last_content[uri] == content:
+            cached = self._last_diags.get(uri, [])
+            errors = [d for d in cached if d["severity"] == SEVERITY_ERROR]
+            warnings = [d for d in cached if d["severity"] == SEVERITY_WARNING]
+            return {
+                "success": len(errors) == 0,
+                "errors": errors,
+                "warnings": warnings,
+                "check_time_ms": 0,
+            }
+
         start_time = time.monotonic()
 
         if uri in self._open_docs:
@@ -164,9 +185,10 @@ class LspChecker:
 
         # Wait for publishDiagnostics for our file.
         # coq-lsp sends diagnostics incrementally as it processes.
-        # We wait until we receive diagnostics with no errors pending,
-        # or until timeout.
-        diagnostics = self._wait_for_diagnostics(uri, timeout)
+        # We wait for the completion signal (fileProgress/serverStatus).
+        diagnostics = self._wait_for_diagnostics(uri, version, timeout)
+        self._last_content[uri] = content
+        self._last_diags[uri] = diagnostics
 
         elapsed = time.monotonic() - start_time
 
@@ -181,40 +203,42 @@ class LspChecker:
         }
 
     def _wait_for_diagnostics(
-        self, uri: str, timeout: float
+        self, uri: str, version: int, timeout: float
     ) -> list[dict[str, Any]]:
         """Wait for coq-lsp to finish processing and return diagnostics.
 
-        coq-lsp sends textDocument/publishDiagnostics notifications as
-        it processes.  We collect them until we either:
-        - Receive a diagnostics notification (coq-lsp sends a final one
-          when processing completes)
-        - Time out
+        coq-lsp signals completion via:
+        - ``$/coq/fileProgress`` with an empty ``processing`` array
+        - ``$/coq/serverStatus`` transitioning to Idle
 
-        We keep reading until no new diagnostics arrive for a settle
-        period, indicating coq-lsp has finished processing.
+        We only accept diagnostics whose ``version`` matches the version
+        we sent (ignoring stale diagnostics from previous edits).
+        We collect diagnostics while waiting for the completion signal,
+        then continue reading briefly to catch any final diagnostic
+        update that arrives after the signal.
         """
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + timeout if timeout > 0 else float("inf")
         latest_diags: list[dict[str, Any]] = []
-        last_diag_time = time.monotonic()
-        settle_seconds = 0.5  # wait this long after last diagnostic
+        saw_processing = False
+        file_done = False
 
         while time.monotonic() < deadline:
-            remaining = min(deadline - time.monotonic(), settle_seconds)
-            if remaining <= 0:
-                break
-
-            msg = self._read_message(timeout=remaining)
+            # Short timeout after done signal, longer while waiting
+            read_timeout = 0.1 if file_done else 2.0
+            msg = self._read_message(timeout=read_timeout)
             if msg is None:
-                # No message within settle period — check if we've
-                # received at least one diagnostic batch
-                if latest_diags is not None and time.monotonic() - last_diag_time > settle_seconds:
+                if file_done:
                     break
                 continue
 
-            if msg.get("method") == "textDocument/publishDiagnostics":
+            method = msg.get("method", "")
+
+            if method == "textDocument/publishDiagnostics":
                 params = msg.get("params", {})
                 if params.get("uri") == uri:
+                    diag_version = params.get("version")
+                    if diag_version is not None and diag_version != version:
+                        continue
                     raw_diags = params.get("diagnostics", [])
                     latest_diags = [
                         {
@@ -227,7 +251,26 @@ class LspChecker:
                         }
                         for d in raw_diags
                     ]
-                    last_diag_time = time.monotonic()
+                    # Return immediately on first error.
+                    if any(d["severity"] == SEVERITY_ERROR for d in latest_diags):
+                        return latest_diags
+
+            elif method == "$/coq/fileProgress":
+                params = msg.get("params", {})
+                if params.get("textDocument", {}).get("uri") == uri:
+                    processing = params.get("processing", [])
+                    if processing:
+                        saw_processing = True
+                    elif saw_processing:
+                        # Processing went non-empty → empty: done.
+                        file_done = True
+
+            elif method == "$/coq/serverStatus":
+                params = msg.get("params", {})
+                # Server idle = definitively done, regardless of
+                # whether we saw processing start.
+                if params.get("status") in ("Idle", "Stopped"):
+                    file_done = True
 
         return latest_diags
 
