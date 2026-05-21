@@ -219,11 +219,10 @@ class LspChecker:
         """
         deadline = time.monotonic() + timeout if timeout > 0 else float("inf")
         latest_diags: list[dict[str, Any]] = []
-        saw_processing = False
+        saw_busy = False
         file_done = False
 
         while time.monotonic() < deadline:
-            # Short timeout after done signal, longer while waiting
             read_timeout = 0.1 if file_done else 2.0
             msg = self._read_message(timeout=read_timeout)
             if msg is None:
@@ -255,22 +254,15 @@ class LspChecker:
                     if any(d["severity"] == SEVERITY_ERROR for d in latest_diags):
                         return latest_diags
 
-            elif method == "$/coq/fileProgress":
-                params = msg.get("params", {})
-                if params.get("textDocument", {}).get("uri") == uri:
-                    processing = params.get("processing", [])
-                    if processing:
-                        saw_processing = True
-                    elif saw_processing:
-                        # Processing went non-empty → empty: done.
-                        file_done = True
-
             elif method == "$/coq/serverStatus":
                 params = msg.get("params", {})
-                # Server idle = definitively done, regardless of
-                # whether we saw processing start.
-                if params.get("status") in ("Idle", "Stopped"):
-                    file_done = True
+                status = params.get("status", "")
+                if status == "Busy":
+                    saw_busy = True
+                elif status in ("Idle", "Stopped"):
+                    # Busy → Idle transition = processing complete.
+                    if saw_busy:
+                        file_done = True
 
         return latest_diags
 
