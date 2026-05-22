@@ -223,6 +223,13 @@ class LspChecker:
         file_done = False
 
         while time.monotonic() < deadline:
+            # Bail promptly if coq-lsp died (e.g., killed by the memory
+            # watchdog).  Without this check, _read_message would return
+            # None on EOF and the loop would spin until ``deadline`` --
+            # which can be ``inf`` when the caller passes timeout=0.
+            if self._process is None or self._process.poll() is not None:
+                break
+
             read_timeout = 0.1 if file_done else 2.0
             msg = self._read_message(timeout=read_timeout)
             if msg is None:

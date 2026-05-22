@@ -53,6 +53,12 @@ def _default_max_pet_rss_mb() -> int:
 ROCQ_MAX_PET_RSS_MB: int = int(
     os.environ.get("ROCQ_MAX_PET_RSS_MB", str(_default_max_pet_rss_mb()))
 )
+# coq-lsp RSS cap (mirrors ROCQ_MAX_PET_RSS_MB).  Same default formula
+# because both subprocesses can blow up on the same kinds of workloads
+# (large vm_compute, deep proof terms, runaway typeclass search).
+ROCQ_MAX_LSP_RSS_MB: int = int(
+    os.environ.get("ROCQ_MAX_LSP_RSS_MB", str(_default_max_pet_rss_mb()))
+)
 _MEMORY_WATCHDOG_INTERVAL: float = 0.5
 _RECENT_ERRORS_MAX: int = 20
 
@@ -79,6 +85,9 @@ async def app_lifespan(server: Any) -> Any:
         "total_spawns": 0,
         "peak_pet_rss_mb": 0.0,
         "pet_generation": 0,
+        # Parallel LSP-side bookkeeping (see ROCQ_MAX_LSP_RSS_MB).
+        "peak_lsp_rss_mb": 0.0,
+        "lsp_generation": 0,
         "recent_errors": collections.deque(maxlen=_RECENT_ERRORS_MAX),
     }
     try:
@@ -732,6 +741,28 @@ def _invalidate_pet(lifespan_state: dict[str, Any]) -> None:
         hook()
 
 
+def _invalidate_lsp(lifespan_state: dict[str, Any]) -> None:
+    """Kill coq-lsp and clear the cached checker so the next call respawns.
+
+    Mirrors :func:`_invalidate_pet`.  LspChecker holds its own
+    per-instance ``threading.Lock`` (no global LSP lock to release),
+    so there is no analogue of ``_force_release_pet_lock`` here -- the
+    discarded checker takes its lock with it.
+    """
+    checker = lifespan_state.get("lsp_checker")
+    if checker is not None:
+        try:
+            checker.stop()
+        except Exception:
+            # Best-effort cleanup; the subprocess may already be dead or
+            # the FDs already closed.  We only care that we tried.
+            pass
+    lifespan_state["lsp_checker"] = None
+    lifespan_state["lsp_generation"] = (
+        lifespan_state.get("lsp_generation", 0) + 1
+    )
+
+
 def _set_workspace_if_needed(
     pet: Any, workspace: str, lifespan_state: dict[str, Any]
 ) -> None:
@@ -913,26 +944,83 @@ async def _build_memory_abort_response(
     )
 
 
+def _build_lsp_memory_abort_response(
+    lifespan_state: dict[str, Any],
+    tool: str,
+) -> dict[str, Any]:
+    """Memory-abort recovery for the coq-lsp path.
+
+    Kills the coq-lsp subprocess (so the next call respawns it),
+    records the failure into ``recent_errors`` so ``rocq_diag`` surfaces
+    it, and returns the unified ``memory_exhausted`` envelope.  Unlike
+    the pet path there is no global lock to force-release -- LspChecker
+    owns its lock per-instance, and discarding the checker discards
+    its lock too.
+    """
+    _invalidate_lsp(lifespan_state)
+    error = (
+        f"{tool} aborted: coq-lsp RSS exceeded "
+        f"{ROCQ_MAX_LSP_RSS_MB} MB. coq-lsp has been restarted. "
+        "Retry on a smaller file or split the work into smaller pieces."
+    )
+    _record_error(lifespan_state, tool, error, reason="memory_exhausted")
+    return {
+        "success": False,
+        "error": error,
+        "reason": "memory_exhausted",
+        "lsp_restarted": True,
+    }
+
+
+def _pet_process_from_state(lifespan_state: dict[str, Any]) -> Any:
+    """Return the pet subprocess (with ``.pid``) or None if not running."""
+    client = lifespan_state.get("pet_client")
+    if client is None or getattr(client, "process", None) is None:
+        return None
+    return client.process
+
+
+def _lsp_process_from_state(lifespan_state: dict[str, Any]) -> Any:
+    """Return the coq-lsp subprocess (with ``.pid``) or None if not running."""
+    checker = lifespan_state.get("lsp_checker")
+    if checker is None:
+        return None
+    process = getattr(checker, "_process", None)
+    if process is None:
+        return None
+    return process
+
+
 async def _memory_watchdog(
     lifespan_state: dict[str, Any],
     max_rss_mb: int,
     main_task: asyncio.Task,
     event: asyncio.Event,
     interval: float | None = None,
+    *,
+    get_process: Callable[[dict[str, Any]], Any] = _pet_process_from_state,
+    peak_key: str = "peak_pet_rss_mb",
 ) -> None:
-    """Sample pet RSS; on threshold breach, set *event* and cancel *main_task*.
+    """Sample subprocess RSS; on threshold breach, set *event* and cancel *main_task*.
 
-    Runs concurrently with ``_run_with_pet``'s main thread.  When the pet
-    subprocess RSS exceeds ``max_rss_mb`` MB, signals memory exhaustion via
-    *event* and cancels the main task so the existing timeout-class recovery
-    path can reclaim the lock and respawn pet.
+    Runs concurrently with the main work thread.  When the subprocess
+    RSS exceeds ``max_rss_mb`` MB, signals memory exhaustion via
+    *event* and cancels the main task so the caller's recovery path
+    can reclaim resources and respawn the subprocess.
+
+    ``get_process`` returns a subprocess-like object with a ``.pid``
+    attribute (or ``None`` if not yet spawned).  Defaults to the pet
+    process; pass ``_lsp_process_from_state`` to monitor coq-lsp.
+    ``peak_key`` is the lifespan-state field used to track the peak
+    RSS seen during this run (``peak_pet_rss_mb`` for pet,
+    ``peak_lsp_rss_mb`` for coq-lsp).
 
     Tolerates:
     - ``psutil`` not installed -- exits silently (no monitoring).
-    - pet not yet spawned (``lifespan_state["pet_client"] is None``) --
+    - subprocess not yet spawned (``get_process`` returns None) --
       keeps polling.
-    - pet exits between samples (``psutil.NoSuchProcess``) -- treated as
-      transient; keeps polling.
+    - subprocess exits between samples (``psutil.NoSuchProcess``) --
+      treated as transient; keeps polling.
     """
     if interval is None:
         interval = _MEMORY_WATCHDOG_INTERVAL
@@ -942,20 +1030,20 @@ async def _memory_watchdog(
             await asyncio.sleep(interval)
             if main_task.done():
                 return
-            client = lifespan_state.get("pet_client")
-            if client is None or client.process is None:
+            process = get_process(lifespan_state)
+            if process is None:
                 continue
             try:
-                pid = client.process.pid
+                pid = process.pid
                 rss_bytes = psutil.Process(pid).memory_info().rss
             except (psutil.Error, AttributeError, OSError):
                 # psutil.Error covers NoSuchProcess / AccessDenied / ZombieProcess;
-                # OSError catches raw ProcessLookupError if pet died between
-                # Process() construction and memory_info().
+                # OSError catches raw ProcessLookupError if the subprocess died
+                # between Process() construction and memory_info().
                 continue
             rss_mb = rss_bytes // (1024 * 1024)
-            if rss_mb > lifespan_state.get("peak_pet_rss_mb", 0):
-                lifespan_state["peak_pet_rss_mb"] = float(rss_mb)
+            if rss_mb > lifespan_state.get(peak_key, 0):
+                lifespan_state[peak_key] = float(rss_mb)
             if rss_mb > max_rss_mb:
                 event.set()
                 main_task.cancel()
@@ -2016,10 +2104,14 @@ async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
     Response shape:
 
     - ``pet``: ``{pid, uptime_seconds, restarts, generation}``
+    - ``lsp``: ``{pid, generation}`` -- coq-lsp subprocess.  ``pid`` is
+      ``None`` when coq-lsp is not running.
     - ``memory``: ``{pet_rss_mb, peak_pet_rss_mb, max_rss_mb_threshold,
-      sample_status}`` where ``sample_status`` is one of ``"ok"`` /
-      ``"no_pet"`` / ``"psutil_error"`` and disambiguates a ``None``
-      ``pet_rss_mb``.
+      sample_status, lsp_rss_mb, peak_lsp_rss_mb,
+      lsp_max_rss_mb_threshold, lsp_sample_status}``.  The
+      ``sample_status`` fields are one of ``"ok"`` / ``"no_pet"`` (or
+      ``"no_lsp"``) / ``"psutil_error"`` and disambiguate a ``None``
+      RSS reading.
     - ``live_states``: capped at 50 most-recent entries (by
       ``created_at``) to keep the payload bounded.  Each entry has
       ``{state_id, parent, file, theorem, age_seconds}``.
@@ -2055,7 +2147,7 @@ async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
 
 
 @mcp.tool
-def rocq_compile_lsp(
+async def rocq_compile_lsp(
     file: str,
     workspace: str = "",
     timeout: int = 0,
@@ -2072,6 +2164,11 @@ def rocq_compile_lsp(
     Returns errors (and optionally warnings) reported by coq-lsp.
     Use this instead of rocq_compile_file when iterating on a proof.
     Use rocq_compile_file for final authoritative verification with coqc.
+
+    A memory watchdog monitors the coq-lsp subprocess against
+    ``ROCQ_MAX_LSP_RSS_MB``; on breach the response is
+    ``{success: False, reason: "memory_exhausted", lsp_restarted: True}``
+    and coq-lsp is restarted automatically on the next call.
 
     Args:
         file: Path to the .v file (relative to workspace).
@@ -2103,7 +2200,41 @@ def rocq_compile_lsp(
         checker = LspChecker(workspace=workspace)
         lifespan_state["lsp_checker"] = checker
 
-    result = checker.check_file(resolved, workspace=workspace, timeout=float(timeout))
+    main_task = asyncio.create_task(
+        asyncio.to_thread(
+            checker.check_file, resolved, workspace, float(timeout)
+        )
+    )
+    mem_event = asyncio.Event()
+    monitor_task = asyncio.create_task(
+        _memory_watchdog(
+            lifespan_state,
+            ROCQ_MAX_LSP_RSS_MB,
+            main_task,
+            mem_event,
+            get_process=_lsp_process_from_state,
+            peak_key="peak_lsp_rss_mb",
+        )
+    )
+    try:
+        try:
+            result = await main_task
+        finally:
+            if not monitor_task.done():
+                monitor_task.cancel()
+                try:
+                    await monitor_task
+                except asyncio.CancelledError:
+                    pass
+    except asyncio.CancelledError:
+        # Watchdog cancelled the main task because coq-lsp RSS breached
+        # the threshold.  Build the memory_exhausted envelope (which
+        # also kills coq-lsp so the next call respawns it).
+        if mem_event.is_set():
+            return _build_lsp_memory_abort_response(
+                lifespan_state, "rocq_compile_lsp"
+            )
+        raise
 
     if not include_warnings:
         result.pop("warnings", None)

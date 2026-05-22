@@ -22,6 +22,7 @@ _DIAG_LIVE_STATES_CAP: int = 50
 
 
 _RssSampleStatus = Literal["ok", "no_pet", "psutil_error"]
+_LspRssSampleStatus = Literal["ok", "no_lsp", "psutil_error"]
 
 
 def _sample_pet_rss_mb(
@@ -43,6 +44,29 @@ def _sample_pet_rss_mb(
         return None, "no_pet"
     try:
         pid = client.process.pid
+        rss_bytes = psutil.Process(pid).memory_info().rss
+    except (psutil.Error, AttributeError, OSError):
+        return None, "psutil_error"
+    return rss_bytes / (1024 * 1024), "ok"
+
+
+def _sample_lsp_rss_mb(
+    lifespan_state: dict[str, Any],
+) -> tuple[float | None, _LspRssSampleStatus]:
+    """Best-effort live RSS sample of the coq-lsp subprocess.
+
+    Parallel to :func:`_sample_pet_rss_mb`; ``"no_lsp"`` signals that
+    coq-lsp is not currently running (no checker, or its subprocess
+    handle is None).
+    """
+    checker = lifespan_state.get("lsp_checker")
+    if checker is None:
+        return None, "no_lsp"
+    process = getattr(checker, "_process", None)
+    if process is None:
+        return None, "no_lsp"
+    try:
+        pid = process.pid
         rss_bytes = psutil.Process(pid).memory_info().rss
     except (psutil.Error, AttributeError, OSError):
         return None, "psutil_error"
@@ -74,6 +98,15 @@ def _build_diag_snapshot(lifespan_state: dict[str, Any]) -> dict[str, Any]:
 
     pet_rss_mb, sample_status = _sample_pet_rss_mb(lifespan_state)
     peak = float(lifespan_state.get("peak_pet_rss_mb", 0.0) or 0.0)
+
+    lsp_rss_mb, lsp_sample_status = _sample_lsp_rss_mb(lifespan_state)
+    lsp_peak = float(lifespan_state.get("peak_lsp_rss_mb", 0.0) or 0.0)
+    lsp_checker = lifespan_state.get("lsp_checker")
+    lsp_pid: int | None = None
+    if lsp_checker is not None:
+        lsp_process = getattr(lsp_checker, "_process", None)
+        if lsp_process is not None:
+            lsp_pid = lsp_process.pid
 
     # Sort by created_at descending (most recent first), then take cap.
     all_entries = list(_state_table.items())
@@ -117,11 +150,19 @@ def _build_diag_snapshot(lifespan_state: dict[str, Any]) -> dict[str, Any]:
             "restarts": max(0, total_spawns - 1),
             "generation": int(lifespan_state.get("pet_generation", 0)),
         },
+        "lsp": {
+            "pid": lsp_pid,
+            "generation": int(lifespan_state.get("lsp_generation", 0)),
+        },
         "memory": {
             "pet_rss_mb": pet_rss_mb,
             "peak_pet_rss_mb": peak,
             "max_rss_mb_threshold": float(_server.ROCQ_MAX_PET_RSS_MB),
             "sample_status": sample_status,
+            "lsp_rss_mb": lsp_rss_mb,
+            "peak_lsp_rss_mb": lsp_peak,
+            "lsp_max_rss_mb_threshold": float(_server.ROCQ_MAX_LSP_RSS_MB),
+            "lsp_sample_status": lsp_sample_status,
         },
         "live_states": live_states,
         "live_states_total": live_states_total,

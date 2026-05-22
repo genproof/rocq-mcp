@@ -66,6 +66,7 @@ class TestDiagSchema:
         assert set(snap.keys()) == {
             "success",
             "pet",
+            "lsp",
             "memory",
             "live_states",
             "live_states_total",
@@ -78,11 +79,19 @@ class TestDiagSchema:
             "restarts",
             "generation",
         }
+        assert set(snap["lsp"].keys()) == {
+            "pid",
+            "generation",
+        }
         assert set(snap["memory"].keys()) == {
             "pet_rss_mb",
             "peak_pet_rss_mb",
             "max_rss_mb_threshold",
             "sample_status",
+            "lsp_rss_mb",
+            "peak_lsp_rss_mb",
+            "lsp_max_rss_mb_threshold",
+            "lsp_sample_status",
         }
         assert isinstance(snap["live_states"], list)
         assert isinstance(snap["live_states_total"], int)
@@ -100,6 +109,11 @@ class TestDiagSchema:
         assert snap["memory"]["pet_rss_mb"] is None
         assert snap["memory"]["peak_pet_rss_mb"] == 0.0
         assert snap["memory"]["sample_status"] == "no_pet"
+        assert snap["lsp"]["pid"] is None
+        assert snap["lsp"]["generation"] == 0
+        assert snap["memory"]["lsp_rss_mb"] is None
+        assert snap["memory"]["peak_lsp_rss_mb"] == 0.0
+        assert snap["memory"]["lsp_sample_status"] == "no_lsp"
         assert snap["live_states"] == []
         assert snap["live_states_total"] == 0
         assert snap["recent_errors"] == []

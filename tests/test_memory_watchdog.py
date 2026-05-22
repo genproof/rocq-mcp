@@ -419,3 +419,140 @@ class TestWatchdogCoroutine:
         main_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await main_task
+
+
+# ---------------------------------------------------------------------------
+# coq-lsp watchdog (ROCQ_MAX_LSP_RSS_MB)
+# ---------------------------------------------------------------------------
+
+
+class _MockLspContext:
+    """Minimal Context stand-in carrying a lifespan_state."""
+
+    def __init__(self, lifespan_state: dict) -> None:
+        self.lifespan_context = lifespan_state
+
+
+def _mock_lsp_checker(pid: int = 54321, alive: bool = True):
+    """Stand-in for ``LspChecker`` with the surface ``rocq_compile_lsp``
+    and the watchdog read:
+
+    - ``_is_alive()`` returns *alive* so the tool reuses this checker
+      instead of constructing a real one.
+    - ``_process`` exposes a ``.pid`` (so the watchdog can sample) and
+      a ``.poll()`` (so ``_pet_alive``-style checks work).
+    - ``check_file(...)`` blocks long enough for the watchdog to fire;
+      override on individual tests if a different behaviour is needed.
+    - ``stop()`` records that ``_invalidate_lsp`` called it.
+    """
+    checker = MagicMock()
+    checker._is_alive.return_value = alive
+    checker._process = MagicMock()
+    checker._process.pid = pid
+    checker._process.poll.return_value = None if alive else 1
+    # Default: block 200 ms so the 10 ms watchdog interval samples.
+    checker.check_file.side_effect = lambda *a, **kw: (
+        time.sleep(0.2) or {"success": True, "errors": [], "warnings": [], "check_time_ms": 200}
+    )
+    checker.stop = MagicMock()
+    return checker
+
+
+class TestLspMemoryWatchdogBreach:
+    """RSS samples above the LSP threshold abort rocq_compile_lsp."""
+
+    @pytest.mark.asyncio
+    async def test_high_lsp_rss_triggers_abort(self, tmp_path, monkeypatch):
+        """LSP RSS above ROCQ_MAX_LSP_RSS_MB -> memory_exhausted + lsp_restarted."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 100)
+        _patch_psutil_rss(monkeypatch, 500)  # 500 MB > 100 MB threshold
+
+        vfile = tmp_path / "probe.v"
+        vfile.write_text("Theorem t : True. Proof. exact I. Qed.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()
+        ls["lsp_checker"] = checker
+
+        ctx = _MockLspContext(ls)
+        result = await rocq_compile_lsp(
+            file=str(vfile), workspace=str(tmp_path), ctx=ctx
+        )
+
+        assert result["success"] is False
+        assert result["reason"] == "memory_exhausted"
+        assert result["lsp_restarted"] is True
+        assert "coq-lsp RSS exceeded" in result["error"]
+        assert "100 MB" in result["error"]
+        # _invalidate_lsp was called -> checker.stop() fired and
+        # lifespan_state["lsp_checker"] cleared so the next call respawns.
+        assert checker.stop.called
+        assert ls["lsp_checker"] is None
+        assert ls["lsp_generation"] == 1
+        # Recent-errors deque records this under memory_exhausted.
+        assert any(
+            e.get("reason") == "memory_exhausted"
+            and e.get("tool") == "rocq_compile_lsp"
+            for e in ls["recent_errors"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_low_lsp_rss_does_not_abort(self, tmp_path, monkeypatch):
+        """LSP RSS below threshold -> normal result, no abort."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 10_000)
+        _patch_psutil_rss(monkeypatch, 50)  # 50 MB << 10 GB threshold
+
+        vfile = tmp_path / "ok.v"
+        vfile.write_text("Theorem t : True. Proof. exact I. Qed.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()
+        # Make check_file return quickly so the watchdog has minimal work.
+        checker.check_file.side_effect = lambda *a, **kw: {
+            "success": True, "errors": [], "warnings": [], "check_time_ms": 1,
+        }
+        ls["lsp_checker"] = checker
+
+        ctx = _MockLspContext(ls)
+        result = await rocq_compile_lsp(
+            file=str(vfile), workspace=str(tmp_path), ctx=ctx
+        )
+
+        assert result["success"] is True
+        assert "lsp_restarted" not in result
+        assert "reason" not in result or result["reason"] != "memory_exhausted"
+        # Checker was reused, not replaced.
+        assert ls["lsp_checker"] is checker
+        assert ls["lsp_generation"] == 0
+        assert not checker.stop.called
+
+    @pytest.mark.asyncio
+    async def test_lsp_watchdog_tracks_peak(self, tmp_path, monkeypatch):
+        """peak_lsp_rss_mb gets updated even when no breach occurs."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 10_000)
+        _patch_psutil_rss(monkeypatch, 333)
+
+        vfile = tmp_path / "peak.v"
+        vfile.write_text("Theorem t : True. Proof. exact I. Qed.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()
+        # Block 100 ms so the 10 ms-interval watchdog samples at least once.
+        checker.check_file.side_effect = lambda *a, **kw: (
+            time.sleep(0.1)
+            or {"success": True, "errors": [], "warnings": [], "check_time_ms": 100}
+        )
+        ls["lsp_checker"] = checker
+
+        ctx = _MockLspContext(ls)
+        await rocq_compile_lsp(file=str(vfile), workspace=str(tmp_path), ctx=ctx)
+        assert ls["peak_lsp_rss_mb"] >= 333.0

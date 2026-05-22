@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import PET_AVAILABLE, make_lifespan_state
+from tests.conftest import COQLSP_AVAILABLE, PET_AVAILABLE, make_lifespan_state
 
 pytestmark = pytest.mark.skipif(not PET_AVAILABLE, reason="pet not available")
 
@@ -171,3 +171,62 @@ class TestNotFoundEnrichmentRealPet:
             assert len(not_found) >= 1
         finally:
             _invalidate_pet(ls)
+
+
+# ---------------------------------------------------------------------------
+# coq-lsp memory watchdog (real coq-lsp, fake threshold)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not COQLSP_AVAILABLE, reason="coq-lsp not available")
+class TestLspMemoryWatchdogRealLsp:
+    """Mock tests cover the LSP watchdog cancellation logic in isolation;
+    this pins the end-to-end wiring against a real coq-lsp subprocess.
+    We force a 1 MB cap so a freshly spawned coq-lsp -- which uses tens
+    of MB even idle -- breaches the threshold on the first sample and
+    triggers the abort path."""
+
+    @pytest.mark.asyncio
+    async def test_memory_watchdog_aborts_real_lsp_call(self, workspace, monkeypatch):
+        import rocq_mcp.server as _server
+        from rocq_mcp.server import _invalidate_lsp, rocq_compile_lsp
+
+        class _Ctx:
+            def __init__(self, lifespan_state):
+                self.lifespan_context = lifespan_state
+
+        # Cap coq-lsp RSS at 1 MB.  Real coq-lsp uses tens of MB even
+        # idle, so the watchdog must fire on the first sample.
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 1)
+        # Speed up watchdog poll so it samples within the call budget.
+        monkeypatch.setattr(_server, "_MEMORY_WATCHDOG_INTERVAL", 0.05)
+
+        vfile = Path(workspace) / "real_lsp_mem.v"
+        vfile.write_text("Theorem t : True. Proof. exact I. Qed.\n")
+
+        ls = make_lifespan_state(pet_timeout=30.0, full=True)
+        ls["workspace"] = str(workspace)
+        ls["recent_errors"] = deque(maxlen=10)
+
+        ctx = _Ctx(ls)
+        try:
+            result = await rocq_compile_lsp(
+                file=str(vfile),
+                workspace=str(workspace),
+                timeout=15,  # generous so it's the watchdog that fires, not timeout
+                ctx=ctx,
+            )
+            assert result["success"] is False
+            assert result["reason"] == "memory_exhausted"
+            assert result.get("lsp_restarted") is True
+            # _invalidate_lsp cleared the cached checker so the next call respawns.
+            assert ls.get("lsp_checker") is None
+            assert ls.get("lsp_generation", 0) >= 1
+            # Recent-errors trail picks it up under the same reason.
+            assert any(
+                e.get("reason") == "memory_exhausted"
+                and e.get("tool") == "rocq_compile_lsp"
+                for e in ls["recent_errors"]
+            )
+        finally:
+            _invalidate_lsp(ls)
