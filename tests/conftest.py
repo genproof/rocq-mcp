@@ -278,6 +278,7 @@ def make_lifespan_state(pet_timeout: float = 30.0, *, full: bool = False) -> dic
                 "total_spawns": 0,
                 "peak_pet_rss_mb": 0.0,
                 "pet_generation": 0,
+                "pet_trim_count": 0,
                 "lsp_checker": None,
                 "peak_lsp_rss_mb": 0.0,
                 "lsp_generation": 0,

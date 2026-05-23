@@ -78,6 +78,7 @@ class TestDiagSchema:
             "uptime_seconds",
             "restarts",
             "generation",
+            "trim_count",
         }
         assert set(snap["lsp"].keys()) == {
             "pid",
@@ -88,6 +89,7 @@ class TestDiagSchema:
             "pet_rss_mb",
             "peak_pet_rss_mb",
             "max_rss_mb_threshold",
+            "trim_rss_mb_threshold",
             "sample_status",
             "lsp_rss_mb",
             "peak_lsp_rss_mb",
@@ -108,6 +110,7 @@ class TestDiagSchema:
         assert snap["pet"]["uptime_seconds"] == 0.0
         assert snap["pet"]["restarts"] == 0
         assert snap["pet"]["generation"] == 0
+        assert snap["pet"]["trim_count"] == 0
         assert snap["memory"]["pet_rss_mb"] is None
         assert snap["memory"]["peak_pet_rss_mb"] == 0.0
         assert snap["memory"]["sample_status"] == "no_pet"

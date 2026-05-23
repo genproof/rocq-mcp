@@ -687,3 +687,184 @@ class TestLspCheckerTrimWire:
                '"method": "coq/trimCaches"' in payload
         # Notification (no id) per LSP convention.
         assert '"id"' not in payload
+
+
+# ---------------------------------------------------------------------------
+# Pet soft trim (ROCQ_PET_TRIM_RSS_MB + petanque/trimCaches)
+# ---------------------------------------------------------------------------
+
+
+def _mock_pet_with_stdin(pid: int = 12345):
+    """Mock pet client whose ``.process.stdin`` captures every byte written.
+
+    The default ``_mock_pet`` sets stdin to None so the wire-level write
+    in ``_send_pet_trim_notification`` would short-circuit; the soft
+    trim path needs a real (buffered) stdin we can inspect.
+    """
+    from io import BytesIO
+
+    m = _mock_pet(pid=pid)
+    m.process.stdin = BytesIO()
+    return m
+
+
+class TestPetSoftTrim:
+    """pet inherits Flèche's unbounded global memo tables.  When RSS
+    crosses ROCQ_PET_TRIM_RSS_MB on a successful call, we send the
+    petanque/trimCaches notification to free them WITHOUT killing pet.
+    Client-held state_ids stay valid (pet's obj_map is untouched).
+    """
+
+    @pytest.mark.asyncio
+    async def test_high_rss_after_call_triggers_trim(self, monkeypatch):
+        """RSS above ROCQ_PET_TRIM_RSS_MB on a successful call -> notification sent."""
+        # Hard cap high so the watchdog doesn't abort us.
+        monkeypatch.setattr(_server, "ROCQ_MAX_PET_RSS_MB", 10_000)
+        # Soft cap at 100 MB; sampled RSS will be 500 MB -> trim fires.
+        monkeypatch.setattr(_server, "ROCQ_PET_TRIM_RSS_MB", 100)
+        _patch_psutil_rss(monkeypatch, 500)
+
+        mock = _mock_pet_with_stdin()
+        lifespan_state = make_lifespan_state(full=True)
+        lifespan_state["pet_client"] = mock
+        monkeypatch.setattr(_server, "_ensure_pet", lambda ls: mock)
+
+        def fn_quick(pet):
+            return {"success": True}
+
+        result = await _run_with_pet(fn_quick, lifespan_state, "Op")
+
+        assert result == {"success": True}
+        # The notification bytes hit pet's stdin.
+        wire = mock.process.stdin.getvalue().decode("utf-8")
+        assert "Content-Length:" in wire
+        assert '"petanque/trimCaches"' in wire
+        # Notification: no `"id"` field.
+        assert '"id"' not in wire
+        # Bookkeeping was bumped.
+        assert lifespan_state["pet_trim_count"] == 1
+        # Peak reset so post-trim watermark is honest.
+        assert lifespan_state["peak_pet_rss_mb"] == 0.0
+        # Soft trim does NOT touch the pet client (no kill/restart).
+        assert lifespan_state["pet_client"] is mock
+
+    @pytest.mark.asyncio
+    async def test_low_rss_does_not_trigger_trim(self, monkeypatch):
+        """RSS below the soft threshold -> no notification, no bookkeeping bump."""
+        monkeypatch.setattr(_server, "ROCQ_MAX_PET_RSS_MB", 10_000)
+        monkeypatch.setattr(_server, "ROCQ_PET_TRIM_RSS_MB", 1_000)
+        _patch_psutil_rss(monkeypatch, 50)  # well below 1 GB soft threshold
+
+        mock = _mock_pet_with_stdin()
+        lifespan_state = make_lifespan_state(full=True)
+        lifespan_state["pet_client"] = mock
+        monkeypatch.setattr(_server, "_ensure_pet", lambda ls: mock)
+
+        def fn_quick(pet):
+            return {"success": True}
+
+        await _run_with_pet(fn_quick, lifespan_state, "Op")
+
+        assert mock.process.stdin.getvalue() == b""
+        assert lifespan_state["pet_trim_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_trim_threshold_disabled_when_zero(self, monkeypatch):
+        """ROCQ_PET_TRIM_RSS_MB=0 disables the soft trim entirely."""
+        monkeypatch.setattr(_server, "ROCQ_MAX_PET_RSS_MB", 10_000)
+        monkeypatch.setattr(_server, "ROCQ_PET_TRIM_RSS_MB", 0)
+        _patch_psutil_rss(monkeypatch, 9_999)  # huge RSS but trim disabled
+
+        mock = _mock_pet_with_stdin()
+        lifespan_state = make_lifespan_state(full=True)
+        lifespan_state["pet_client"] = mock
+        monkeypatch.setattr(_server, "_ensure_pet", lambda ls: mock)
+
+        def fn_quick(pet):
+            return {"success": True}
+
+        await _run_with_pet(fn_quick, lifespan_state, "Op")
+
+        assert mock.process.stdin.getvalue() == b""
+        assert lifespan_state["pet_trim_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_trim_not_sent_on_memory_abort(self, monkeypatch):
+        """When the watchdog kills pet for OOM, we don't ALSO send a trim.
+        The hard cap's recovery path is the right action; trying to write
+        to a freshly killed pet's stdin would just raise BrokenPipe."""
+        monkeypatch.setattr(_server, "ROCQ_MAX_PET_RSS_MB", 100)
+        # Both caps breached, but the watchdog should win first.
+        monkeypatch.setattr(_server, "ROCQ_PET_TRIM_RSS_MB", 50)
+        monkeypatch.setattr(_server, "_MEMORY_WATCHDOG_INTERVAL", 0.01)
+        _patch_psutil_rss(monkeypatch, 500)
+
+        mock = _mock_pet_with_stdin()
+        lifespan_state = make_lifespan_state(full=True)
+        lifespan_state["pet_client"] = mock
+        monkeypatch.setattr(_server, "_ensure_pet", lambda ls: mock)
+        monkeypatch.setattr(
+            _server, "_invalidate_pet", lambda ls: ls.update(pet_client=None)
+        )
+
+        def fn_long(pet):
+            time.sleep(0.2)
+            return {"success": True}
+
+        result = await _run_with_pet(fn_long, lifespan_state, "Op")
+        assert result["reason"] == "memory_exhausted"
+        # Trim was NOT sent: the abort path runs instead of the success path.
+        assert lifespan_state["pet_trim_count"] == 0
+
+
+class TestPetTrimWireFormat:
+    """The bytes we write must look like a valid LSP-framed JSON-RPC
+    notification (no id, method = petanque/trimCaches).  Older pet
+    binaries ignore unknown notifications, so sending the notification
+    is safe regardless of whether the patched handler is present.
+    """
+
+    def test_trim_notification_wire_bytes(self):
+        from io import BytesIO
+
+        from rocq_mcp.server import _send_pet_trim_notification
+
+        captured = BytesIO()
+        client = MagicMock()
+        client.process = MagicMock()
+        client.process.stdin = captured
+
+        assert _send_pet_trim_notification(client) is True
+
+        payload = captured.getvalue().decode("utf-8")
+        assert "Content-Length:" in payload
+        # Method exists.
+        assert (
+            '"method":"petanque/trimCaches"' in payload
+            or '"method": "petanque/trimCaches"' in payload
+        )
+        # Notification, not a request: no id.
+        assert '"id"' not in payload
+        # JSON-RPC 2.0.
+        assert '"jsonrpc"' in payload
+
+    def test_trim_notification_is_safe_on_dead_pipe(self):
+        """A broken pipe / dead pet must not raise; the soft trim is best-effort."""
+        from rocq_mcp.server import _send_pet_trim_notification
+
+        client = MagicMock()
+        client.process = MagicMock()
+        broken = MagicMock()
+        broken.write.side_effect = BrokenPipeError("pet died")
+        client.process.stdin = broken
+
+        # Returns False, does not raise.
+        assert _send_pet_trim_notification(client) is False
+
+    def test_trim_notification_when_no_process(self):
+        """No process / no stdin -> returns False, no exception."""
+        from rocq_mcp.server import _send_pet_trim_notification
+
+        client = MagicMock()
+        client.process = None
+        assert _send_pet_trim_notification(client) is False
