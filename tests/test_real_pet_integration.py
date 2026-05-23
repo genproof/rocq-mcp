@@ -171,3 +171,62 @@ class TestNotFoundEnrichmentRealPet:
             assert len(not_found) >= 1
         finally:
             _invalidate_pet(ls)
+
+
+# ---------------------------------------------------------------------------
+# Pet soft trim (ROCQ_PET_TRIM_RSS_MB) against a real patched pet
+# ---------------------------------------------------------------------------
+
+
+class TestPetSoftTrimRealPet:
+    """Mock tests cover the trigger logic in isolation; this exercises
+    the end-to-end wire against a real pet subprocess.  We force a 1 MB
+    soft cap so any freshly spawned pet -- which uses tens of MB even
+    idle -- breaches the threshold on the first call and triggers the
+    petanque/trimCaches notification.
+
+    The notification is a no-op on unpatched pets (logged as "unhandled
+    notification" and ignored), so this test pins the wire-level
+    contract regardless.  On patched pets, the notification clears
+    Fleche's global memo tables.
+    """
+
+    @pytest.mark.asyncio
+    async def test_soft_trim_fires_after_real_pet_call(self, workspace, monkeypatch):
+        import rocq_mcp.server as _server
+        from rocq_mcp.interactive import run_query
+
+        # Hard cap high so the watchdog does NOT abort the call.
+        monkeypatch.setattr(_server, "ROCQ_MAX_PET_RSS_MB", 100_000)
+        # Soft cap at 1 MB so any real pet breaches it on the first sample.
+        monkeypatch.setattr(_server, "ROCQ_PET_TRIM_RSS_MB", 1)
+
+        ls = make_lifespan_state(pet_timeout=30.0, full=True)
+        ls["recent_errors"] = deque(maxlen=10)
+        try:
+            # Drive a real pet call to spawn pet + run a query.
+            ok = await run_query(
+                command="Check Nat.add.",
+                preamble="",
+                workspace=str(workspace),
+                lifespan_state=ls,
+            )
+            assert ok["success"] is True
+            # Soft trim must have fired exactly once on the post-call
+            # sampling.  Pet stays alive (no kill/restart).
+            assert ls["pet_trim_count"] == 1
+            assert ls["pet_client"] is not None
+            assert ls["pet_generation"] == 0  # NOT bumped by soft trim
+            # Subsequent calls must still work (notification didn't break
+            # the connection).
+            ok2 = await run_query(
+                command="Check Nat.mul.",
+                preamble="",
+                workspace=str(workspace),
+                lifespan_state=ls,
+            )
+            assert ok2["success"] is True
+            # And another trim should fire (RSS still above the 1 MB cap).
+            assert ls["pet_trim_count"] == 2
+        finally:
+            _server._invalidate_pet(ls)

@@ -53,6 +53,19 @@ def _default_max_pet_rss_mb() -> int:
 ROCQ_MAX_PET_RSS_MB: int = int(
     os.environ.get("ROCQ_MAX_PET_RSS_MB", str(_default_max_pet_rss_mb()))
 )
+# Soft cap: when pet RSS exceeds this after a successful call, the
+# server sends the ``petanque/trimCaches`` notification to free pet's
+# unbounded global memo tables (Memo.{Intern,Interp,Admit,Init,Require})
+# WITHOUT killing the process -- client-held state_ids stay valid
+# because the int<->State.t obj_map is untouched.  Requires a patched
+# pet binary that handles the notification (older pets log it as
+# "unhandled notification" and otherwise ignore it -- safe to send).
+# Default: half the hard cap.  Set to 0 to disable soft trimming.
+ROCQ_PET_TRIM_RSS_MB: int = int(
+    os.environ.get(
+        "ROCQ_PET_TRIM_RSS_MB", str(max(1, ROCQ_MAX_PET_RSS_MB // 2))
+    )
+)
 _MEMORY_WATCHDOG_INTERVAL: float = 0.5
 _RECENT_ERRORS_MAX: int = 20
 
@@ -78,6 +91,9 @@ async def app_lifespan(server: Any) -> Any:
         "total_spawns": 0,
         "peak_pet_rss_mb": 0.0,
         "pet_generation": 0,
+        # Count of petanque/trimCaches notifications sent so far
+        # (ROCQ_PET_TRIM_RSS_MB).
+        "pet_trim_count": 0,
         "recent_errors": collections.deque(maxlen=_RECENT_ERRORS_MAX),
     }
     try:
@@ -909,6 +925,74 @@ async def _build_memory_abort_response(
     )
 
 
+def _send_pet_trim_notification(pet_client: Any) -> bool:
+    """Send a ``petanque/trimCaches`` notification over pet's stdin.
+
+    Returns True on success, False on any I/O failure (broken pipe,
+    process dead, etc.) -- best-effort; never raises.  Caller is
+    responsible for holding any synchronisation needed to avoid
+    interleaving writes with another concurrent caller.  Within
+    :func:`_run_with_pet` this is guaranteed by the per-call asyncio
+    semaphore.
+
+    Older pet binaries that don't yet handle ``petanque/trimCaches``
+    log it as an "unhandled notification" and otherwise ignore it --
+    safe to send.  See :data:`ROCQ_PET_TRIM_RSS_MB`.
+    """
+    process = getattr(pet_client, "process", None)
+    if process is None or getattr(process, "stdin", None) is None:
+        return False
+    import json as _json
+
+    payload = _json.dumps({"jsonrpc": "2.0", "method": "petanque/trimCaches"})
+    encoded = payload.encode("utf-8")
+    header = f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii")
+    try:
+        process.stdin.write(header + encoded)
+        process.stdin.flush()
+        return True
+    except (BrokenPipeError, OSError, ValueError):
+        return False
+
+
+def _maybe_trim_pet_caches(lifespan_state: dict[str, Any]) -> None:
+    """Send ``petanque/trimCaches`` when pet RSS is above the soft cap.
+
+    No-op when ``ROCQ_PET_TRIM_RSS_MB <= 0`` or when the live RSS
+    sample is unavailable / below the threshold.  On success,
+    increments ``lifespan_state["pet_trim_count"]`` and resets
+    ``peak_pet_rss_mb`` so the watchdog's peak tracking shows the
+    post-trim high-water mark on subsequent calls.
+
+    Runs synchronously after a successful pet call, while the asyncio
+    pet semaphore is still held -- so no concurrent caller can be
+    writing to pet's stdin.
+    """
+    if ROCQ_PET_TRIM_RSS_MB <= 0:
+        return
+    client = lifespan_state.get("pet_client")
+    if client is None or getattr(client, "process", None) is None:
+        return
+    try:
+        rss_bytes = psutil.Process(client.process.pid).memory_info().rss
+    except (psutil.Error, AttributeError, OSError, TypeError):
+        # TypeError covers tests passing a MagicMock pid; the watchdog
+        # path tolerates the same family of errors (see _memory_watchdog).
+        return
+    try:
+        rss_mb = int(rss_bytes) // (1024 * 1024)
+    except (TypeError, ValueError):
+        return
+    if rss_mb <= ROCQ_PET_TRIM_RSS_MB:
+        return
+    if not _send_pet_trim_notification(client):
+        return
+    lifespan_state["pet_trim_count"] = (
+        lifespan_state.get("pet_trim_count", 0) + 1
+    )
+    lifespan_state["peak_pet_rss_mb"] = 0.0
+
+
 async def _memory_watchdog(
     lifespan_state: dict[str, Any],
     max_rss_mb: int,
@@ -1082,6 +1166,14 @@ async def _run_with_pet(
         try:
             try:
                 result = await asyncio.wait_for(main_task, timeout=_timeout)
+                # Soft trim: pet inherits Flèche's unbounded global memo
+                # tables.  When RSS crosses ROCQ_PET_TRIM_RSS_MB on a
+                # successful call, send petanque/trimCaches to free them
+                # without killing pet -- client-held state_ids stay valid
+                # because pet's int<->State.t obj_map is untouched.  The
+                # hard ROCQ_MAX_PET_RSS_MB cap remains the runaway safety
+                # net.
+                _maybe_trim_pet_caches(lifespan_state)
                 return result
             finally:
                 if not monitor_task.done():
@@ -2011,11 +2103,13 @@ async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
 
     Response shape:
 
-    - ``pet``: ``{pid, uptime_seconds, restarts, generation}``
+    - ``pet``: ``{pid, uptime_seconds, restarts, generation, trim_count}``.
+      ``trim_count`` is the number of ``petanque/trimCaches`` notifications
+      sent so far (see ``ROCQ_PET_TRIM_RSS_MB``).
     - ``memory``: ``{pet_rss_mb, peak_pet_rss_mb, max_rss_mb_threshold,
-      sample_status}`` where ``sample_status`` is one of ``"ok"`` /
-      ``"no_pet"`` / ``"psutil_error"`` and disambiguates a ``None``
-      ``pet_rss_mb``.
+      trim_rss_mb_threshold, sample_status}`` where ``sample_status``
+      is one of ``"ok"`` / ``"no_pet"`` / ``"psutil_error"`` and
+      disambiguates a ``None`` ``pet_rss_mb``.
     - ``live_states``: capped at 50 most-recent entries (by
       ``created_at``) to keep the payload bounded.  Each entry has
       ``{state_id, parent, file, theorem, age_seconds}``.

@@ -77,11 +77,13 @@ class TestDiagSchema:
             "uptime_seconds",
             "restarts",
             "generation",
+            "trim_count",
         }
         assert set(snap["memory"].keys()) == {
             "pet_rss_mb",
             "peak_pet_rss_mb",
             "max_rss_mb_threshold",
+            "trim_rss_mb_threshold",
             "sample_status",
         }
         assert isinstance(snap["live_states"], list)
@@ -97,6 +99,7 @@ class TestDiagSchema:
         assert snap["pet"]["uptime_seconds"] == 0.0
         assert snap["pet"]["restarts"] == 0
         assert snap["pet"]["generation"] == 0
+        assert snap["pet"]["trim_count"] == 0
         assert snap["memory"]["pet_rss_mb"] is None
         assert snap["memory"]["peak_pet_rss_mb"] == 0.0
         assert snap["memory"]["sample_status"] == "no_pet"

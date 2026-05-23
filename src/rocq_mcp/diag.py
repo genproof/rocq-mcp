@@ -116,11 +116,13 @@ def _build_diag_snapshot(lifespan_state: dict[str, Any]) -> dict[str, Any]:
             "uptime_seconds": uptime,
             "restarts": max(0, total_spawns - 1),
             "generation": int(lifespan_state.get("pet_generation", 0)),
+            "trim_count": int(lifespan_state.get("pet_trim_count", 0)),
         },
         "memory": {
             "pet_rss_mb": pet_rss_mb,
             "peak_pet_rss_mb": peak,
             "max_rss_mb_threshold": float(_server.ROCQ_MAX_PET_RSS_MB),
+            "trim_rss_mb_threshold": float(_server.ROCQ_PET_TRIM_RSS_MB),
             "sample_status": sample_status,
         },
         "live_states": live_states,
