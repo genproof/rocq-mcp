@@ -153,6 +153,7 @@ def _build_diag_snapshot(lifespan_state: dict[str, Any]) -> dict[str, Any]:
         "lsp": {
             "pid": lsp_pid,
             "generation": int(lifespan_state.get("lsp_generation", 0)),
+            "trim_count": int(lifespan_state.get("lsp_trim_count", 0)),
         },
         "memory": {
             "pet_rss_mb": pet_rss_mb,
@@ -162,6 +163,7 @@ def _build_diag_snapshot(lifespan_state: dict[str, Any]) -> dict[str, Any]:
             "lsp_rss_mb": lsp_rss_mb,
             "peak_lsp_rss_mb": lsp_peak,
             "lsp_max_rss_mb_threshold": float(_server.ROCQ_MAX_LSP_RSS_MB),
+            "lsp_trim_rss_mb_threshold": float(_server.ROCQ_LSP_TRIM_RSS_MB),
             "lsp_sample_status": lsp_sample_status,
         },
         "live_states": live_states,

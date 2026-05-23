@@ -455,6 +455,7 @@ def _mock_lsp_checker(pid: int = 54321, alive: bool = True):
         time.sleep(0.2) or {"success": True, "errors": [], "warnings": [], "check_time_ms": 200}
     )
     checker.stop = MagicMock()
+    checker.trim_caches = MagicMock()
     return checker
 
 
@@ -556,3 +557,133 @@ class TestLspMemoryWatchdogBreach:
         ctx = _MockLspContext(ls)
         await rocq_compile_lsp(file=str(vfile), workspace=str(tmp_path), ctx=ctx)
         assert ls["peak_lsp_rss_mb"] >= 333.0
+
+
+class TestLspSoftThresholdTrim:
+    """coq-lsp memo caches grow unboundedly across calls (Memo.Interp /
+    Admit / Init / Require / Intern, each an unbounded OCaml Hashtbl).
+
+    When RSS crosses ROCQ_LSP_TRIM_RSS_MB on a successful check, we
+    send the `coq/trimCaches` notification to free memory WITHOUT
+    killing coq-lsp.  The hard ROCQ_MAX_LSP_RSS_MB cap (covered by
+    TestLspMemoryWatchdogBreach) remains the runaway safety net.
+    """
+
+    @pytest.mark.asyncio
+    async def test_high_rss_after_check_triggers_trim(self, tmp_path, monkeypatch):
+        """RSS above ROCQ_LSP_TRIM_RSS_MB on a successful check -> trim_caches called once."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        # Hard cap well above sampled RSS so the watchdog does not abort.
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 10_000)
+        # Soft cap at 100 MB; sampled RSS will be 500 MB -> trim fires.
+        monkeypatch.setattr(_server, "ROCQ_LSP_TRIM_RSS_MB", 100)
+        _patch_psutil_rss(monkeypatch, 500)
+
+        vfile = tmp_path / "trim.v"
+        vfile.write_text("Theorem t : True. Proof. exact I. Qed.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()
+        # Return quickly so the watchdog doesn't preempt with a hard abort.
+        checker.check_file.side_effect = lambda *a, **kw: {
+            "success": True, "errors": [], "warnings": [], "check_time_ms": 1,
+        }
+        ls["lsp_checker"] = checker
+
+        ctx = _MockLspContext(ls)
+        result = await rocq_compile_lsp(
+            file=str(vfile), workspace=str(tmp_path), ctx=ctx
+        )
+
+        assert result["success"] is True
+        assert checker.trim_caches.call_count == 1
+        assert ls.get("lsp_trim_count", 0) == 1
+        # Soft trim must NOT kill coq-lsp (that's the hard cap's job).
+        assert not checker.stop.called
+        assert ls["lsp_checker"] is checker
+
+    @pytest.mark.asyncio
+    async def test_low_rss_does_not_trigger_trim(self, tmp_path, monkeypatch):
+        """RSS below the soft threshold -> no trim, no cost."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 10_000)
+        monkeypatch.setattr(_server, "ROCQ_LSP_TRIM_RSS_MB", 1_000)
+        _patch_psutil_rss(monkeypatch, 50)  # well below 1 GB soft threshold
+
+        vfile = tmp_path / "no_trim.v"
+        vfile.write_text("Theorem t : True. Proof. exact I. Qed.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()
+        checker.check_file.side_effect = lambda *a, **kw: {
+            "success": True, "errors": [], "warnings": [], "check_time_ms": 1,
+        }
+        ls["lsp_checker"] = checker
+
+        ctx = _MockLspContext(ls)
+        await rocq_compile_lsp(file=str(vfile), workspace=str(tmp_path), ctx=ctx)
+
+        assert not checker.trim_caches.called
+        assert ls.get("lsp_trim_count", 0) == 0
+
+    @pytest.mark.asyncio
+    async def test_trim_threshold_disabled_when_zero(self, tmp_path, monkeypatch):
+        """Setting ROCQ_LSP_TRIM_RSS_MB=0 disables the soft trim entirely."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 10_000)
+        monkeypatch.setattr(_server, "ROCQ_LSP_TRIM_RSS_MB", 0)
+        _patch_psutil_rss(monkeypatch, 9_999)  # huge RSS but trim disabled
+
+        vfile = tmp_path / "disabled.v"
+        vfile.write_text("Theorem t : True. Proof. exact I. Qed.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()
+        checker.check_file.side_effect = lambda *a, **kw: {
+            "success": True, "errors": [], "warnings": [], "check_time_ms": 1,
+        }
+        ls["lsp_checker"] = checker
+
+        ctx = _MockLspContext(ls)
+        await rocq_compile_lsp(file=str(vfile), workspace=str(tmp_path), ctx=ctx)
+
+        assert not checker.trim_caches.called
+
+
+class TestLspCheckerTrimWire:
+    """LspChecker.trim_caches must send the canonical coq-lsp
+    `coq/trimCaches` notification — the supported escape valve from
+    fleche/memo.ml's unbounded global Hashtbls.
+    """
+
+    def test_trim_caches_sends_coq_trimcaches_notification(self):
+        from io import BytesIO
+        from rocq_mcp.lsp_checker import LspChecker
+
+        # Stand-in subprocess: capture every byte written to stdin.
+        sent = BytesIO()
+        process = MagicMock()
+        process.stdin = sent
+        process.stdout = BytesIO()
+        process.poll.return_value = None
+
+        checker = LspChecker(workspace="/tmp")
+        checker._process = process
+        checker._initialized = True
+
+        checker.trim_caches()
+
+        payload = sent.getvalue().decode("utf-8")
+        # LSP framing: Content-Length header followed by JSON body.
+        assert "Content-Length:" in payload
+        # The actual notification method name.
+        assert '"method":"coq/trimCaches"' in payload or \
+               '"method": "coq/trimCaches"' in payload
+        # Notification (no id) per LSP convention.
+        assert '"id"' not in payload

@@ -59,6 +59,16 @@ ROCQ_MAX_PET_RSS_MB: int = int(
 ROCQ_MAX_LSP_RSS_MB: int = int(
     os.environ.get("ROCQ_MAX_LSP_RSS_MB", str(_default_max_pet_rss_mb()))
 )
+# Soft cap: when coq-lsp RSS exceeds this after a successful check, the
+# server sends ``coq/trimCaches`` to free coq-lsp's unbounded global
+# memo tables (Memo.{Intern,Interp,Admit,Init,Require}) WITHOUT killing
+# the process -- preserving incremental cache for the active file.
+# Default: half the hard cap.  Set to 0 to disable soft trimming.
+ROCQ_LSP_TRIM_RSS_MB: int = int(
+    os.environ.get(
+        "ROCQ_LSP_TRIM_RSS_MB", str(max(1, ROCQ_MAX_LSP_RSS_MB // 2))
+    )
+)
 _MEMORY_WATCHDOG_INTERVAL: float = 0.5
 _RECENT_ERRORS_MAX: int = 20
 
@@ -88,6 +98,8 @@ async def app_lifespan(server: Any) -> Any:
         # Parallel LSP-side bookkeeping (see ROCQ_MAX_LSP_RSS_MB).
         "peak_lsp_rss_mb": 0.0,
         "lsp_generation": 0,
+        # Count of coq/trimCaches notifications sent so far (ROCQ_LSP_TRIM_RSS_MB).
+        "lsp_trim_count": 0,
         "recent_errors": collections.deque(maxlen=_RECENT_ERRORS_MAX),
     }
     try:
@@ -2104,14 +2116,16 @@ async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
     Response shape:
 
     - ``pet``: ``{pid, uptime_seconds, restarts, generation}``
-    - ``lsp``: ``{pid, generation}`` -- coq-lsp subprocess.  ``pid`` is
-      ``None`` when coq-lsp is not running.
+    - ``lsp``: ``{pid, generation, trim_count}`` -- coq-lsp subprocess
+      bookkeeping.  ``pid`` is ``None`` when coq-lsp is not running.
+      ``trim_count`` is the number of ``coq/trimCaches`` notifications
+      sent so far (see ``ROCQ_LSP_TRIM_RSS_MB``).
     - ``memory``: ``{pet_rss_mb, peak_pet_rss_mb, max_rss_mb_threshold,
       sample_status, lsp_rss_mb, peak_lsp_rss_mb,
-      lsp_max_rss_mb_threshold, lsp_sample_status}``.  The
-      ``sample_status`` fields are one of ``"ok"`` / ``"no_pet"`` (or
-      ``"no_lsp"``) / ``"psutil_error"`` and disambiguate a ``None``
-      RSS reading.
+      lsp_max_rss_mb_threshold, lsp_trim_rss_mb_threshold,
+      lsp_sample_status}``.  The ``sample_status`` fields are one of
+      ``"ok"`` / ``"no_pet"`` (or ``"no_lsp"``) / ``"psutil_error"``
+      and disambiguate a ``None`` RSS reading.
     - ``live_states``: capped at 50 most-recent entries (by
       ``created_at``) to keep the payload bounded.  Each entry has
       ``{state_id, parent, file, theorem, age_seconds}``.
@@ -2236,10 +2250,56 @@ async def rocq_compile_lsp(
             )
         raise
 
+    # Soft trim: coq-lsp's global memo tables (Memo.{Intern, Interp,
+    # Admit, Init, Require}) grow unboundedly across calls.  When RSS
+    # crosses ROCQ_LSP_TRIM_RSS_MB on a successful check, send
+    # coq/trimCaches to free them without killing coq-lsp -- this
+    # preserves the incremental cache for the file the agent is
+    # actively editing.  ROCQ_LSP_TRIM_RSS_MB=0 disables this path;
+    # the hard ROCQ_MAX_LSP_RSS_MB cap remains the runaway safety net.
+    _maybe_trim_lsp_caches(lifespan_state, checker)
+
     if not include_warnings:
         result.pop("warnings", None)
 
     return result
+
+
+def _maybe_trim_lsp_caches(
+    lifespan_state: dict[str, Any], checker: Any
+) -> None:
+    """Send ``coq/trimCaches`` to coq-lsp when RSS is above the soft cap.
+
+    No-op when ``ROCQ_LSP_TRIM_RSS_MB <= 0`` or when the live RSS sample
+    is unavailable / below the threshold.  On success, increments
+    ``lifespan_state["lsp_trim_count"]`` and resets
+    ``peak_lsp_rss_mb`` so future peak tracking reflects post-trim
+    growth.
+    """
+    if ROCQ_LSP_TRIM_RSS_MB <= 0:
+        return
+    process = _lsp_process_from_state(lifespan_state)
+    if process is None:
+        return
+    try:
+        rss_bytes = psutil.Process(process.pid).memory_info().rss
+    except (psutil.Error, AttributeError, OSError):
+        return
+    rss_mb = rss_bytes // (1024 * 1024)
+    if rss_mb <= ROCQ_LSP_TRIM_RSS_MB:
+        return
+    try:
+        checker.trim_caches()
+    except Exception:
+        # trim_caches itself is best-effort; never let a trim failure
+        # turn a successful check into a tool-level error.
+        return
+    lifespan_state["lsp_trim_count"] = (
+        lifespan_state.get("lsp_trim_count", 0) + 1
+    )
+    # Reset peak so the watchdog's peak tracking shows the post-trim
+    # high-water mark on subsequent calls.
+    lifespan_state["peak_lsp_rss_mb"] = 0.0
 
 
 # ---------------------------------------------------------------------------

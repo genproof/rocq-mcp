@@ -281,6 +281,7 @@ def make_lifespan_state(pet_timeout: float = 30.0, *, full: bool = False) -> dic
                 "lsp_checker": None,
                 "peak_lsp_rss_mb": 0.0,
                 "lsp_generation": 0,
+                "lsp_trim_count": 0,
                 "recent_errors": collections.deque(maxlen=_server._RECENT_ERRORS_MAX),
             }
         )

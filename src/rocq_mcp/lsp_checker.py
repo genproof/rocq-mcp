@@ -81,6 +81,30 @@ class LspChecker:
             and self._initialized
         )
 
+    def trim_caches(self) -> None:
+        """Tell coq-lsp to free its global memoization tables.
+
+        Sends the ``coq/trimCaches`` notification, which on the server
+        side clears ``Memo.{Intern, Interp, Admit, Init, Require}`` and
+        runs ``Gc.full_major``.  These hashtables otherwise grow without
+        bound across calls (every executed sentence's post-state is
+        cached), which is the dominant memory-growth pattern for
+        long-running coq-lsp processes.
+
+        Safe to call when the server is idle.  No-op if coq-lsp is not
+        running.  Errors during send are swallowed (best-effort
+        recovery -- the next watchdog cycle will catch a truly broken
+        connection).
+        """
+        if not self._is_alive():
+            return
+        try:
+            self._notify("coq/trimCaches", {})
+        except Exception:
+            # Best-effort: if the pipe is broken / coq-lsp is dying,
+            # let the next check_file or watchdog cycle handle it.
+            pass
+
     def stop(self) -> None:
         """Shut down coq-lsp."""
         if self._process and self._process.poll() is None:
