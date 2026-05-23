@@ -80,3 +80,28 @@ class TestLspChecker:
         )
         r = checker.check_file(str(vfile))
         assert r["success"] is True
+
+    def test_info_messages_collected_for_time_qed(self, checker, vfile):
+        """coq-lsp's ``msg_info`` output (e.g. from ``Time Qed.``) must
+        reach ``check_file``'s ``info`` field.  This depends on us
+        sending ``show_coq_info_messages: true`` at LSP startup -- the
+        default cutoff in fleche/doc.ml otherwise drops everything below
+        severity 2.
+        """
+        vfile.write_text(
+            "Lemma t : 1 + 1 = 2.\nProof. reflexivity. Time Qed.\n"
+        )
+        r = checker.check_file(str(vfile))
+        assert r["success"] is True
+        assert "info" in r
+        assert isinstance(r["info"], list)
+        # ``Time Qed.`` emits a "Finished transaction in ..." info line.
+        assert len(r["info"]) >= 1, (
+            f"expected an info entry from `Time Qed.`, got: {r['info']!r}"
+        )
+        all_info_msgs = " ".join(d["message"] for d in r["info"])
+        assert "Finished" in all_info_msgs or "transaction" in all_info_msgs, (
+            f"expected timing text in info messages, got: {all_info_msgs!r}"
+        )
+        # Sanity: errors/warnings are unaffected by the new info path.
+        assert r["errors"] == []
