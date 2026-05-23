@@ -2166,6 +2166,7 @@ async def rocq_compile_lsp(
     workspace: str = "",
     timeout: int = 0,
     include_warnings: bool = False,
+    include_info: bool = False,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Incrementally check a .v file using coq-lsp diagnostics.
@@ -2175,9 +2176,10 @@ async def rocq_compile_lsp(
     edit point.  Everything before the change is cached internally
     by coq-lsp — not re-processed.
 
-    Returns errors (and optionally warnings) reported by coq-lsp.
-    Use this instead of rocq_compile_file when iterating on a proof.
-    Use rocq_compile_file for final authoritative verification with coqc.
+    Returns errors (and optionally warnings and info messages) reported
+    by coq-lsp.  Use this instead of rocq_compile_file when iterating
+    on a proof.  Use rocq_compile_file for final authoritative
+    verification with coqc.
 
     A memory watchdog monitors the coq-lsp subprocess against
     ``ROCQ_MAX_LSP_RSS_MB``; on breach the response is
@@ -2189,6 +2191,12 @@ async def rocq_compile_lsp(
         workspace: Directory to use as workspace (default: ROCQ_WORKSPACE env var).
         timeout: Timeout in seconds (default: ROCQ_COQC_TIMEOUT env var).
         include_warnings: Include warnings in the result (default: False).
+        include_info: Include coq-lsp ``info`` diagnostics in the result
+            (default: False).  Surfaces output from ``msg_info``-emitting
+            commands -- ``Time Qed.`` timings, ``Check`` results,
+            ``Print`` output, etc.  Each entry has the same shape as an
+            error/warning: ``{line, character, end_line, end_character,
+            message, severity}`` with ``severity == 3``.
     """
     workspace = workspace or ROCQ_WORKSPACE
     timeout = timeout if timeout is not None and timeout > 0 else 0  # 0 = no timeout
@@ -2261,6 +2269,8 @@ async def rocq_compile_lsp(
 
     if not include_warnings:
         result.pop("warnings", None)
+    if not include_info:
+        result.pop("info", None)
 
     return result
 

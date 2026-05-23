@@ -656,6 +656,92 @@ class TestLspSoftThresholdTrim:
         assert not checker.trim_caches.called
 
 
+class TestRocqCompileLspInfoFilter:
+    """``rocq_compile_lsp.include_info`` controls whether coq-lsp info
+    diagnostics (e.g. ``Time Qed.`` timings, ``Check`` output) reach
+    the tool response.  Default: hidden, to keep responses compact.
+    """
+
+    @pytest.mark.asyncio
+    async def test_include_info_false_drops_info(self, tmp_path, monkeypatch):
+        """Default (``include_info=False``): ``info`` field is stripped."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        # Keep RSS-trim out of the picture for this test.
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 100_000)
+        monkeypatch.setattr(_server, "ROCQ_LSP_TRIM_RSS_MB", 0)
+        _patch_psutil_rss(monkeypatch, 10)
+
+        vfile = tmp_path / "info_off.v"
+        vfile.write_text("Theorem t : True. Proof. exact I. Qed.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()
+        # check_file always returns an `info` entry; the tool layer
+        # decides whether to surface it.
+        checker.check_file.side_effect = lambda *a, **kw: {
+            "success": True,
+            "errors": [],
+            "warnings": [],
+            "info": [{
+                "line": 1, "character": 0, "end_line": 1, "end_character": 4,
+                "message": "Finished transaction in 0.001 secs",
+                "severity": 3,
+            }],
+            "check_time_ms": 1,
+        }
+        ls["lsp_checker"] = checker
+
+        ctx = _MockLspContext(ls)
+        result = await rocq_compile_lsp(
+            file=str(vfile), workspace=str(tmp_path), ctx=ctx,
+        )
+
+        assert result["success"] is True
+        assert "info" not in result, (
+            f"expected info field stripped by default, got: {result!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_include_info_true_keeps_info(self, tmp_path, monkeypatch):
+        """``include_info=True``: ``info`` field is preserved verbatim."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 100_000)
+        monkeypatch.setattr(_server, "ROCQ_LSP_TRIM_RSS_MB", 0)
+        _patch_psutil_rss(monkeypatch, 10)
+
+        vfile = tmp_path / "info_on.v"
+        vfile.write_text("Theorem t : True. Proof. exact I. Qed.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()
+        expected_info = [{
+            "line": 1, "character": 0, "end_line": 1, "end_character": 4,
+            "message": "Finished transaction in 0.001 secs",
+            "severity": 3,
+        }]
+        checker.check_file.side_effect = lambda *a, **kw: {
+            "success": True,
+            "errors": [],
+            "warnings": [],
+            "info": list(expected_info),
+            "check_time_ms": 1,
+        }
+        ls["lsp_checker"] = checker
+
+        ctx = _MockLspContext(ls)
+        result = await rocq_compile_lsp(
+            file=str(vfile), workspace=str(tmp_path), ctx=ctx,
+            include_info=True,
+        )
+
+        assert result["success"] is True
+        assert result.get("info") == expected_info
+
+
 class TestLspCheckerTrimWire:
     """LspChecker.trim_caches must send the canonical coq-lsp
     `coq/trimCaches` notification — the supported escape valve from

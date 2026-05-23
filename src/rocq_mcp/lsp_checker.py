@@ -59,7 +59,16 @@ class LspChecker:
         self._last_content.clear()
         self._last_diags.clear()
 
-        # LSP initialize
+        # LSP initialize.  We pass our custom settings via
+        # ``initializationOptions`` -- coq-lsp's ``do_initialize``
+        # routes them through ``Rq_init.do_settings`` synchronously,
+        # so the config is in effect by the time the initialize
+        # response arrives.  ``show_coq_info_messages`` enables
+        # ``msg_info`` diagnostics (e.g. ``Time Qed.`` timings,
+        # ``Check`` output) -- see ``of_messages`` in
+        # ``fleche/doc.ml`` and ``show_coq_info_messages`` in
+        # ``fleche/config.ml``.  The tool layer decides whether to
+        # surface them (``rocq_compile_lsp``'s ``include_info``).
         root_uri = Path(self._workspace).as_uri() if self._workspace else None
         self._request("initialize", {
             "processId": os.getpid(),
@@ -69,6 +78,7 @@ class LspChecker:
                 [{"uri": root_uri, "name": "workspace"}]
                 if root_uri else None
             ),
+            "initializationOptions": {"show_coq_info_messages": True},
         })
         # Send initialized notification
         self._notify("initialized", {})
@@ -136,13 +146,18 @@ class LspChecker:
         Returns:
             {
                 "success": bool,       # True if no errors (warnings OK)
-                "errors": [...],       # list of error dicts
-                "warnings": [...],     # list of warning dicts
+                "errors": [...],       # list of error dicts (severity 1)
+                "warnings": [...],     # list of warning dicts (severity 2)
+                "info": [...],         # list of info dicts (severity 3)
                 "check_time_ms": int,
             }
 
-        Each error/warning dict has: line, character, end_line,
-        end_character, message, severity.
+        Each error/warning/info dict has: line, character, end_line,
+        end_character, message, severity.  Info messages include
+        coq-lsp's ``msg_info`` output -- e.g. ``Time Qed.`` timings,
+        ``Check`` results, ``Print`` output -- and are populated only
+        because we send ``workspace/didChangeConfiguration`` with
+        ``show_coq_info_messages: true`` during initialization.
         """
         with self._lock:
             return self._check_file_locked(file_path, workspace, timeout)
@@ -177,10 +192,12 @@ class LspChecker:
             cached = self._last_diags.get(uri, [])
             errors = [d for d in cached if d["severity"] == SEVERITY_ERROR]
             warnings = [d for d in cached if d["severity"] == SEVERITY_WARNING]
+            info = [d for d in cached if d["severity"] == SEVERITY_INFO]
             return {
                 "success": len(errors) == 0,
                 "errors": errors,
                 "warnings": warnings,
+                "info": info,
                 "check_time_ms": 0,
             }
 
@@ -218,11 +235,13 @@ class LspChecker:
 
         errors = [d for d in diagnostics if d["severity"] == SEVERITY_ERROR]
         warnings = [d for d in diagnostics if d["severity"] == SEVERITY_WARNING]
+        info = [d for d in diagnostics if d["severity"] == SEVERITY_INFO]
 
         return {
             "success": len(errors) == 0,
             "errors": errors,
             "warnings": warnings,
+            "info": info,
             "check_time_ms": int(elapsed * 1000),
         }
 
