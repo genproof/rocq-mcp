@@ -150,15 +150,24 @@ class TestGetState:
         assert "n + m = m + n" in r["goals"]
 
     @pytest.mark.asyncio
-    async def test_goal_after_intros(self, proof_ws, lstate):
-        # On the "intros n m." sentence -> state AFTER it (n, m in context).
-        r = await run_get_state(
+    async def test_before_and_after_at_a_tactic(self, proof_ws, lstate):
+        # On the "intros n m." sentence (line 3).  Positions round
+        # backward by default: before=True shows the state the tactic
+        # operates on (the forall goal, before intros); before=False
+        # shows the state after it (n, m in context).
+        before = await run_get_state(
             file="t.v", line=3, character=2, workspace=str(proof_ws),
             lifespan_state=lstate,
         )
-        assert r["success"] is True
-        assert r["in_proof"] is True
-        assert "n, m : nat" in r["goals"]
+        assert before["success"] is True
+        assert "forall" in before["goals"]
+        assert "n, m : nat" not in before["goals"]
+
+        after = await run_get_state(
+            file="t.v", line=3, character=2, workspace=str(proof_ws),
+            lifespan_state=lstate, before=False,
+        )
+        assert "n, m : nat" in after["goals"]
 
     @pytest.mark.asyncio
     async def test_not_in_proof(self, proof_ws, lstate):
@@ -180,9 +189,9 @@ class TestGetState:
         #   3    - admit.
         #   4    - reflexivity.
         #   5  Admitted.
-        # proof/goals reports the state AFTER the sentence under the cursor,
-        # so the state *before* admit is read by pointing at the preceding
-        # sentence -- the bullet `-` -- which shows the goal admit discharges.
+        # Positions round backward by default (before=True), so pointing
+        # AT `admit.` shows the goal it discharges -- the "before admit"
+        # state the user wants -- without having to aim at the bullet.
         src = (
             "Theorem t : 1 = 1 /\\ 2 = 2.\n"
             "Proof.\n"
@@ -192,19 +201,18 @@ class TestGetState:
             "Admitted.\n"
         )
         (tmp_path / "b.v").write_text(src)
-        # On the bullet `-` (char 2): the focused goal, i.e. before admit.
+        # before=True (default): the goal admit operates on.
         r = await run_get_state(
-            file="b.v", line=3, character=2, workspace=str(tmp_path),
+            file="b.v", line=3, character=4, workspace=str(tmp_path),
             lifespan_state=lstate,
         )
         assert r["success"] is True
         assert r["in_proof"] is True
         assert "1 = 1" in r["goals"]
-        # On `admit.` (char 4): the goal is discharged -> gone from the
-        # foreground and recorded as given-up (the state after admit).
+        # before=False: the state after admit -- discharged, given-up.
         r2 = await run_get_state(
             file="b.v", line=3, character=4, workspace=str(tmp_path),
-            lifespan_state=lstate,
+            lifespan_state=lstate, before=False,
         )
         assert r2["goals"] == ""
         assert r2.get("given_up_goals") == 1

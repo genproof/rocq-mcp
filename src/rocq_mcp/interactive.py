@@ -1054,6 +1054,17 @@ def _position_timeout(lifespan_state: dict[str, Any], timeout: float | None) -> 
     return float(lifespan_state.get("op_timeout", 30.0))
 
 
+def _goals_mode(before: bool) -> str:
+    """Map the position tools' ``before`` flag to a proof/goals ``mode``.
+
+    ``before=True`` (the default) -> ``"Prev"``: report the state *before*
+    the sentence at the point -- i.e. the goal that sentence operates on.
+    ``before=False`` -> ``"After"``: the state after it.  See
+    ``LspChecker.goals`` and coq-lsp's ``Info.Prev`` / ``goal_after_tactic``.
+    """
+    return "Prev" if before else "After"
+
+
 async def run_get_state(
     file: str,
     line: int,
@@ -1062,12 +1073,15 @@ async def run_get_state(
     lifespan_state: dict[str, Any],
     *,
     include_warnings: bool = True,
+    before: bool = True,
     timeout: float | None = None,
 ) -> dict[str, Any]:
     """Return the proof goals at a (file, line, character) position.
 
     Stateless: reads the live file via coq-lsp and reports the goals at
-    *position* (0-indexed; coq-lsp rounds forward to a sentence boundary).
+    *position* (0-indexed).  Positions round *backward* by default (the
+    state before the sentence at the point); pass ``before=False`` for the
+    state after it.
     ``goals`` is empty and ``in_proof`` is False when the position is not
     inside a proof; when inside a proof, an empty ``goals`` means no
     foreground goals remain.  No ``state_id`` -- subsequent calls just
@@ -1084,7 +1098,9 @@ async def run_get_state(
     _t = _position_timeout(lifespan_state, timeout)
 
     def _do(checker: Any) -> dict[str, Any]:
-        answer = checker.goals(resolved, line, character, timeout=_t)
+        answer = checker.goals(
+            resolved, line, character, mode=_goals_mode(before), timeout=_t
+        )
         kind, payload = _classify_goals_answer(answer)
         if kind == "timeout":
             return _server._fail(
@@ -1123,6 +1139,7 @@ async def run_step(
     lifespan_state: dict[str, Any],
     *,
     include_warnings: bool = True,
+    before: bool = True,
     timeout: float | None = None,
 ) -> dict[str, Any]:
     """Run a tactic *block* from a position and return the resulting goals.
@@ -1151,7 +1168,8 @@ async def run_step(
 
     def _do(checker: Any) -> dict[str, Any]:
         answer = checker.goals(
-            resolved, line, character, command=tactics, timeout=_t
+            resolved, line, character, command=tactics,
+            mode=_goals_mode(before), timeout=_t,
         )
         kind, payload = _classify_goals_answer(answer)
         if kind == "timeout":
@@ -1199,6 +1217,7 @@ async def run_step_multi(
     lifespan_state: dict[str, Any],
     *,
     include_warnings: bool = True,
+    before: bool = True,
     timeout: float | None = None,
 ) -> dict[str, Any]:
     """Try several tactic blocks from one position; return all outcomes.
@@ -1239,7 +1258,8 @@ async def run_step_multi(
         for tac in tactics:
             entry: dict[str, Any] = {"tactics": tac}
             answer = checker.goals(
-                resolved, line, character, command=tac, timeout=_t
+                resolved, line, character, command=tac,
+                mode=_goals_mode(before), timeout=_t,
             )
             kind, payload = _classify_goals_answer(answer)
             if kind == "transport":

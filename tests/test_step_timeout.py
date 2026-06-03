@@ -81,7 +81,7 @@ class _MockChecker:
         pass
 
     def goals(self, file_path, line, character, *, content=None, command=None,
-              pp_format="Str", timeout=None):
+              pp_format="Str", mode=None, timeout=None):
         if command in self._ok_for:
             return {"goals": {"goals": [], "shelf": [], "given_up": []}, "messages": []}
         return dict(_TIMEOUT_ENVELOPE)

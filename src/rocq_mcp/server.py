@@ -1351,14 +1351,18 @@ async def rocq_get_state(
     character: int,
     workspace: str = "",
     include_warnings: bool = True,
+    before: bool = True,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Show the proof goals at a position in a .v file.
 
     Stateless: reads the live file and reports the goals at
-    ``(line, character)`` (0-indexed; coq-lsp rounds forward to the
-    enclosing sentence boundary).  Use it to inspect a proof mid-way, or
-    to see the goals at an error position reported by ``rocq_compile``.
+    ``(line, character)`` (0-indexed).  By default positions round
+    *backward*: you see the goals the sentence at the point operates on
+    (the state before it runs), so pointing at ``- admit.`` shows the goal
+    admit discharges.  Pass ``before=False`` for the state after the
+    sentence.  Use it to inspect a proof mid-way, or to see the goals at
+    an error position reported by ``rocq_compile``.
 
     Returns ``goals`` (formatted text; empty when no foreground goals
     remain) and ``in_proof`` (False when the position is not inside any
@@ -1372,6 +1376,9 @@ async def rocq_get_state(
         workspace: Workspace directory.  If omitted, auto-detected from
             project markers near *file*; falls back to ``ROCQ_WORKSPACE``.
         include_warnings: Include severity-2 warnings in any messages.
+        before: Round the position backward (default True) -- report the
+            state before the sentence at the point; False reports the
+            state after it.
     """
     workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
     err = _validate_workspace(workspace)
@@ -1392,6 +1399,7 @@ async def rocq_get_state(
         workspace=workspace,
         lifespan_state=ctx.lifespan_context,
         include_warnings=include_warnings,
+        before=before,
     )
 
 
@@ -1409,6 +1417,7 @@ async def rocq_step(
     workspace: str = "",
     timeout: int = 0,
     include_warnings: bool = True,
+    before: bool = True,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Run a tactic block from a position and see the resulting goals.
@@ -1433,6 +1442,9 @@ async def rocq_step(
         workspace: Workspace directory (auto-detected from *file* if omitted).
         timeout: Per-call timeout in seconds (0 = default op timeout).
         include_warnings: Include severity-2 warnings in any block output.
+        before: Run from the state *before* the sentence at the point
+            (default True) -- in place of it; False runs from the state
+            after it.
     """
     workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
     err = _validate_workspace(workspace)
@@ -1455,6 +1467,7 @@ async def rocq_step(
         workspace=workspace,
         lifespan_state=ctx.lifespan_context,
         include_warnings=include_warnings,
+        before=before,
         timeout=_t,
     )
 
@@ -1473,6 +1486,7 @@ async def rocq_step_multi(
     workspace: str = "",
     timeout: int = 0,
     include_warnings: bool = True,
+    before: bool = True,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Try multiple tactic blocks from one position — find what works.
@@ -1496,6 +1510,9 @@ async def rocq_step_multi(
         workspace: Workspace directory (auto-detected from *file* if omitted).
         timeout: Per-call timeout in seconds (0 = default op timeout).
         include_warnings: Include severity-2 warnings in any block output.
+        before: Run from the state *before* the sentence at the point
+            (default True) -- in place of it; False runs from the state
+            after it.
     """
     workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
     err = _validate_workspace(workspace)
@@ -1521,6 +1538,7 @@ async def rocq_step_multi(
         workspace=workspace,
         lifespan_state=ctx.lifespan_context,
         include_warnings=include_warnings,
+        before=before,
         timeout=_t,
     )
 @mcp.tool

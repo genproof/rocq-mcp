@@ -635,6 +635,7 @@ class LspChecker:
         content: str | None = None,
         command: str | None = None,
         pp_format: str = "Str",
+        mode: str | None = None,
         timeout: float = _DEFAULT_REQUEST_TIMEOUT,
     ) -> dict[str, Any]:
         """Return ``proof/goals`` at a point, optionally running *command*.
@@ -644,6 +645,13 @@ class LspChecker:
         speculatively against the state at the point and the resulting
         goals are returned **without mutating the document** — the engine
         for multi-tactic exploration and single-step checking.
+
+        *mode* selects which sentence's state to report relative to the
+        point: ``"Prev"`` = the state *before* the sentence at the point
+        (coq-lsp's ``Info.Prev``), ``"After"`` = the state after it (the
+        coq-lsp default).  ``None`` leaves it to coq-lsp's
+        ``goal_after_tactic`` config.  With a *command*, this is the base
+        state the pretac runs against.
 
         coq-lsp postpones the request until the document is checked up to
         the point, so the response arrival is itself the completion
@@ -671,6 +679,8 @@ class LspChecker:
             }
             if command is not None:
                 params["command"] = command
+            if mode is not None:
+                params["mode"] = mode
             return self._request("proof/goals", params, timeout=timeout)
 
     # ------------------------------------------------------------------
