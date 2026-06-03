@@ -1,7 +1,10 @@
 """Unit tests for the max_results parameter in run_query.
 
-These tests mock _run_with_pet to avoid needing pet — they test
-the feedback truncation and count logic only.
+These tests mock _run_with_lsp (the coq-lsp execution helper) to avoid
+needing a real coq-lsp — they test the info-diagnostic truncation and
+count logic in ``_lsp_run_query`` only.  The mock checker returns
+exactly 20 ``info`` diagnostics, standing in for a ``Search`` that
+matched 20 results.
 """
 
 from __future__ import annotations
@@ -13,40 +16,46 @@ import rocq_mcp.interactive as _int
 
 
 @pytest.fixture(autouse=True)
-def _patch_run_with_pet(monkeypatch):
-    """Patch _run_with_pet to run the callback with a mock pet."""
-    from types import SimpleNamespace
+def _patch_run_with_lsp(monkeypatch):
+    """Patch _run_with_lsp to run the callback with a mock coq-lsp checker.
 
-    class MockState:
-        def __init__(self, feedback):
-            self.feedback = feedback
+    The mock's ``check_content`` returns 20 ``info`` diagnostics (one per
+    simulated ``Search`` hit), all on the appended command's line, so the
+    ``max_results`` truncation/count logic can be exercised without a
+    live coq-lsp.
+    """
 
-    class MockPet:
-        def __init__(self):
-            self.process = SimpleNamespace(poll=lambda: None)
-            self._feedback = [(0, f"result_{i}") for i in range(20)]
+    class MockChecker:
+        def _is_alive(self):
+            return True
 
-        def run(self, state, cmd, timeout=None):
-            return MockState(self._feedback)
+        def check_content(
+            self, path, content, workspace="", timeout=0, wait_full=False
+        ):
+            return {
+                "success": True,
+                "errors": [],
+                "warnings": [],
+                "info": [
+                    {
+                        "line": 0,
+                        "character": i,
+                        "end_line": 0,
+                        "end_character": i,
+                        "message": f"result_{i}",
+                        "severity": 3,
+                    }
+                    for i in range(20)
+                ],
+                "timed_out": False,
+            }
 
-        def get_state_at_pos(self, path, line, col):
-            return MockState([])
+    mock_checker = MockChecker()
 
-        def set_workspace(self, debug=False, dir=""):
-            pass
+    async def mock_run_with_lsp(fn, lifespan_state, label, *, workspace):
+        return fn(mock_checker)
 
-    mock_pet = MockPet()
-
-    async def mock_run_with_pet(fn, lifespan_state, label, **kw):
-        return fn(mock_pet)
-
-    monkeypatch.setattr(_server, "_run_with_pet", mock_run_with_pet)
-    # Bypass import caching — just return a mock state directly
-    monkeypatch.setattr(
-        _int,
-        "_get_or_create_import_state",
-        lambda pet, ws, cmds, ls: MockState([]),
-    )
+    monkeypatch.setattr(_server, "_run_with_lsp", mock_run_with_lsp)
 
 
 class TestMaxResultsEdgeCases:
@@ -59,7 +68,7 @@ class TestMaxResultsEdgeCases:
             command="Search nat.",
             preamble="",
             workspace="/tmp",
-            lifespan_state={"pet_timeout": 30.0},
+            lifespan_state={"op_timeout": 30.0},
             max_results=5,
         )
         assert result["success"] is True
@@ -74,7 +83,7 @@ class TestMaxResultsEdgeCases:
             command="Search nat.",
             preamble="",
             workspace="/tmp",
-            lifespan_state={"pet_timeout": 30.0},
+            lifespan_state={"op_timeout": 30.0},
             max_results=None,
         )
         assert result["success"] is True
@@ -87,7 +96,7 @@ class TestMaxResultsEdgeCases:
             command="Search nat.",
             preamble="",
             workspace="/tmp",
-            lifespan_state={"pet_timeout": 30.0},
+            lifespan_state={"op_timeout": 30.0},
             max_results=0,
         )
         assert result["success"] is True
@@ -100,7 +109,7 @@ class TestMaxResultsEdgeCases:
             command="Search nat.",
             preamble="",
             workspace="/tmp",
-            lifespan_state={"pet_timeout": 30.0},
+            lifespan_state={"op_timeout": 30.0},
             max_results=-1,
         )
         assert result["success"] is True
@@ -113,7 +122,7 @@ class TestMaxResultsEdgeCases:
             command="Search nat.",
             preamble="",
             workspace="/tmp",
-            lifespan_state={"pet_timeout": 30.0},
+            lifespan_state={"op_timeout": 30.0},
             max_results=100,
         )
         assert result["success"] is True
@@ -126,7 +135,7 @@ class TestMaxResultsEdgeCases:
             command="Search nat.",
             preamble="",
             workspace="/tmp",
-            lifespan_state={"pet_timeout": 30.0},
+            lifespan_state={"op_timeout": 30.0},
             max_results=20,
         )
         assert result["success"] is True
@@ -139,7 +148,7 @@ class TestMaxResultsEdgeCases:
             command="Search nat.",
             preamble="",
             workspace="/tmp",
-            lifespan_state={"pet_timeout": 30.0},
+            lifespan_state={"op_timeout": 30.0},
             max_results=1,
         )
         assert result["success"] is True

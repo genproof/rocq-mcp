@@ -362,11 +362,12 @@ class TestAssumptionsFileModeIntegration:
 
     @pytest.fixture
     def lifespan_state(self):
-        from rocq_mcp.server import _invalidate_pet
 
         state = _make_lifespan_state()
         yield state
-        _invalidate_pet(state)
+        checker = state.get("lsp_checker")
+        if checker is not None:
+            checker.stop()
 
     @pytest.mark.asyncio
     async def test_closed_theorem_via_file(self, workspace, lifespan_state):
@@ -469,7 +470,7 @@ class TestRocqAssumptionsWrapper:
         monkeypatch.setattr(_server, "run_assumptions", mock_run_assumptions)
         monkeypatch.setattr(_server, "_validate_workspace", lambda ws: None)
 
-        mock_ctx = _MockContext({"pet_client": None})
+        mock_ctx = _MockContext({})
 
         await rocq_assumptions(
             name="my_thm",

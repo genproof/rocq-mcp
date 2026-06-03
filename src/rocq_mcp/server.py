@@ -1,8 +1,8 @@
 """Rocq MCP Server — tools for Rocq/Coq proof development.
 
 This is the main entry point.  It defines the MCP application, shared
-infrastructure (configuration, workspace validation, pet subprocess
-management), and thin ``@mcp.tool`` wrappers that delegate to
+infrastructure (configuration, workspace validation, coq-lsp lifecycle +
+memory watchdog), and thin ``@mcp.tool`` wrappers that delegate to
 implementation functions in :mod:`rocq_mcp.compile` and
 :mod:`rocq_mcp.interactive`.
 """
@@ -32,14 +32,18 @@ ROCQ_WORKSPACE: str = os.environ.get("ROCQ_WORKSPACE", os.getcwd())
 _ROCQ_WORKSPACE_EXPLICIT: bool = "ROCQ_WORKSPACE" in os.environ
 ROCQ_COQC_TIMEOUT: int = int(os.environ.get("ROCQ_COQC_TIMEOUT", "60"))
 ROCQ_VERIFY_TIMEOUT: int = int(os.environ.get("ROCQ_VERIFY_TIMEOUT", "120"))
-ROCQ_PET_TIMEOUT: float = float(os.environ.get("ROCQ_PET_TIMEOUT", "30"))
+# Default per-operation timeout (seconds) for the coq-lsp tools.  Reads
+# ROCQ_OP_TIMEOUT, falling back to the legacy ROCQ_PET_TIMEOUT env var.
+ROCQ_OP_TIMEOUT: float = float(
+    os.environ.get("ROCQ_OP_TIMEOUT", os.environ.get("ROCQ_PET_TIMEOUT", "30"))
+)
 ROCQ_QUERY_TIMEOUT_CAP: int = int(os.environ.get("ROCQ_QUERY_TIMEOUT_CAP", "300"))
 ROCQ_COQC_BINARY: str = os.environ.get("ROCQ_COQC_BINARY", "coqc")
 ROCQ_MAX_SOURCE_SIZE: int = int(os.environ.get("ROCQ_MAX_SOURCE_SIZE", "1000000"))
 
 
-def _default_max_pet_rss_mb() -> int:
-    """Default pet RSS cap: 50% of system RAM, hard-capped at 16 GB.
+def _default_max_rss_mb() -> int:
+    """Default coq-lsp RSS cap: 50% of system RAM, hard-capped at 16 GB.
 
     Tuned to fire well above legitimate ``vm_compute`` ceilings (~2-4 GB)
     but well below the OOM-killer / swap-thrash zone.  On a 32 GB Mac
@@ -50,27 +54,11 @@ def _default_max_pet_rss_mb() -> int:
     return min(int(0.50 * total_mb), 16_384)
 
 
-ROCQ_MAX_PET_RSS_MB: int = int(
-    os.environ.get("ROCQ_MAX_PET_RSS_MB", str(_default_max_pet_rss_mb()))
-)
-# Soft cap: when pet RSS exceeds this after a successful call, the
-# server sends the ``petanque/trimCaches`` notification to free pet's
-# unbounded global memo tables (Memo.{Intern,Interp,Admit,Init,Require})
-# WITHOUT killing the process -- client-held state_ids stay valid
-# because the int<->State.t obj_map is untouched.  Requires a patched
-# pet binary that handles the notification (older pets log it as
-# "unhandled notification" and otherwise ignore it -- safe to send).
-# Default: half the hard cap.  Set to 0 to disable soft trimming.
-ROCQ_PET_TRIM_RSS_MB: int = int(
-    os.environ.get(
-        "ROCQ_PET_TRIM_RSS_MB", str(max(1, ROCQ_MAX_PET_RSS_MB // 2))
-    )
-)
-# coq-lsp RSS cap (mirrors ROCQ_MAX_PET_RSS_MB).  Same default formula
-# because both subprocesses can blow up on the same kinds of workloads
-# (large vm_compute, deep proof terms, runaway typeclass search).
+# coq-lsp RSS cap.  Fires well above legitimate vm_compute ceilings but
+# below the OOM-killer / swap-thrash zone (large vm_compute, deep proof
+# terms, runaway typeclass search can all blow this up).
 ROCQ_MAX_LSP_RSS_MB: int = int(
-    os.environ.get("ROCQ_MAX_LSP_RSS_MB", str(_default_max_pet_rss_mb()))
+    os.environ.get("ROCQ_MAX_LSP_RSS_MB", str(_default_max_rss_mb()))
 )
 # Soft cap: when coq-lsp RSS exceeds this after a successful check, the
 # server sends ``coq/trimCaches`` to free coq-lsp's unbounded global
@@ -92,26 +80,13 @@ _RECENT_ERRORS_MAX: int = 20
 
 @lifespan
 async def app_lifespan(server: Any) -> Any:
-    """Server lifespan. Pet is spawned lazily on first pytanque call."""
+    """Server lifespan. coq-lsp is spawned lazily on first tool call."""
     state: dict[str, Any] = {
-        "pet_client": None,
         "workspace": ROCQ_WORKSPACE,
-        "pet_timeout": ROCQ_PET_TIMEOUT,
-        "current_workspace": None,
+        # Default per-operation timeout (seconds) for the coq-lsp tools.
+        "op_timeout": ROCQ_OP_TIMEOUT,
         "lsp_checker": None,
-        # Diagnostics (rocq_diag tool, see _build_diag_snapshot).
-        "pet_started_at": None,
-        # Count of successful spawns; pet_restarts is derived as
-        # max(0, total_spawns - 1).  Counting only successful spawns
-        # ensures a fresh server reports 0 restarts even if the very
-        # first spawn attempt raised.
-        "total_spawns": 0,
-        "peak_pet_rss_mb": 0.0,
-        "pet_generation": 0,
-        # Count of petanque/trimCaches notifications sent so far
-        # (ROCQ_PET_TRIM_RSS_MB).
-        "pet_trim_count": 0,
-        # Parallel LSP-side bookkeeping (see ROCQ_MAX_LSP_RSS_MB).
+        # coq-lsp diagnostics (rocq_diag tool, see _build_diag_snapshot).
         "peak_lsp_rss_mb": 0.0,
         "lsp_generation": 0,
         # Count of coq/trimCaches notifications sent so far (ROCQ_LSP_TRIM_RSS_MB).
@@ -121,9 +96,6 @@ async def app_lifespan(server: Any) -> Any:
     try:
         yield state
     finally:
-        client = state.get("pet_client")
-        if client:
-            _kill_pet(client)
         lsp = state.get("lsp_checker")
         if lsp:
             lsp.stop()
@@ -584,198 +556,15 @@ def _parse_project_flags(ws: Path) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Pet subprocess management
+# coq-lsp subprocess lifecycle
 # ---------------------------------------------------------------------------
-
-# Global lock for ALL pytanque operations. Pytanque's stdio pipe is
-# single-duplex -- concurrent reads/writes corrupt JSON-RPC framing.
-# NOTE: _pet_lock may be replaced after a timeout (see _force_release_pet_lock).
-# All _execute functions must capture a local reference before acquiring.
-_pet_lock = threading.Lock()
-
-# Callbacks invoked when pet is invalidated (crash, timeout).
-# interactive.py registers _invalidate_import_cache and _state_invalidate_all
-# here to break the circular dependency (server -> interactive -> server).
-_pet_invalidation_hooks: list[Callable[[], None]] = []
-
-
-class _PetLockTimeout(Exception):
-    """Lock acquisition timed out (distinct from asyncio.TimeoutError).
-
-    On Python 3.11+, TimeoutError *is* asyncio.TimeoutError. Using a
-    private class prevents lock contention from being caught by the
-    asyncio.wait_for timeout handler, which would incorrectly kill pet
-    and destroy the proof session.
-    """
-
-
-async def _force_release_pet_lock() -> None:
-    """Recover from a deadlocked _pet_lock after timeout.
-
-    After _invalidate_pet kills the pet process, the orphaned thread's
-    blocking pet.run() should fail and release the lock.  We wait briefly
-    for this natural release.  If the lock is still held after a grace
-    period, replace the global lock with a fresh one so subsequent
-    operations can proceed.
-
-    This is safe because every _execute function captures a local
-    reference to the lock before acquiring it, so the orphaned thread
-    releases its own (now-discarded) lock object.
-
-    Runs the blocking acquire in a thread to avoid stalling the event loop.
-    """
-
-    def _try_reacquire() -> bool:
-        lock = _pet_lock  # capture local ref
-        if lock.acquire(timeout=2):
-            lock.release()
-            return True
-        return False
-
-    global _pet_lock
-    if await asyncio.to_thread(_try_reacquire):
-        return
-    # Orphaned thread still holds the lock -- replace with fresh lock
-    _pet_lock = threading.Lock()
-
-
-def _ensure_pet(lifespan_state: dict[str, Any]) -> Any:
-    """Lazy-initialize pet subprocess. Must be called with _pet_lock held."""
-    try:
-        from pytanque import Pytanque, PytanqueMode
-    except ImportError:
-        raise ImportError(
-            "pytanque is not installed. Install with: pip install 'rocq-mcp[interactive]'"
-        )
-
-    pet = lifespan_state.get("pet_client")
-    if pet is None or not _pet_alive(pet):
-        if pet is not None:
-            _kill_pet(pet)  # Full cleanup: kill + wait + close FDs
-            for hook in _pet_invalidation_hooks:
-                hook()
-        pet = Pytanque(mode=PytanqueMode.STDIO)
-        pet.connect()
-        # Attempt process group setup for clean kill.
-        # May fail on macOS if child already exec'd -- that's OK,
-        # os.getpgid at kill time handles it.
-        if pet.process:
-            try:
-                os.setpgid(pet.process.pid, pet.process.pid)
-                pet._own_pgrp = True
-            except OSError:
-                pet._own_pgrp = False
-        else:
-            pet._own_pgrp = False
-        # Count *only* successful spawns so a fresh server reports
-        # pet_restarts=0 even if a previous spawn raised before reaching
-        # this point.  The bookkeeping below is the canonical "spawn
-        # succeeded" point.
-        prev_spawns: int = int(lifespan_state.get("total_spawns", 0))
-        if prev_spawns > 0:
-            # Reset peak RSS so "headroom before vm_compute" reflects the
-            # live pet, not a long-dead predecessor that may have pushed
-            # the peak high.  Reset *before* assigning ``pet_client`` so
-            # the watchdog cannot sample the new pet's RSS, write it to
-            # ``peak_pet_rss_mb``, and then have us wipe it.
-            lifespan_state["peak_pet_rss_mb"] = 0.0
-        lifespan_state["pet_client"] = pet
-        lifespan_state["pet_started_at"] = time.time()
-        lifespan_state["total_spawns"] = prev_spawns + 1
-    return pet
-
-
-def _pet_alive(pet: Any) -> bool:
-    """Check if the pet subprocess is still running."""
-    return pet is not None and pet.process is not None and pet.process.poll() is None
-
-
-def _kill_pet(pet: Any) -> None:
-    """Kill pet and its entire process group.
-
-    If the pet has its own process group (_own_pgrp=True), uses os.killpg
-    to kill the whole group (pet + coq-lsp). Otherwise falls back to
-    process.terminate()/kill() to avoid killing our own process group.
-    """
-    if pet is None or pet.process is None:
-        return
-    # If process already exited, just close FDs — no signals needed.
-    # This avoids PID-reuse races where os.killpg could kill an unrelated process.
-    if pet.process.poll() is not None:
-        _try_close_pet(pet)
-        return
-    try:
-        if getattr(pet, "_own_pgrp", False):
-            # Safe: pet has its own process group
-            pgid = os.getpgid(pet.process.pid)
-            os.killpg(pgid, signal.SIGTERM)
-        else:
-            # Fallback: only kill the direct child
-            pet.process.terminate()
-        try:
-            pet.process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            if getattr(pet, "_own_pgrp", False):
-                pgid = os.getpgid(pet.process.pid)
-                os.killpg(pgid, signal.SIGKILL)
-            else:
-                pet.process.kill()
-            pet.process.wait(timeout=3)
-    except (OSError, ChildProcessError, subprocess.TimeoutExpired):
-        # Process already dead, group doesn't exist, or refused to die
-        pass
-    # Close pipe file descriptors
-    _try_close_pet(pet)
-
-
-def _try_close_pet(pet: Any) -> None:
-    """Close pytanque's pipe file descriptors without killing."""
-    if pet is None or pet.process is None:
-        return
-    for stream in [pet.process.stdin, pet.process.stdout, pet.process.stderr]:
-        try:
-            if stream:
-                stream.close()
-        except Exception:
-            # Best-effort FD cleanup -- the pipe may already be closed,
-            # the peer may be dead, or the buffer may be in any state.
-            # Any further error here is uninteresting; we only care that
-            # we tried to close every FD we hold.
-            pass
-
-
-def _invalidate_pet(lifespan_state: dict[str, Any]) -> None:
-    """Kill pet and set to None so next call respawns.
-
-    Does NOT acquire _pet_lock — this is intentional. After a timeout,
-    an orphaned thread may still hold the lock. The OS-level kill is safe
-    to call without the lock (it's a signal, not a protocol operation).
-    The next _ensure_pet call (under _pet_lock) will see the dead process
-    and respawn.
-
-    Note: there is a brief race window where a concurrent _ensure_pet
-    call may have already read pet_client before this function sets it
-    to None.  The stale pet object will fail with a broken-pipe error,
-    which is caught by the caller's broad exception handler and triggers
-    a respawn on the next call.
-    """
-    pet = lifespan_state.get("pet_client")
-    if pet:
-        _kill_pet(pet)
-    lifespan_state["pet_client"] = None
-    lifespan_state["current_workspace"] = None
-    lifespan_state["pet_generation"] = lifespan_state.get("pet_generation", 0) + 1
-    for hook in _pet_invalidation_hooks:
-        hook()
 
 
 def _invalidate_lsp(lifespan_state: dict[str, Any]) -> None:
     """Kill coq-lsp and clear the cached checker so the next call respawns.
 
-    Mirrors :func:`_invalidate_pet`.  LspChecker holds its own
-    per-instance ``threading.Lock`` (no global LSP lock to release),
-    so there is no analogue of ``_force_release_pet_lock`` here -- the
-    discarded checker takes its lock with it.
+    LspChecker holds its own per-instance ``threading.Lock``, which the
+    discarded checker takes with it -- there is no global lock to release.
     """
     checker = lifespan_state.get("lsp_checker")
     if checker is not None:
@@ -791,25 +580,6 @@ def _invalidate_lsp(lifespan_state: dict[str, Any]) -> None:
     )
 
 
-def _set_workspace_if_needed(
-    pet: Any, workspace: str, lifespan_state: dict[str, Any]
-) -> None:
-    """Set pet workspace, skipping if already set to the same directory.
-
-    Side-effect: invokes :func:`_parse_project_flags` before
-    ``pet.set_workspace`` so that any dune-derived ``_RocqProject`` is
-    materialised on disk *before* coq-lsp indexes the workspace.
-    Without this, pet-based tools on a fresh dune workspace would see a
-    workspace with no project file, falling back to single-theory load
-    paths and breaking cross-theory imports (pytanque issue #17).
-    """
-    ws = str(Path(workspace).resolve())
-    if lifespan_state.get("current_workspace") != ws:
-        _parse_project_flags(Path(ws))
-        pet.set_workspace(debug=False, dir=ws)
-        lifespan_state["current_workspace"] = ws
-
-
 # ---------------------------------------------------------------------------
 # Semaphore (shared by interactive tools)
 # ---------------------------------------------------------------------------
@@ -819,28 +589,6 @@ def _set_workspace_if_needed(
 # thread is orphaned by asyncio.wait_for timeout.
 # Shared across ALL pet operations (step + query) because pytanque's
 # stdio pipe is single-duplex.
-_pet_semaphore: asyncio.Semaphore | None = None
-
-
-def _get_pet_semaphore() -> asyncio.Semaphore:
-    """Lazy-init the semaphore (must be created inside a running event loop)."""
-    global _pet_semaphore
-    if _pet_semaphore is None:
-        _pet_semaphore = asyncio.Semaphore(1)
-    return _pet_semaphore
-
-
-def _merge_partial_state(resp: dict[str, Any], partial: dict[str, Any]) -> None:
-    """Merge *partial* into *resp* without overwriting control keys.
-
-    Keys like ``"success"``, ``"error"``, and ``"pet_restarted"`` are set by
-    the error handler and must not be clobbered by user-provided partial state.
-    """
-    for k, v in partial.items():
-        if k not in resp:
-            resp[k] = v
-
-
 _RECENT_ERROR_MESSAGE_LIMIT: int = 500
 
 # Allowed values for the ``reason`` field on ``recent_errors`` entries.
@@ -943,35 +691,6 @@ def _fail(
     return {"success": False, "error": message, "reason": reason, **extra}
 
 
-async def _build_memory_abort_response(
-    lifespan_state: dict[str, Any],
-    tool: str,
-    on_timeout: Callable[[], None] | None,
-    partial_state: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Run the memory-abort recovery path and return the response dict.
-
-    Thin wrapper around :func:`_handle_pet_failure` that supplies the
-    memory-specific error message; the recovery scaffold (invalidate
-    pet, release lock, fire on_timeout, merge partial, record error)
-    is shared with every other killed-pet path.
-    """
-    return await _handle_pet_failure(
-        lifespan_state,
-        tool,
-        reason="memory_exhausted",
-        error=(
-            f"{tool} aborted: pet RSS exceeded "
-            f"{ROCQ_MAX_PET_RSS_MB} MB. The proof state was lost; "
-            "pet has been restarted. Retry with a smaller term, "
-            "avoid vm_compute on large inputs, or split the work."
-        ),
-        killed_pet=True,
-        on_timeout=on_timeout,
-        partial_state=partial_state,
-    )
-
-
 def _build_lsp_memory_abort_response(
     lifespan_state: dict[str, Any],
     tool: str,
@@ -1000,14 +719,6 @@ def _build_lsp_memory_abort_response(
     }
 
 
-def _pet_process_from_state(lifespan_state: dict[str, Any]) -> Any:
-    """Return the pet subprocess (with ``.pid``) or None if not running."""
-    client = lifespan_state.get("pet_client")
-    if client is None or getattr(client, "process", None) is None:
-        return None
-    return client.process
-
-
 def _lsp_process_from_state(lifespan_state: dict[str, Any]) -> Any:
     """Return the coq-lsp subprocess (with ``.pid``) or None if not running."""
     checker = lifespan_state.get("lsp_checker")
@@ -1019,74 +730,23 @@ def _lsp_process_from_state(lifespan_state: dict[str, Any]) -> Any:
     return process
 
 
-def _send_pet_trim_notification(pet_client: Any) -> bool:
-    """Send a ``petanque/trimCaches`` notification over pet's stdin.
-
-    Returns True on success, False on any I/O failure (broken pipe,
-    process dead, etc.) -- best-effort; never raises.  Caller is
-    responsible for holding any synchronisation needed to avoid
-    interleaving writes with another concurrent caller.  Within
-    :func:`_run_with_pet` this is guaranteed by the per-call asyncio
-    semaphore.
-
-    Older pet binaries that don't yet handle ``petanque/trimCaches``
-    log it as an "unhandled notification" and otherwise ignore it --
-    safe to send.  See :data:`ROCQ_PET_TRIM_RSS_MB`.
-    """
-    process = getattr(pet_client, "process", None)
-    if process is None or getattr(process, "stdin", None) is None:
-        return False
-    import json as _json
-
-    payload = _json.dumps({"jsonrpc": "2.0", "method": "petanque/trimCaches"})
-    encoded = payload.encode("utf-8")
-    header = f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii")
-    try:
-        process.stdin.write(header + encoded)
-        process.stdin.flush()
-        return True
-    except (BrokenPipeError, OSError, ValueError):
-        return False
-
-
-def _maybe_trim_pet_caches(lifespan_state: dict[str, Any]) -> None:
-    """Send ``petanque/trimCaches`` when pet RSS is above the soft cap.
-
-    No-op when ``ROCQ_PET_TRIM_RSS_MB <= 0`` or when the live RSS
-    sample is unavailable / below the threshold.  On success,
-    increments ``lifespan_state["pet_trim_count"]`` and resets
-    ``peak_pet_rss_mb`` so the watchdog's peak tracking shows the
-    post-trim high-water mark on subsequent calls.
-
-    Runs synchronously after a successful pet call, while the asyncio
-    pet semaphore is still held -- so no concurrent caller can be
-    writing to pet's stdin.
-    """
-    if ROCQ_PET_TRIM_RSS_MB <= 0:
-        return
-    process = _pet_process_from_state(lifespan_state)
-    if process is None:
-        return
-    try:
-        rss_bytes = psutil.Process(process.pid).memory_info().rss
-    except (psutil.Error, AttributeError, OSError, TypeError):
-        # TypeError covers tests passing a MagicMock pid; the watchdog
-        # path tolerates the same family of errors (see _memory_watchdog).
-        return
-    try:
-        rss_mb = int(rss_bytes) // (1024 * 1024)
-    except (TypeError, ValueError):
-        return
-    if rss_mb <= ROCQ_PET_TRIM_RSS_MB:
-        return
-    if not _send_pet_trim_notification(lifespan_state.get("pet_client")):
-        return
-    lifespan_state["pet_trim_count"] = (
-        lifespan_state.get("pet_trim_count", 0) + 1
-    )
-    lifespan_state["peak_pet_rss_mb"] = 0.0
-
-
+# ---------------------------------------------------------------------------
+# Forget evicted states (bound pet's int<->State.t obj_map)
+# ---------------------------------------------------------------------------
+#
+# pet's obj_map (petanque/json/obj_map.ml) only ever grows: every state
+# returned to the client is pinned under a fresh id and never removed, and
+# trimCaches deliberately leaves it intact.  When the interactive state
+# table (interactive._state_table) evicts an old state, the corresponding
+# pet-side Vernacstate.t snapshot is leaked.  We collect the pet ``st``
+# handles of evicted states here and send a ``petanque/forget`` notification
+# (patched pet handles it; older pets ignore it) so pet can drop them.
+#
+# CRITICAL: pet resets its id counter to 0 on (re)spawn, so a handle from a
+# dead pet would alias a *different* live state in a fresh pet.  The buffer
+# is therefore cleared on every spawn (see _ensure_pet) and drained on the
+# same successful call that produced the evictions -- never carried across
+# a pet generation.
 async def _memory_watchdog(
     lifespan_state: dict[str, Any],
     max_rss_mb: int,
@@ -1094,8 +754,8 @@ async def _memory_watchdog(
     event: asyncio.Event,
     interval: float | None = None,
     *,
-    get_process: Callable[[dict[str, Any]], Any] = _pet_process_from_state,
-    peak_key: str = "peak_pet_rss_mb",
+    get_process: Callable[[dict[str, Any]], Any] = _lsp_process_from_state,
+    peak_key: str = "peak_lsp_rss_mb",
 ) -> None:
     """Sample subprocess RSS; on threshold breach, set *event* and cancel *main_task*.
 
@@ -1105,11 +765,9 @@ async def _memory_watchdog(
     can reclaim resources and respawn the subprocess.
 
     ``get_process`` returns a subprocess-like object with a ``.pid``
-    attribute (or ``None`` if not yet spawned).  Defaults to the pet
-    process; pass ``_lsp_process_from_state`` to monitor coq-lsp.
-    ``peak_key`` is the lifespan-state field used to track the peak
-    RSS seen during this run (``peak_pet_rss_mb`` for pet,
-    ``peak_lsp_rss_mb`` for coq-lsp).
+    attribute (or ``None`` if not yet spawned).  Defaults to the coq-lsp
+    process.  ``peak_key`` is the lifespan-state field used to track the
+    peak RSS seen during this run (``peak_lsp_rss_mb`` for coq-lsp).
 
     Tolerates:
     - ``psutil`` not installed -- exits silently (no monitoring).
@@ -1148,217 +806,70 @@ async def _memory_watchdog(
         return
 
 
-async def _handle_pet_failure(
-    lifespan_state: dict[str, Any],
-    tool: str,
-    *,
-    reason: str,
-    error: str,
-    killed_pet: bool = False,
-    on_timeout: Callable[[], None] | None = None,
-    partial_state: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Build a unified failure response for ``_run_with_pet``'s except arms.
-
-    When *killed_pet* is True (timeout / dead PetanqueError / BrokenPipe /
-    ConnectionError), invalidates the pet client, force-releases the
-    pet lock, optionally invokes the caller's *on_timeout* hook, and
-    tags the response with ``pet_restarted: True``.  When False
-    (lock contention / live PetanqueError / FileNotFoundError /
-    unexpected OSError-class exception), leaves the pet alone.
-
-    Both paths merge *partial_state* (if any) into the response and
-    record the failure into ``recent_errors`` so ``rocq_diag`` surfaces
-    it.
-    """
-    if killed_pet:
-        _invalidate_pet(lifespan_state)
-        await _force_release_pet_lock()
-        if on_timeout is not None:
-            on_timeout()
-    resp: dict[str, Any] = {"success": False, "error": error, "reason": reason}
-    if killed_pet:
-        resp["pet_restarted"] = True
-    if partial_state:
-        _merge_partial_state(resp, partial_state)
-    _record_error(lifespan_state, tool, error, reason=reason)
-    return resp
-
-
-async def _run_with_pet(
+async def _run_with_lsp(
     fn: Callable[[Any], Any],
     lifespan_state: dict[str, Any],
     tool: str,
-    on_timeout: Callable[[], None] | None = None,
-    timeout: float | None = None,
-    partial_state: dict[str, Any] | None = None,
+    *,
+    workspace: str,
 ) -> Any:
-    """Run *fn(pet)* with the pet client, handling lock/semaphore/timeout/errors.
+    """Run *fn(checker)* against the coq-lsp client with a memory watchdog.
 
-    The helper encapsulates the full boilerplate shared by every pytanque
-    operation that follows the simple "acquire lock, ensure pet, do work"
-    pattern:
+    The coq-lsp analogue of :func:`_run_with_pet`.  Lazily creates the
+    :class:`~rocq_mcp.lsp_checker.LspChecker`, runs *fn* in a worker
+    thread, and monitors coq-lsp RSS against ``ROCQ_MAX_LSP_RSS_MB``; on
+    breach the subprocess is killed and the unified ``memory_exhausted``
+    envelope is returned (see :func:`_build_lsp_memory_abort_response`).
+    On success, soft-trims coq-lsp's global memo tables when RSS crosses
+    ``ROCQ_LSP_TRIM_RSS_MB`` (see :func:`_maybe_trim_lsp_caches`).
 
-    1. PetanqueError import check
-    2. _pet_lock acquisition with timeout
-    3. _ensure_pet (lazy-init the pet subprocess)
-    4. asyncio.Semaphore + asyncio.wait_for (async-level timeout)
-    5. All standard exception handlers
-
-    *fn* receives the live pet client and must return the desired result.
-    It runs inside a background thread with _pet_lock held; the lock is
-    released automatically when *fn* returns or raises.
-
-    *tool* is the canonical MCP tool name (e.g. ``"rocq_check"``) and is
-    used both as the prefix in user-facing error messages
-    (``"rocq_check timed out after 30s."``) and as the ``tool`` field on
-    ``recent_errors`` entries.  Pass exactly the public tool name, not a
-    human phrase.
-
-    When pet crashes (timeout, broken pipe), the return dict includes
-    ``"pet_restarted": True`` so callers can decide whether to retry.
-
-    If *partial_state* is given (a mutable dict), *fn* can populate it
-    with intermediate results.  On timeout or error the dict contents
-    are merged into the error response so partial work is not lost.
-
-    The return type is left as ``Any`` because the dict shape varies by
-    failure mode (success path, ``pet_restarted``-tagged crashes,
-    ``partial_state`` merges, etc.) and a TypedDict would be unwieldy.
-    The ``"reason"`` key, when present on a failure, is a
-    :data:`compile_enrichment._StateCaptureStatus` (one of ``"timeout"``, ``"crashed"``,
-    ``"memory_exhausted"``, ``"lock_contended"``, ``"unavailable"``).
+    *fn* receives the live ``LspChecker`` and must embed its own
+    per-request timeout (the checker's ``goals`` / ``check_*`` /
+    ``document_symbol`` methods all take a ``timeout`` argument).  There
+    is deliberately no ``asyncio.wait_for`` here: cancelling the worker
+    task would not interrupt a blocking LSP read, and coq-lsp already
+    serializes requests on its own per-instance lock, so the request
+    drains via the checker's internal timeout instead.
     """
+    from rocq_mcp.lsp_checker import LspChecker
+
+    checker = lifespan_state.get("lsp_checker")
+    if checker is None or not checker._is_alive():
+        checker = LspChecker(workspace=workspace)
+        lifespan_state["lsp_checker"] = checker
+
+    main_task = asyncio.create_task(asyncio.to_thread(fn, checker))
+    mem_event = asyncio.Event()
+    monitor_task = asyncio.create_task(
+        _memory_watchdog(
+            lifespan_state,
+            ROCQ_MAX_LSP_RSS_MB,
+            main_task,
+            mem_event,
+            get_process=_lsp_process_from_state,
+            peak_key="peak_lsp_rss_mb",
+        )
+    )
     try:
-        from pytanque import PetanqueError
-    except ImportError:
-        msg = (
-            "pytanque is not installed. "
-            "Install with: pip install 'rocq-mcp[interactive]'"
-        )
-        _record_error(lifespan_state, tool, msg, reason="unavailable")
-        return {
-            "success": False,
-            "error": msg,
-            "reason": "unavailable",
-        }
-
-    _timeout: float = timeout if timeout is not None else lifespan_state["pet_timeout"]
-    # Lock acquire uses a shorter timeout than wait_for so that
-    # _PetLockTimeout fires before asyncio.TimeoutError on contention.
-    # This avoids unnecessarily killing pet when the issue is just
-    # lock contention, not a pet hang.
-    lock_timeout = _timeout * 0.8
-
-    def _execute() -> Any:
-        lock = _pet_lock  # capture local ref (survives _force_release_pet_lock)
-        if not lock.acquire(timeout=lock_timeout):
-            raise _PetLockTimeout("Could not acquire pet lock")
         try:
-            pet = _ensure_pet(lifespan_state)
-            return fn(pet)
+            result = await main_task
         finally:
-            lock.release()
-
-    sem = _get_pet_semaphore()
-    async with sem:
-        main_task = asyncio.create_task(asyncio.to_thread(_execute))
-        mem_event = asyncio.Event()
-        monitor_task = asyncio.create_task(
-            _memory_watchdog(lifespan_state, ROCQ_MAX_PET_RSS_MB, main_task, mem_event)
-        )
-        try:
-            try:
-                result = await asyncio.wait_for(main_task, timeout=_timeout)
-                # Soft trim: pet inherits Flèche's unbounded global memo
-                # tables.  When RSS crosses ROCQ_PET_TRIM_RSS_MB on a
-                # successful call, send petanque/trimCaches to free them
-                # without killing pet -- client-held state_ids stay valid
-                # because pet's int<->State.t obj_map is untouched.  The
-                # hard ROCQ_MAX_PET_RSS_MB cap remains the runaway safety
-                # net.
-                _maybe_trim_pet_caches(lifespan_state)
-                return result
-            finally:
-                if not monitor_task.done():
-                    monitor_task.cancel()
-                    try:
-                        await monitor_task
-                    except asyncio.CancelledError:
-                        pass
-        except asyncio.CancelledError:
-            # If mem_event is set, the watchdog cancelled main_task because
-            # pet RSS exceeded the threshold; otherwise this is an external
-            # cancel that should propagate.
-            if mem_event.is_set():
-                return await _build_memory_abort_response(
-                    lifespan_state, tool, on_timeout, partial_state
-                )
-            raise
-        except asyncio.TimeoutError:
-            # If the wait_for timer and the watchdog raced, mem_event may
-            # already be set; prefer the more specific memory_exhausted label.
-            if mem_event.is_set():
-                return await _build_memory_abort_response(
-                    lifespan_state, tool, on_timeout, partial_state
-                )
-            return await _handle_pet_failure(
-                lifespan_state,
-                tool,
-                reason="timeout",
-                error=f"{tool} timed out after {_timeout}s.",
-                killed_pet=True,
-                on_timeout=on_timeout,
-                partial_state=partial_state,
-            )
-        except _PetLockTimeout:
-            return await _handle_pet_failure(
-                lifespan_state,
-                tool,
-                reason="lock_contended",
-                error=f"{tool}: pet is busy (lock contention). Try again.",
-            )
-        except PetanqueError as e:
-            if not _pet_alive(lifespan_state.get("pet_client")):
-                return await _handle_pet_failure(
-                    lifespan_state,
-                    tool,
-                    reason="crashed",
-                    error=f"Pet process died: {e.message}",
-                    killed_pet=True,
-                    partial_state=partial_state,
-                )
-            return await _handle_pet_failure(
-                lifespan_state,
-                tool,
-                reason="crashed",
-                error=e.message,
-            )
-        except (BrokenPipeError, ConnectionError) as e:
-            return await _handle_pet_failure(
-                lifespan_state,
-                tool,
-                reason="crashed",
-                error=f"Pet process died: {e}",
-                killed_pet=True,
-                on_timeout=on_timeout,
-                partial_state=partial_state,
-            )
-        except FileNotFoundError:
-            return await _handle_pet_failure(
-                lifespan_state,
-                tool,
-                reason="unavailable",
-                error="pet binary not found on PATH. Install coq-lsp.",
-            )
-        except (OSError, RuntimeError, ValueError, TypeError) as e:
-            return await _handle_pet_failure(
-                lifespan_state,
-                tool,
-                reason="crashed",
-                error=f"Unexpected error: {e}",
-                partial_state=partial_state,
-            )
+            if not monitor_task.done():
+                monitor_task.cancel()
+                try:
+                    await monitor_task
+                except asyncio.CancelledError:
+                    pass
+    except asyncio.CancelledError:
+        # Watchdog cancelled the worker because coq-lsp RSS breached the
+        # threshold; build the memory_exhausted envelope (which also
+        # restarts coq-lsp).  An external cancel (mem_event unset) must
+        # propagate.
+        if mem_event.is_set():
+            return _build_lsp_memory_abort_response(lifespan_state, tool)
+        raise
+    _maybe_trim_lsp_caches(lifespan_state, checker)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1378,22 +889,16 @@ from rocq_mcp.compile import (  # noqa: E402
     run_verify,
 )
 from rocq_mcp.interactive import (  # noqa: E402
+    _MAX_LINE_CHAR_RANGE,
     run_assumptions,
     run_query,
-    run_start,
-    run_check,
+    run_get_state,
+    run_step,
     run_step_multi,
     run_toc,
-    run_notations,
 )
 from rocq_mcp.diag import (  # noqa: E402
-    _DIAG_LIVE_STATES_CAP,
     _build_diag_snapshot,
-    _sample_pet_rss_mb,
-)
-from rocq_mcp.compile_enrichment import (  # noqa: E402
-    run_compile_file_with_state,
-    run_compile_with_state,
 )
 
 # ---------------------------------------------------------------------------
@@ -1413,25 +918,13 @@ async def rocq_compile(
 
     Batch-compiles a complete .v file via coqc. Best for checking a
     finished proof. For iterative proof development, prefer
-    rocq_check (faster, cached imports, returns state for recovery)
-    or rocq_step_multi (try multiple tactics at once).
+    rocq_compile_lsp (incremental) or the interactive tools
+    (rocq_get_state / rocq_step / rocq_step_multi).
 
     On failure, the result includes ``error_positions`` and a ``hint``.
-    When coq-lsp is available in the active MCP session, the result
-    also includes ``state_capture_status``:
-
-      - ``"ok"``: proof state was captured at the error position; the
-        result also includes ``state_id``, ``goals``, ``file``,
-        ``theorem``, and ``proof_finished``.  Recover via
-        ``rocq_check(from_state=state_id)`` or
-        ``rocq_step_multi(from_state=state_id)``.
-      - ``"outside_proof"``: error is outside any open proof; no
-        ``state_id`` is returned.  Follow the original ``hint``.
-      - ``"timeout"`` / ``"crashed"`` / ``"lock_contended"`` /
-        ``"unavailable"`` / ``"memory_exhausted"`` /
-        ``"no_position"``: enrichment did not
-        succeed; follow the original ``hint`` (typically
-        ``rocq_start(file=..., line=..., character=...)``).
+    To inspect the proof goals at an error inside a proof, call
+    ``rocq_get_state(file=..., line=..., character=...)`` at the error
+    position (compile no longer returns a reusable proof state itself).
 
     Args:
         source: Complete Rocq (.v) file content to compile.
@@ -1440,9 +933,6 @@ async def rocq_compile(
         include_warnings: If True (default), include deduplicated warnings
             before the error in the output.  Set to False to get only the
             error diagnostic, which keeps context compact.
-
-    On ``pet_restarted: True`` (state-capture path crashed pet), call
-    ``rocq_diag`` for memory headroom and recent error history.
     """
     workspace = workspace or ROCQ_WORKSPACE
     timeout = timeout if timeout is not None and timeout > 0 else ROCQ_COQC_TIMEOUT
@@ -1453,12 +943,11 @@ async def rocq_compile(
             ctx.lifespan_context if ctx else None, "rocq_compile", err, "validation"
         )
 
-    return await run_compile_with_state(
+    return run_compile(
         source=source,
         workspace=workspace,
         timeout=timeout,
         include_warnings=include_warnings,
-        lifespan_state=ctx.lifespan_context if ctx else None,
     )
 
 
@@ -1482,21 +971,9 @@ async def rocq_compile_file(
     The file must already exist within the workspace.
 
     On failure, the result includes ``error_positions`` and a ``hint``.
-    When coq-lsp is available in the active MCP session, the result
-    also includes ``state_capture_status``:
-
-      - ``"ok"``: proof state was captured at the error position; the
-        result also includes ``state_id``, ``goals``, ``file``,
-        ``theorem``, and ``proof_finished``.  Recover via
-        ``rocq_check(from_state=state_id)`` or
-        ``rocq_step_multi(from_state=state_id)``.
-      - ``"outside_proof"``: error is outside any open proof; no
-        ``state_id`` is returned.  Follow the original ``hint``.
-      - ``"timeout"`` / ``"crashed"`` / ``"lock_contended"`` /
-        ``"unavailable"`` / ``"memory_exhausted"`` /
-        ``"no_position"``: enrichment did not
-        succeed; follow the original ``hint`` (typically
-        ``rocq_start(file=..., line=..., character=...)``).
+    To inspect the proof goals at an error inside a proof, call
+    ``rocq_get_state(file=..., line=..., character=...)`` at the error
+    position (compile no longer returns a reusable proof state itself).
 
     Args:
         file: Path to the .v file (relative to workspace).
@@ -1508,9 +985,6 @@ async def rocq_compile_file(
         include_warnings: If True (default), include deduplicated warnings
             before the error in the output.  Set to False to get only the
             error diagnostic, which keeps context compact.
-
-    On ``pet_restarted: True`` (state-capture path crashed pet), call
-    ``rocq_diag`` for memory headroom and recent error history.
     """
     # Workspace precedence: explicit arg > project marker walk-up > env default.
     workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
@@ -1525,12 +999,11 @@ async def rocq_compile_file(
             "validation",
         )
 
-    return await run_compile_file_with_state(
+    return run_compile_file(
         file=file,
         workspace=workspace,
         timeout=timeout,
         include_warnings=include_warnings,
-        lifespan_state=ctx.lifespan_context if ctx else None,
     )
 
 
@@ -1640,58 +1113,47 @@ async def rocq_query(
     preamble: str = "",
     file: str = "",
     workspace: str = "",
+    line: int | None = None,
+    character: int | None = None,
     max_results: int | None = None,
     include_warnings: bool = True,
     timeout: int = 0,
-    from_state: int | None = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Search the Rocq environment — find lemmas, check types, inspect definitions.
 
-    Does NOT modify any proof state. Use this to explore before proving:
+    Does NOT modify any file or proof. Use this to explore before proving:
       command="Search (nat -> nat -> nat)."  — find relevant lemmas
       command="Check Nat.add."               — check a term's type
       command="Print Nat.add."               — see a definition
       command="About plus."                  — summary of a name
 
-    Three context modes (mutually exclusive in practice):
+    Three context modes (mutually exclusive):
     - **preamble mode** (default): pass import / scope commands as a
       string.  Scope and import statements like ``Require Import``,
       ``From X Require Y``, ``Open Scope``, ``Set``, ``Unset``,
       ``Local``, and ``Section`` belong here — NOT inside ``command=``.
-      ``command=`` runs each statement in isolation, so e.g. an
-      ``Open Scope`` placed in ``command`` would not propagate to a
-      following ``Search``.  See README "Recommended usage patterns →
-      Imports and scopes in rocq_query".
     - **file mode**: pass a ``.v`` file path; the query runs with all
-      definitions from that file in scope.  More reliable than preamble
-      because it captures ``Open Scope``, ``Set`` options, etc., in the
-      exact order the file declares them.
-    - **from_state mode**: pass a ``state_id`` from a live ``rocq_check``
-      session to query against the live proof context — opened scopes,
-      hypotheses, and local definitions are all visible to ``Search`` /
-      ``Print`` / ``About`` / ``Locate``.  The query runs against a
-      transient child state which is discarded; the parent state is
-      unchanged.  Canonical pattern::
-
-          state_id = (await rocq_check(body=..., from_state=...))["state_id"]
-          await rocq_query(command="Search _.", from_state=state_id)
-
-      Prefer this over ``rocq_check(from_state=N, body="Search ...")``
-      for pure queries — no new ``state_id`` is allocated and the
-      state-table is not polluted.
+      definitions from that file in scope (end-of-file environment).
+    - **position mode**: pass ``file`` + ``line`` + ``character`` to run
+      the query *at that point* in the file — opened scopes, hypotheses,
+      and local definitions visible there are in scope (e.g.
+      ``command="Check H."`` where ``H`` is a hypothesis).  ``line`` /
+      ``character`` are 0-indexed; point at a sentence boundary (just
+      after a tactic's ``.``).
 
     Args:
         command: The Rocq query command to execute.
         preamble: Optional import lines needed for the query context
                   (e.g., "Require Import Reals.\\nOpen Scope R_scope.").
         file: Path to a .v file (relative to workspace) whose definitions
-            should be in scope. Mutually exclusive with preamble and
-            from_state.
+            should be in scope. Mutually exclusive with preamble.
         workspace: Workspace directory.  If omitted, auto-detected by walking
             up from *file* looking for ``_RocqProject`` / ``_CoqProject`` /
             ``dune-project``; falls back to the ``ROCQ_WORKSPACE`` env var
             (default: cwd).
+        line: 0-based line for position mode (requires *file*).
+        character: 0-based character for position mode (requires *file*).
         max_results: Optional maximum number of results to return.
             Useful for broad Search patterns. If omitted, all results are
             returned (subject to character limit).
@@ -1700,16 +1162,9 @@ async def rocq_query(
             so warning noise does not crowd out tool output.
         timeout: Per-call timeout in seconds for expensive computations
             like ``Time Eval vm_compute in ...``.  ``0`` (default) means
-            use ``ROCQ_PET_TIMEOUT``.  Clamped to ``ROCQ_QUERY_TIMEOUT_CAP``
+            use the default op timeout.  Clamped to ``ROCQ_QUERY_TIMEOUT_CAP``
             (default 300s); when clamping fires the response includes
-            ``clamped_timeout: <cap>`` so the caller can diagnose unexpected
-            timeouts.
-        from_state: A live state_id (from ``rocq_start`` / ``rocq_check`` /
-            ``rocq_step_multi``) to query against.  Mutually exclusive with
-            *file*.  When set, *preamble* is ignored.
-
-    On ``pet_restarted: True``, call ``rocq_diag`` for memory headroom and
-    recent error history.
+            ``clamped_timeout: <cap>``.
     """
     effective_timeout: int | None
     if timeout and timeout > 0:
@@ -1742,7 +1197,8 @@ async def rocq_query(
         max_results=max_results,
         include_warnings=include_warnings,
         timeout=effective_timeout,
-        from_state=from_state,
+        line=line,
+        character=character,
     )
     if clamped:
         result["clamped_timeout"] = ROCQ_QUERY_TIMEOUT_CAP
@@ -1883,167 +1339,123 @@ async def rocq_toc(
 
 
 # ---------------------------------------------------------------------------
-# Tool: rocq_notations
+# ---------------------------------------------------------------------------
+# Tool: rocq_get_state
 # ---------------------------------------------------------------------------
 
 
 @mcp.tool
-async def rocq_notations(
-    statement: str,
-    preamble: str = "",
+async def rocq_get_state(
+    file: str,
+    line: int,
+    character: int,
     workspace: str = "",
+    include_warnings: bool = True,
     ctx: Context = None,
 ) -> dict[str, Any]:
-    """List all notations in a Rocq statement and how they resolve.
+    """Show the proof goals at a position in a .v file.
 
-    Helps debug notation ambiguity (e.g., which scope does "+" resolve to?
-    Is "=" Leibniz equality or Qeq?).
+    Stateless: reads the live file and reports the goals at
+    ``(line, character)`` (0-indexed; coq-lsp rounds forward to the
+    enclosing sentence boundary).  Use it to inspect a proof mid-way, or
+    to see the goals at an error position reported by ``rocq_compile``.
 
-    Pass the statement part of a Lemma/Theorem declaration (after the colon).
-    For example, for "Lemma foo : forall n, n + 0 = n", pass
-    statement="forall n, n + 0 = n".
-
-    NOTE: Only works on statements (propositions/types), not arbitrary terms.
+    Returns ``goals`` (formatted text; empty when no foreground goals
+    remain) and ``in_proof`` (False when the position is not inside any
+    proof).  There is no ``state_id`` — run tactics from here with
+    ``rocq_step`` / ``rocq_step_multi`` by passing the same position.
 
     Args:
-        statement: The proposition/type to analyze.
-        preamble: Import lines for context (e.g., "Require Import QArith.").
-        workspace: Workspace directory (default: ROCQ_WORKSPACE env var).
-
-    On ``pet_restarted: True``, call ``rocq_diag`` for memory headroom and
-    recent error history.
+        file: Path to the .v file (relative to workspace).
+        line: 0-based line number.
+        character: 0-based character offset.
+        workspace: Workspace directory.  If omitted, auto-detected from
+            project markers near *file*; falls back to ``ROCQ_WORKSPACE``.
+        include_warnings: Include severity-2 warnings in any messages.
     """
-    workspace = workspace or ROCQ_WORKSPACE
-
+    workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
     err = _validate_workspace(workspace)
     if err:
         return _fail(
-            ctx.lifespan_context if ctx else None, "rocq_notations", err, "validation"
+            ctx.lifespan_context if ctx else None, "rocq_get_state", err, "validation"
         )
-
     if ctx is None:
         return {
             "success": False,
             "reason": "validation",
             "error": "Internal error: no MCP context.",
         }
-
-    return await run_notations(
-        statement=statement,
-        preamble=preamble,
+    return await run_get_state(
+        file=file,
+        line=line,
+        character=character,
         workspace=workspace,
         lifespan_state=ctx.lifespan_context,
+        include_warnings=include_warnings,
     )
 
 
 # ---------------------------------------------------------------------------
-# Tool: rocq_start
+# Tool: rocq_step
 # ---------------------------------------------------------------------------
 
 
 @mcp.tool
-async def rocq_start(
-    file: str = "",
-    theorem: str = "",
+async def rocq_step(
+    file: str,
+    line: int,
+    character: int,
+    tactics: str,
     workspace: str = "",
-    line: int | None = None,
-    character: int | None = None,
-    preamble: str = "",
-    force_restart: bool = False,
+    timeout: int = 0,
+    include_warnings: bool = True,
     ctx: Context = None,
 ) -> dict[str, Any]:
-    """Start an interactive proof session — see goals, explore tactics.
+    """Run a tactic block from a position and see the resulting goals.
 
-    Returns a state_id for use with rocq_check and rocq_step_multi.
-    Also returns the current proof goals at the starting position,
-    so this tool can be used to inspect goals at any point in a file.
+    Speculative: the *tactics* block (one or more sentences / bullets) is
+    applied to the proof state at ``(line, character)`` and the resulting
+    goals are returned — **the file on disk is not modified**.  To keep a
+    step, write it into the file yourself, then re-query by position.
 
-    Three start modes (precedence: theorem > position > preamble):
-    1. By theorem: file + theorem — start proving a specific theorem
-    2. By position: file + line + character — jump to any position in
-       a file and see the proof goals there.  Useful for inspecting
-       proof state at a specific point, or recovering from an error
-       position returned by rocq_compile.
-    3. From imports: preamble — set up import context only (for rocq_check)
-
-    **Position semantics (mode 2):** ``line`` and ``character`` are
-    0-indexed.  Petanque resolves the cursor to a sentence boundary by
-    *rounding forward* through the sentence that contains the cursor:
-
-    - Cursor on any character of a sentence — its first letter, any
-      character inside, or its terminating period — yields the state
-      **after** that whole sentence has executed.
-    - Cursor in the whitespace **before** a sentence's first
-      non-whitespace character yields the state **before** that
-      sentence (= after the previous sentence).
-    - Cursor in the whitespace **after** a sentence's terminating
-      period yields the state **after** that sentence.
-
-    So to inspect goals **before** a tactic, point at the whitespace
-    just before its first character.  To inspect goals **after** a
-    tactic, point at any character of the tactic (including its
-    period) or at the whitespace immediately following the period.
-
-    **Important:** The interactive session reads the file at start time and
-    does not track subsequent edits. If another process or agent modifies the
-    file while a session is active, the proof state becomes stale and tactics
-    may fail or produce wrong results. To avoid this, work on a **copy** of
-    the file for interactive proving, or restart the session after edits.
+    On success returns ``goals`` (empty when no foreground goals remain).
+    If Coq rejects the block, returns ``{success: False, reason:
+    "tactic_failed", error: <coq message>}``.  If the block exceeds the timeout, returns
+    ``{success: False, reason: "timeout"}`` (coq-lsp keeps computing it in
+    the background until the next call preempts it).
 
     Args:
         file: Path to the .v file (relative to workspace).
-        theorem: Name of the theorem to prove.
-        workspace: Workspace directory.  If omitted, auto-detected by walking
-            up from *file* looking for ``_RocqProject`` / ``_CoqProject`` /
-            ``dune-project``; falls back to the ``ROCQ_WORKSPACE`` env var
-            (default: cwd).
-        line: 0-based line number for position-based start.  See
-            "Position semantics" above for how the cursor is resolved
-            to a sentence boundary.
-        character: 0-based character offset for position-based start.
-            See "Position semantics" above.
-        preamble: Import commands for preamble mode (e.g., "Require Import Lia.").
-        force_restart: If True, kill the current PET process and clear all
-            cached state before starting.  Use when PET is alive but in a
-            bad state (e.g., coq-lsp indexing corruption).  You rarely need
-            this — PET auto-restarts on crash/timeout.  Default: False.
-
-    On theorem-not-found errors: response includes ``available_in_file:
-    list[str]`` with the file's defined names (sorted, capped — see
-    ``available_in_file_limit`` in the response when truncated).  When the
-    file has more names than the cap, ``available_in_file_truncated:
-    true``, ``available_in_file_total: <int>`` (uncapped count), and
-    ``available_in_file_limit: <int>`` (the active cap) are also
-    included; call ``rocq_toc`` for the full list.  Agents can fuzzy-
-    match the requested name against this list to recover from typos.
-
-    On ``pet_restarted: True``, call ``rocq_diag`` for memory headroom and
-    recent error history.
+        line: 0-based line number to run from.
+        character: 0-based character offset to run from.
+        tactics: A tactic block to run speculatively (e.g. "intros n m.
+            induction n.").
+        workspace: Workspace directory (auto-detected from *file* if omitted).
+        timeout: Per-call timeout in seconds (0 = default op timeout).
+        include_warnings: Include severity-2 warnings in any block output.
     """
     workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
-
     err = _validate_workspace(workspace)
     if err:
         return _fail(
-            ctx.lifespan_context if ctx else None, "rocq_start", err, "validation"
+            ctx.lifespan_context if ctx else None, "rocq_step", err, "validation"
         )
-
     if ctx is None:
         return {
             "success": False,
             "reason": "validation",
             "error": "Internal error: no MCP context.",
         }
-
-    return await run_start(
+    _t = float(timeout) if timeout and timeout > 0 else None
+    return await run_step(
         file=file,
-        theorem=theorem,
-        workspace=workspace,
-        lifespan_state=ctx.lifespan_context,
         line=line,
         character=character,
-        preamble=preamble,
-        force_restart=force_restart,
+        tactics=tactics,
+        workspace=workspace,
+        lifespan_state=ctx.lifespan_context,
+        include_warnings=include_warnings,
+        timeout=_t,
     )
 
 
@@ -2054,187 +1466,93 @@ async def rocq_start(
 
 @mcp.tool
 async def rocq_step_multi(
+    file: str,
+    line: int,
+    character: int,
     tactics: list[str],
-    from_state: int | None = None,
-    include_warnings: bool = True,
-    ctx: Context = None,
-) -> dict[str, Any]:
-    """Try multiple tactics at once — find what works without guessing.
-
-    Tests each tactic against the current proof state and returns all
-    results. Does NOT advance the state — commit the winner with
-    rocq_check.
-
-    Use this whenever you're unsure which tactic to apply:
-      tactics=["auto.", "lia.", "lra.", "ring.", "tauto.", "firstorder."]
-
-    Or to auto-solve a subgoal, try the standard automation battery:
-      tactics=["trivial.", "reflexivity.", "assumption.", "exact I.",
-               "auto.", "eauto.", "tauto.", "intuition.", "lia.", "lra.",
-               "nia.", "nra.", "ring.", "field.", "decide equality.",
-               "firstorder."]
-    Note: lia/lra/ring/field require the .v file to import Lia/Lra/Ring/Field.
-
-    Or to explore proof structure:
-      tactics=["destruct n.", "induction n.", "case_eq n."]
-
-    Each result entry includes a ``feedback`` field (truncated string)
-    when the tactic produces visible output (e.g., ``Print``, ``Search``).
-
-    Requires an active state from rocq_start or rocq_check (or use from_state).
-    With ``from_state=None`` and no current state in the table, returns a
-    validation failure with reason ``"validation"`` and a hint to call
-    rocq_start first.
-
-    **Canonical exploration pattern:** if the first few steps of a proof
-    are a confident prefix, advance with ``rocq_check`` first and pass
-    the resulting ``state_id`` as ``from_state`` here — don't repeat the
-    prefix inside every entry of ``tactics``.  See README
-    "Recommended usage patterns → Multi-tactic exploration".
-
-    Args:
-        tactics: List of tactics to try (max 20).
-        from_state: Try from a specific state (default: current state).
-            For exploring alternatives, prefer advancing the prefix via
-            ``rocq_check(from_state=S, body=prefix)`` and passing that
-            new ``state_id`` here over re-running the prefix inside each
-            tactic.
-        include_warnings: If True (default), per-tactic ``feedback`` includes
-            all severities.  If False, drop entries at LSP Warning severity.
-
-    On ``pet_restarted: True``, call ``rocq_diag`` for memory headroom and
-    recent error history.
-    """
-    if ctx is None:
-        return {
-            "success": False,
-            "reason": "validation",
-            "error": "Internal error: no MCP context.",
-        }
-
-    return await run_step_multi(
-        tactics=tactics,
-        lifespan_state=ctx.lifespan_context,
-        from_state=from_state,
-        include_warnings=include_warnings,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Tool: rocq_check
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool
-async def rocq_check(
-    body: str,
-    from_state: int | None = None,
     workspace: str = "",
     timeout: int = 0,
     include_warnings: bool = True,
     ctx: Context = None,
 ) -> dict[str, Any]:
-    """Run proof commands from cached imports — fast iterative checking.
+    """Try multiple tactic blocks from one position — find what works.
 
-    Much faster than rocq_compile for iterative proof development:
-    imports are cached (first call processes them, subsequent calls skip), and on error
-    returns the last valid state for immediate interactive recovery
-    via rocq_check(from_state=...) or rocq_step_multi(from_state=...).
+    Each block in *tactics* is run speculatively from ``(line, character)``
+    (the file is never modified) and its outcome recorded in ``results``
+    (order preserved).  Per block: success -> ``{tactics, goals}``;
+    Coq rejection -> ``{tactics, success: False,
+    reason: "tactic_failed", error}``; timeout -> ``{tactics, success:
+    False, reason: "timeout", error}`` (the batch still runs to the end).
 
-    When proof_finished=True, also returns proof_tactics (ordered list of
-    all tactics from root to current state) and proof_hint (instructions
-    for assembling the final .v file).
+    Useful for an automation battery without committing any of it::
 
-    Recommended workflow:
-    1. rocq_start(file=..., theorem=...) to open the proof
-    2. rocq_check(body="intros. simpl.") to advance
-    3. If stuck: rocq_step_multi(tactics=[...]) to explore
-    4. rocq_check(body="winning_tactic.") to commit
-
-    When commands produce visible output (e.g., ``Print``, ``Check``,
-    ``vm_compute``, ``native_compute``), a ``feedback`` field is included
-    as a list of ``[command, output]`` pairs (truncated per step at 50K
-    chars).  Omitted when no command produces output.
-
-    **Note:** If the underlying .v file is modified after rocq_start, the
-    session state becomes stale. A ``stale_warning`` field is returned when
-    this is detected. Restart the session with rocq_start after file edits.
+        tactics=["reflexivity.", "lia.", "ring.", "auto.", "firstorder."]
 
     Args:
-        body: Commands to execute (one or more Rocq sentences).
-        from_state: Execute from a specific state ID (default: current state).
-        workspace: Directory to use as workspace (default: ROCQ_WORKSPACE env var).
-        timeout: Timeout in seconds (default: ROCQ_PET_TIMEOUT env var).
-        include_warnings: If True (default), per-step ``feedback`` includes
-            all severities.  If False, drop entries at LSP Warning severity.
-
-    On ``pet_restarted: True``, call ``rocq_diag`` for memory headroom and
-    recent error history.
+        file: Path to the .v file (relative to workspace).
+        line: 0-based line number to run each block from.
+        character: 0-based character offset to run each block from.
+        tactics: List of tactic blocks to try (max 20).
+        workspace: Workspace directory (auto-detected from *file* if omitted).
+        timeout: Per-call timeout in seconds (0 = default op timeout).
+        include_warnings: Include severity-2 warnings in any block output.
     """
-    # Note: workspace param is accepted for API compatibility but unused;
-    # the active workspace comes from the state entry set by rocq_start.
-    timeout = timeout if timeout is not None and timeout > 0 else ROCQ_PET_TIMEOUT
-
+    workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
+    err = _validate_workspace(workspace)
+    if err:
+        return _fail(
+            ctx.lifespan_context if ctx else None,
+            "rocq_step_multi",
+            err,
+            "validation",
+        )
     if ctx is None:
         return {
             "success": False,
             "reason": "validation",
             "error": "Internal error: no MCP context.",
         }
-
-    return await run_check(
-        body=body,
-        timeout=float(timeout),
+    _t = float(timeout) if timeout and timeout > 0 else None
+    return await run_step_multi(
+        file=file,
+        line=line,
+        character=character,
+        tactics=tactics,
+        workspace=workspace,
         lifespan_state=ctx.lifespan_context,
-        from_state=from_state,
         include_warnings=include_warnings,
+        timeout=_t,
     )
-
-
 @mcp.tool
 async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
-    """Operational diagnostics: pet health, memory headroom, recent errors.
+    """Operational diagnostics: coq-lsp health, memory headroom, recent errors.
 
     Use this when:
-    - A tool returned ``pet_restarted: True`` and you want to see what
+    - A tool returned ``lsp_restarted: True`` and you want to see what
       happened.
     - You're considering a long ``vm_compute`` and want to check memory
-      headroom against ``max_rss_mb_threshold``.
-    - You want to know which proof states are currently live in pet's
-      state table.
+      headroom against ``lsp_max_rss_mb_threshold``.
 
-    Does NOT spawn pet if it's not running; just reports state.
+    Does NOT spawn coq-lsp if it's not running; just reports state.
 
     Response shape:
 
-    - ``pet``: ``{pid, uptime_seconds, restarts, generation, trim_count}``.
-      ``trim_count`` is the number of ``petanque/trimCaches`` notifications
-      sent so far (see ``ROCQ_PET_TRIM_RSS_MB``).
     - ``lsp``: ``{pid, generation, trim_count}`` -- coq-lsp subprocess
       bookkeeping.  ``pid`` is ``None`` when coq-lsp is not running.
       ``trim_count`` is the number of ``coq/trimCaches`` notifications
       sent so far (see ``ROCQ_LSP_TRIM_RSS_MB``).
-    - ``memory``: ``{pet_rss_mb, peak_pet_rss_mb, max_rss_mb_threshold,
-      trim_rss_mb_threshold, sample_status, lsp_rss_mb, peak_lsp_rss_mb,
-      lsp_max_rss_mb_threshold, lsp_trim_rss_mb_threshold,
-      lsp_sample_status}``.  The ``sample_status`` fields are one of
-      ``"ok"`` / ``"no_pet"`` (or ``"no_lsp"``) / ``"psutil_error"``
-      and disambiguate a ``None`` RSS reading.
-    - ``live_states``: capped at 50 most-recent entries (by
-      ``created_at``) to keep the payload bounded.  Each entry has
-      ``{state_id, parent, file, theorem, age_seconds}``.
-    - ``live_states_total``: full count of entries in the state table
-      (use this to detect that ``live_states`` was truncated).
+    - ``memory``: ``{lsp_rss_mb, peak_lsp_rss_mb, lsp_max_rss_mb_threshold,
+      lsp_trim_rss_mb_threshold, lsp_sample_status}``.  ``lsp_sample_status``
+      is ``"ok"`` / ``"no_lsp"`` / ``"psutil_error"`` and disambiguates a
+      ``None`` RSS reading.
     - ``recent_errors``: ring buffer of the last 20 errors, each
       ``{tool, message, reason, ago_seconds}``.  ``reason`` is one of:
 
-      - **Pet-side** (set by ``_run_with_pet``): ``"timeout"``,
-        ``"crashed"``, ``"memory_exhausted"``, ``"lock_contended"``,
-        ``"unavailable"``.
-      - **Validation / lookup** (set by tools before pet): ``"validation"``,
-        ``"not_found"`` (rocq_start / rocq_assumptions on a typo).
-      - **rocq_check mid-batch**: ``"tactic_failed"`` (a tactic was
-        rejected by Coq — distinct from a transport-level ``"crashed"``).
+      - **coq-lsp transport**: ``"timeout"``, ``"crashed"``,
+        ``"memory_exhausted"``, ``"unavailable"``.
+      - **Validation / lookup** (set by tools): ``"validation"``,
+        ``"not_found"`` (e.g. rocq_assumptions on a typo).
+      - **Tactic rejected** (rocq_step / rocq_step_multi): ``"tactic_failed"``.
       - **rocq_verify-specific**: ``"compile_error"``,
         ``"axiom_dependency"``, ``"type_mismatch"``.
 
@@ -2261,6 +1579,8 @@ async def rocq_compile_lsp(
     timeout: int = 0,
     include_warnings: bool = False,
     include_info: bool = False,
+    line: int | None = None,
+    character: int | None = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Incrementally check a .v file using coq-lsp diagnostics.
@@ -2274,6 +1594,21 @@ async def rocq_compile_lsp(
     by coq-lsp.  Use this instead of rocq_compile_file when iterating
     on a proof.  Use rocq_compile_file for final authoritative
     verification with coqc.
+
+    **Check up to a position (low latency).**  Pass ``line`` (and
+    optionally ``character``) to get the diagnostics for the file *up to
+    that point* as soon as coq-lsp's check reaches it — without waiting
+    for the rest of the file, which keeps checking in the background.
+    This is the fast way to verify a lemma near the top of a file with an
+    expensive proof further down: you get the top lemma's result
+    immediately.  Omit ``line`` (the default) to check the whole file and
+    wait for completion.  With ``character`` omitted the point is the end
+    of ``line`` (so passing a lemma's ``Qed.``/``Defined.`` line reports
+    through that lemma); give ``character`` for an exact point.  Only
+    diagnostics at or before the point are returned, and the result
+    carries ``checked_through: {line, character}``.  (Because the tail
+    then elaborates unsupervised — no watchdog runs once this returns —
+    prefer a full check on files whose *unchecked* tail is huge.)
 
     A memory watchdog monitors the coq-lsp subprocess against
     ``ROCQ_MAX_LSP_RSS_MB``; on breach the response is
@@ -2291,80 +1626,71 @@ async def rocq_compile_lsp(
             ``Print`` output, etc.  Each entry has the same shape as an
             error/warning: ``{line, character, end_line, end_character,
             message, severity}`` with ``severity == 3``.
+        line: 0-based line to check up to, returning as soon as the check
+            reaches it (default: None = check the whole file and wait).
+        character: 0-based character within *line* for an exact point
+            (default: None = the end of *line*).  Ignored when *line* is
+            None.
     """
-    workspace = workspace or ROCQ_WORKSPACE
+    # Same workspace handling as the other file tools: auto-detect the
+    # project root from *file* when no explicit workspace is given.
+    workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
     timeout = timeout if timeout is not None and timeout > 0 else 0  # 0 = no timeout
 
     if ctx is None:
-        return _fail(ctx, "rocq_compile_lsp", "Internal error: no MCP context.")
+        return _fail(None, "rocq_compile_lsp", "Internal error: no MCP context.")
+    lifespan_state = ctx.lifespan_context
 
     ws_err = _validate_workspace(workspace)
     if ws_err:
-        return _fail(ctx, "rocq_compile_lsp", ws_err)
+        return _fail(lifespan_state, "rocq_compile_lsp", ws_err)
 
     try:
         resolved = _resolve_file_in_workspace(file, workspace)
     except (ValueError, FileNotFoundError) as e:
-        return _fail(ctx, "rocq_compile_lsp", str(e))
+        return _fail(lifespan_state, "rocq_compile_lsp", str(e))
 
-    lifespan_state = ctx.lifespan_context
-
-    from rocq_mcp.lsp_checker import LspChecker
-
-    checker = lifespan_state.get("lsp_checker")
-    if checker is None or not checker._is_alive():
-        checker = LspChecker(workspace=workspace)
-        lifespan_state["lsp_checker"] = checker
-
-    main_task = asyncio.create_task(
-        asyncio.to_thread(
-            checker.check_file, resolved, workspace, float(timeout)
-        )
-    )
-    mem_event = asyncio.Event()
-    monitor_task = asyncio.create_task(
-        _memory_watchdog(
+    # Optional position: check the file only as far as (line, character).
+    # Default (line is None) = check the whole file and wait for
+    # completion (the original behaviour).  With a position, coq-lsp
+    # answers as soon as its check *reaches* the point (a postponed
+    # proof/goals barrier) and the tail keeps checking in the background
+    # — low latency to the prefix result.  See LspChecker.check_up_to.
+    if line is not None and (
+        not (0 <= line <= _MAX_LINE_CHAR_RANGE)
+        or (character is not None and not (0 <= character <= _MAX_LINE_CHAR_RANGE))
+    ):
+        return _fail(
             lifespan_state,
-            ROCQ_MAX_LSP_RSS_MB,
-            main_task,
-            mem_event,
-            get_process=_lsp_process_from_state,
-            peak_key="peak_lsp_rss_mb",
+            "rocq_compile_lsp",
+            f"line and character must be in range [0, {_MAX_LINE_CHAR_RANGE}].",
         )
+
+    def _check(checker: Any) -> dict[str, Any]:
+        if line is None:
+            return checker.check_file(resolved, workspace, float(timeout))
+        return checker.check_up_to(
+            resolved, line, character, workspace=workspace, timeout=float(timeout)
+        )
+
+    # _run_with_lsp handles checker lifecycle, the RSS memory watchdog
+    # (memory_exhausted envelope on breach), and the post-success soft
+    # trim (coq/trimCaches when RSS crosses ROCQ_LSP_TRIM_RSS_MB).
+    result = await _run_with_lsp(
+        _check, lifespan_state, "rocq_compile_lsp", workspace=workspace
     )
-    try:
-        try:
-            result = await main_task
-        finally:
-            if not monitor_task.done():
-                monitor_task.cancel()
-                try:
-                    await monitor_task
-                except asyncio.CancelledError:
-                    pass
-    except asyncio.CancelledError:
-        # Watchdog cancelled the main task because coq-lsp RSS breached
-        # the threshold.  Build the memory_exhausted envelope (which
-        # also kills coq-lsp so the next call respawns it).
-        if mem_event.is_set():
-            return _build_lsp_memory_abort_response(
-                lifespan_state, "rocq_compile_lsp"
-            )
-        raise
 
-    # Soft trim: coq-lsp's global memo tables (Memo.{Intern, Interp,
-    # Admit, Init, Require}) grow unboundedly across calls.  When RSS
-    # crosses ROCQ_LSP_TRIM_RSS_MB on a successful check, send
-    # coq/trimCaches to free them without killing coq-lsp -- this
-    # preserves the incremental cache for the file the agent is
-    # actively editing.  ROCQ_LSP_TRIM_RSS_MB=0 disables this path;
-    # the hard ROCQ_MAX_LSP_RSS_MB cap remains the runaway safety net.
-    _maybe_trim_lsp_caches(lifespan_state, checker)
-
+    # On a memory abort the envelope carries no warnings/info keys to pop.
     if not include_warnings:
         result.pop("warnings", None)
     if not include_info:
         result.pop("info", None)
+    # Self-describe a position-limited check so the caller knows the
+    # result covers only diagnostics up to the point (the tail may still
+    # be checking).  The memory-abort envelope has no diagnostics, so
+    # leave it untouched.
+    if line is not None and result.get("reason") != "memory_exhausted":
+        result["checked_through"] = {"line": line, "character": character}
 
     return result
 

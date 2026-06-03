@@ -9,7 +9,7 @@ An [MCP](https://modelcontextprotocol.io/) server for [Rocq](https://rocq-prover
 ## Prerequisites
 
 - **Rocq / Coq** -- `coqc` must be on your `PATH` (needed by all tools). If the workspace contains a `_RocqProject` or `_CoqProject` file, the server parses it for load-path flags (`-Q`, `-R`, `-I`). For **dune projects** (no `_CoqProject` but a `dune-project` file present), the server auto-detects load paths via `dune coq top` (once per `(coq.theory ...)` stanza, so multi-theory workspaces resolve cross-theory imports correctly) and writes a `_RocqProject` file in the workspace so that coq-lsp also picks them up. This generated file stays in the workspace and should be added to `.gitignore`. Otherwise it defaults to `-Q <workspace> Test`.
-- **pet** (from [coq-lsp](https://github.com/ejgallego/coq-lsp)) -- optional, needed only for the interactive tools (`rocq_query`, `rocq_assumptions`, `rocq_start`, `rocq_check`, `rocq_step_multi`, `rocq_toc`, `rocq_notations`). If `pet` is not installed, the compile and verify tools still work.
+- **coq-lsp** -- `coq-lsp` must be on your `PATH` for the interactive and query tools (`rocq_get_state`, `rocq_step`, `rocq_step_multi`, `rocq_query`, `rocq_assumptions`, `rocq_toc`, `rocq_compile_lsp`). If it is not installed, the `coqc`-based tools (`rocq_compile`, `rocq_compile_file`, `rocq_verify`) still work.
 - **Python 3.11+**
 
 ## Installation
@@ -17,7 +17,6 @@ An [MCP](https://modelcontextprotocol.io/) server for [Rocq](https://rocq-prover
 Using [uv](https://docs.astral.sh/uv/):
 
 ```bash
-# Install (includes pytanque for interactive tools)
 uv pip install -e .
 ```
 
@@ -29,88 +28,85 @@ uv pip install -e ".[dev]"
 
 ## Tools
 
-The server exposes eleven MCP tools:
+The server exposes ten MCP tools:
 
-### Compilation tools (coqc-based, no pytanque needed)
+### Compilation tools (coqc-based)
 
 | Tool | Description |
 |------|-------------|
-| **`rocq_compile`** | Batch-compile Rocq source code via coqc. Best for checking a finished proof. On error, returns error positions and a `state_capture_status` field; when `pet`/coq-lsp is available and the failure is inside a proof, also returns a reusable `state_id` and the goals at the error position. For iterative development, prefer `rocq_check`. |
-| **`rocq_compile_file`** | Like `rocq_compile` but takes a file path instead of source string. More efficient for large files (avoids transmitting full source over MCP). Cleans up compilation artifacts but preserves the source file. When `pet`/coq-lsp is available and the failure is inside a proof, also returns a reusable `state_id` and the goals at the error position via `state_capture_status`. |
+| **`rocq_compile`** | Batch-compile Rocq source code via coqc. Best for checking a finished proof. On error, returns error positions and a `hint`; inspect the proof goals at an error inside a proof with `rocq_get_state(file=..., line=..., character=...)`. For iterative development, prefer `rocq_compile_lsp` (incremental). |
+| **`rocq_compile_file`** | Like `rocq_compile` but takes a file path instead of source string. More efficient for large files (avoids transmitting full source over MCP). Cleans up compilation artifacts but preserves the source file. |
 | **`rocq_verify`** | Verify that a proof actually proves the original statement. Wraps in a `Module M.` sandbox to catch type redefinition, `Admitted`/`Abort`, custom axioms, and statement mismatches. Run after `rocq_compile` succeeds. |
 
-### Interactive tools (pytanque-based, require `pet`)
+### Interactive & query tools (coq-lsp-based)
+
+These are **stateless and position-addressed**: every proof state is referred to by `(file, line, character)` on the live file. There is no `state_id` and no session to manage — the agent edits the file and re-queries by position.
 
 | Tool | Description |
 |------|-------------|
-| **`rocq_query`** | Search the Rocq environment — find lemmas, check types, inspect definitions. Three context modes: **preamble** (import commands as a string), **file** (a `.v` file path whose definitions are in scope), or **from_state** (a live `state_id` from a `rocq_check` session — the query sees opened scopes, hypotheses, and local definitions). Use `from_state=<state_id>` to introspect mid-proof without re-specifying preamble. Optional `max_results` parameter limits output for broad searches. Does not modify any proof state. |
-| **`rocq_assumptions`** | List the axioms a theorem depends on. Takes a required `file` parameter (path to the `.v` file where the theorem is defined) to set up the full environment. Returns `assumptions: list[str]` of `"name : type"` pairs from `Print Assumptions` (empty when the theorem is closed under the global context) plus the full `raw_output` for agents that want it. No classification — `rocq_assumptions` is pure introspection; the agent decides what's safe to trust. Use `rocq_verify` for a sandboxed admit-free / axiom-policy decision on a candidate proof. |
-| **`rocq_start`** | Start an interactive proof session and return proof goals. Three modes: (1) by theorem name, (2) by position — jump to any point in a file to inspect proof goals there (e.g., error positions from `rocq_compile`), (3) from imports. Returns a `state_id` for use with `rocq_check` and `rocq_step_multi`. Optional `force_restart=True` kills the PET process and clears all cached state before starting (use when PET is in a bad state). |
-| **`rocq_check`** | Run proof commands with cached imports — fast iterative checking. On error, returns `last_valid_state_id` for immediate recovery via `rocq_check(from_state=...)` or `rocq_step_multi(from_state=...)`. Includes `stale_warning` if the source file was modified since session start. |
-| **`rocq_step_multi`** | Try multiple tactics at once — find what works without guessing. Useful for auto-solving subgoals (pass standard automation tactics) or exploring proof structure. Does not advance the state; commit the winner with `rocq_check`. Max 20 tactics per call. |
-| **`rocq_toc`** | Get the structure of a `.v` file: all definitions, lemmas, theorems, and sections as a hierarchical outline. Does not require an active session. |
-| **`rocq_notations`** | List all notations in a Rocq statement and how they resolve (which scope, which module). Helps debug notation ambiguity (e.g., is `+` in `nat_scope` or `Z_scope`?). |
-| **`rocq_diag`** | Operational diagnostics: pet health, memory headroom, recent errors. Use after `pet_restarted: True` to diagnose what happened, or before a long `vm_compute` to check memory headroom. |
+| **`rocq_compile_lsp`** | Incrementally check a `.v` file via coq-lsp. Much faster than `rocq_compile_file` for iterative development — coq-lsp caches the unchanged prefix and only re-checks the delta. Pass an optional `line` (and `character`) to get the diagnostics *up to that point* as soon as the check reaches it, without waiting for the rest of the file (which keeps checking in the background) — so you can verify a lemma near the top of a file with an expensive proof below and get its result immediately. The result then carries `checked_through`. |
+| **`rocq_get_state`** | Show the proof goals at a `(file, line, character)` position (0-indexed; coq-lsp rounds forward to the enclosing sentence). Returns `goals` (empty when no foreground goals remain) and `in_proof`. Use it to inspect a proof mid-way or at an error position from `rocq_compile`. |
+| **`rocq_step`** | Run a tactic **block** from a position and see the resulting goals — *speculatively*: the file on disk is **not** modified. On a rejected block, returns `reason: "tactic_failed"` and the Coq error. To keep a step, write it into the file yourself, then re-query by position. |
+| **`rocq_step_multi`** | Try multiple tactic blocks from one position (≤20) and get each outcome — useful for an automation battery without committing any of it. Speculative, like `rocq_step`. |
+| **`rocq_query`** | Search the Rocq environment — find lemmas, check types, inspect definitions. Three context modes: **preamble** (import commands as a string), **file** (a `.v` file path whose definitions are in scope), or **position** (`file` + `line` + `character` to query at a point in a proof, where local hypotheses are visible). Optional `max_results` limits output. Does not modify anything. |
+| **`rocq_assumptions`** | List the axioms a theorem depends on. Takes a required `file` parameter (path to the `.v` file where the theorem is defined) to set up the full environment. Returns `assumptions: list[str]` of `"name : type"` pairs from `Print Assumptions` (empty when the theorem is closed under the global context) plus the full `raw_output`. No classification — pure introspection. Use `rocq_verify` for a sandboxed trust decision. |
+| **`rocq_toc`** | Get the structure of a `.v` file: all definitions, lemmas, theorems, and sections as an outline. Does not require a session. |
+| **`rocq_diag`** | Operational diagnostics: coq-lsp pid / memory headroom and recent errors. Use before a long `vm_compute` to check memory headroom, or after a `memory_exhausted` failure. |
 
-> **Stale file warning:** Interactive sessions (`rocq_start` / `rocq_check` / `rocq_step_multi`) read the `.v` file at session start and do not track subsequent edits. If another process or agent modifies the file while a session is active, the proof state becomes stale and tactics may fail or produce wrong results. In multi-agent setups, **work on a copy of the file** for interactive proving, or restart the session with `rocq_start` after edits. A `stale_warning` field is returned when a file modification is detected.
+> **Live file:** the interactive tools read the file on disk at call time (coq-lsp re-syncs on each call), so there is no session to go stale — edit the file and re-query. `rocq_step` / `rocq_step_multi` never modify the file; they show what a tactic block *would* do.
 
-> **Workspace auto-detection:** When a file-accepting tool (`rocq_compile_file`, `rocq_query`, `rocq_assumptions`, `rocq_toc`, `rocq_start`) is called without an explicit `workspace`, the server walks up from the file's directory looking for `_RocqProject`, `_CoqProject`, or `dune-project` markers and uses the directory of the innermost match. Falls back to `ROCQ_WORKSPACE` if no marker is found. Pass `workspace=` explicitly to override (e.g. for monorepos with nested project files).
+> **Workspace auto-detection:** When a file-accepting tool (`rocq_compile_file`, `rocq_compile_lsp`, `rocq_query`, `rocq_assumptions`, `rocq_toc`, `rocq_get_state`, `rocq_step`, `rocq_step_multi`) is called without an explicit `workspace`, the server walks up from the file's directory looking for `_RocqProject`, `_CoqProject`, or `dune-project` markers and uses the directory of the innermost match. Falls back to `ROCQ_WORKSPACE` if no marker is found.
 
 ## Recommended usage patterns
 
-### Multi-tactic exploration: `rocq_check` then `rocq_step_multi`
+### Inspect, then step, then write
 
-To explore N alternative tactics from a known good state, advance the
-state with `rocq_check` first, then branch with `rocq_step_multi`:
+The interactive tools are stateless and speculative. The loop is: look at
+the goals, try a block, and — if you like the result — write it into the
+file yourself and move on.
 
-    # Step 1: confirm the prefix and advance.
-    result = rocq_check(from_state=S, body="intros n m H.")
-    new_state = result["state_id"]
+    # 1. See the goals where you are (0-indexed position).
+    rocq_get_state(file="foo.v", line=4, character=2)
 
-    # Step 2: try alternatives from that state.
-    rocq_step_multi(from_state=new_state, tactics=[
-        "by ring.",
-        "by lia.",
-        "by reflexivity.",
-    ])
+    # 2. Try a block speculatively (file is NOT modified).
+    rocq_step(file="foo.v", line=4, character=2,
+              tactics="intros n m. induction n.")
 
-This is more efficient than passing the prefix repeatedly inside
-`tactics=[...]` (each tactic would re-run the prefix).  It also makes
-the agent's intent — "I'm confident in the prefix; explore the next
-step" — explicit.
+    # 3. Not sure which tactic? Try several at once.
+    rocq_step_multi(file="foo.v", line=4, character=2,
+                    tactics=["ring.", "lia.", "reflexivity."])
+
+    # 4. Edit foo.v to add the winning block, then re-query by position.
+
+Point at a sentence boundary (e.g. just after a tactic's `.`); coq-lsp
+rounds a cursor forward to the end of the sentence it lies in.
 
 ### Imports and scopes in `rocq_query`
 
 Statements like `Require Import`, `From X Require Y`, `Open Scope`,
-`Set`, `Unset`, `Local`, and `Section` must go in the `preamble=`
-parameter (a multi-line string), not in `body=`:
+`Set`, `Unset`, `Local`, and `Section` go in the `preamble=` parameter
+(a multi-line string):
 
     rocq_query(
         preamble="From Coq Require Import Reals.\nOpen Scope R_scope.",
         command="Search (_ + _).",
     )
 
-Why: each statement in `body=` runs in isolation, so `Open Scope`
-in body would not propagate to the next statement.  For multi-import
-preambles, prefer `file=<path>` to a `.v` file containing the imports
-— more reliable when the imports include `Set` / `Unset` directives
-that may need a specific ordering.
-
-For mid-proof queries — e.g. `Search` against the live proof state —
-use `from_state=<state_id>` instead of preamble; the live state
-already has all imports and scopes set up.
+For a query against a file's full environment, pass `file=<path>`. For a
+mid-proof query — e.g. `Check H.` where `H` is a hypothesis — pass
+`file` + `line` + `character` to query at that point in the proof.
 
 ### Failure envelope and `reason` taxonomy
 
 Every failure response carries `{success: False, error: str, reason: str}` so an agent can dispatch on `reason` without parsing message text. The same `reason` is recorded into the `recent_errors` ring buffer that `rocq_diag` returns. Values:
 
-- **Validation / lookup** (set by tools before reaching `pet`): `"validation"`, `"not_found"` (typo on `rocq_start` / `rocq_assumptions`).
-- **Pet-side** (set by `_run_with_pet` on subprocess-level failures): `"timeout"`, `"crashed"`, `"memory_exhausted"`, `"lock_contended"`, `"unavailable"`. When pet had to be killed, the response also carries `pet_restarted: True`.
-- **`rocq_check` mid-batch**: `"tactic_failed"` (Coq rejected the tactic — distinct from a transport-level `"crashed"`).
+- **Validation / lookup**: `"validation"`, `"not_found"` (e.g. a typo'd theorem name on `rocq_assumptions`).
+- **coq-lsp transport**: `"timeout"`, `"crashed"`, `"memory_exhausted"` (coq-lsp RSS exceeded the cap; the response also carries `lsp_restarted: True`).
+- **Tactic rejected** (`rocq_step` / `rocq_step_multi`): `"tactic_failed"` — Coq rejected the block.
 - **`rocq_compile` / `rocq_compile_file`**: `"compile_error"` (coqc returned non-zero).
-- **`rocq_verify`-specific**: `"compile_error"`, `"axiom_dependency"` (proof relies on `Admitted`/admit/custom axiom), `"type_mismatch"` (Phase 3 found the proof's type differs from the problem's type).
+- **`rocq_verify`-specific**: `"compile_error"`, `"axiom_dependency"` (proof relies on `Admitted`/admit/custom axiom), `"type_mismatch"`.
 
-When a tool returns `pet_restarted: True`, call `rocq_diag` for memory headroom and recent-error history.
+When a tool returns `lsp_restarted: True`, call `rocq_diag` for memory headroom and recent-error history.
 
 ## Environment Variables
 
@@ -119,10 +115,10 @@ When a tool returns `pet_restarted: True`, call `rocq_diag` for memory headroom 
 | `ROCQ_WORKSPACE` | current directory | Working directory for Rocq compilation; used as the final fallback when no project marker is found by walking up from the file. When set explicitly, all workspace parameters are constrained to this directory or its subdirectories. |
 | `ROCQ_COQC_TIMEOUT` | `60` | Timeout (seconds) for `rocq_compile` |
 | `ROCQ_VERIFY_TIMEOUT` | `120` | Timeout (seconds) for `rocq_verify` |
-| `ROCQ_PET_TIMEOUT` | `30` | Timeout (seconds) for pytanque-based tools |
+| `ROCQ_OP_TIMEOUT` | `30` | Default per-operation timeout (seconds) for the coq-lsp tools (falls back to the legacy `ROCQ_PET_TIMEOUT`) |
 | `ROCQ_QUERY_TIMEOUT_CAP` | `300` | Cap (seconds) on the per-call `timeout` parameter of `rocq_query`; larger values are clamped and the response carries `clamped_timeout: <cap>` |
-| `ROCQ_ENRICHMENT_TIMEOUT_CAP` | `5.0` | Cap (seconds) on per-call proof-state capture after a `rocq_compile` / `rocq_compile_file` failure |
-| `ROCQ_MAX_PET_RSS_MB` | `min(50% of system RAM, 16384)` | Maximum pet subprocess RSS (MB). On breach, the call aborts via the timeout recovery path; response includes `reason: "memory_exhausted"` and `pet_restarted: True`. |
+| `ROCQ_MAX_LSP_RSS_MB` | `min(50% of system RAM, 16384)` | Maximum coq-lsp subprocess RSS (MB). On breach the call aborts; response includes `reason: "memory_exhausted"` and `lsp_restarted: True`. |
+| `ROCQ_LSP_TRIM_RSS_MB` | `½ × ROCQ_MAX_LSP_RSS_MB` | Soft cap: above it, a successful check sends `coq/trimCaches` to free coq-lsp's memo tables without killing it. Set to `0` to disable. |
 | `ROCQ_COQC_BINARY` | `coqc` | Path to the `coqc` binary |
 | `ROCQ_MAX_SOURCE_SIZE` | `1000000` | Maximum source size in bytes |
 
@@ -136,7 +132,7 @@ The verification tool (`rocq_verify`) uses defense in depth with three verificat
 
 1. **Phase 1 -- Module M sandbox.** The proof is wrapped inside `Module M. ... End M.`. The theorem is re-stated outside and proved via `exact M.<name>`. This is the strongest sandbox but can time out on compute-heavy proofs.
 
-2. **Phase 2 -- Shared-defs template.** For problems with Inductive/Record/Definition types, type definitions are placed outside Module M to avoid nominal typing mismatches, while the proof stays inside the sandbox. Uses pytanque's `toc` to extract problem structure. Falls back from Phase 1 when type incompatibilities are detected.
+2. **Phase 2 -- Shared-defs template.** For problems with Inductive/Record/Definition types, type definitions are placed outside Module M to avoid nominal typing mismatches, while the proof stays inside the sandbox. Uses coq-lsp's `documentSymbol` to extract problem structure. Falls back from Phase 1 when type incompatibilities are detected.
 
 3. **Phase 3 -- Direct verification.** When Phase 1 or Phase 2 times out or fails, the proof is compiled standalone (no Module M) with the full original timeout budget. Correctness is verified by comparing `Check <name>.` output against the problem statement's expected type after normalization. Additional security checks compensate for the lack of a sandbox (see below). This phase handles compute-heavy proofs that are too slow under Module M wrapping.
 
@@ -233,36 +229,33 @@ Add to your MCP client configuration (e.g., Claude Desktop, Claude Code):
 uv run pytest
 ```
 
-Tests for pytanque-based tools (`rocq_query`, `rocq_assumptions`, `rocq_start`, `rocq_check`, `rocq_step_multi`, `rocq_toc`, `rocq_notations`) require `pet` to be installed. Integration tests will be skipped automatically if it is not available.
+Tests for the coq-lsp-based tools (`rocq_get_state`, `rocq_step`, `rocq_step_multi`, `rocq_query`, `rocq_assumptions`, `rocq_toc`, `rocq_compile_lsp`) require `coq-lsp` to be installed; they are skipped automatically if it is not available.
 
 ## Project Structure
 
 ```
 src/rocq_mcp/
   __init__.py            Package init
-  server.py              MCP server, 11 @mcp.tool wrappers, pet subprocess management
+  server.py              MCP server, @mcp.tool wrappers, coq-lsp lifecycle + memory watchdog
+  lsp_checker.py         Persistent coq-lsp client: diagnostics, proof/goals, documentSymbol
   compile.py             coqc-based tools: compile, compile_file, verify
-  compile_enrichment.py  Compile-error-state orchestration (PET state capture)
-  diag.py                rocq_diag snapshot builder (pet uptime, memory, recent errors)
-  interactive.py         pytanque-based tools: start, check, step_multi, query, assumptions, toc, notations
+  diag.py                rocq_diag snapshot builder (coq-lsp pid/memory, recent errors)
+  interactive.py         coq-lsp tools: get_state, step, step_multi, query, assumptions, toc
   verify.py              Rocq lexer scanner, Module M. verification, Print Assumptions parsing
 tests/
-  conftest.py           Shared fixtures
-  test_compile.py       Tests for rocq_compile
-  test_compile_file.py  Tests for rocq_compile_file
-  test_verify.py        Tests for rocq_verify
-  test_assumptions.py   Tests for rocq_assumptions
-  test_auto_solve.py    Tests for sentence utilities and step_multi auto-solving
-  test_server.py        Tests for server helpers (_format_error, _parse_project_flags, etc.)
-  test_format_error.py  Tests for error formatting
-  test_query.py         Tests for rocq_query (requires pet)
-  test_start.py         Tests for rocq_start (requires pet)
-  test_check.py         Tests for rocq_check (requires pet)
-  test_step_multi.py    Tests for rocq_step_multi
-  test_toc.py           Tests for rocq_toc
-  test_notations.py     Tests for rocq_notations
-  test_timeout.py       Tests for timeout handling
-  test_integration.py   Integration tests
+  conftest.py             Shared fixtures
+  test_compile.py         Tests for rocq_compile
+  test_compile_file.py    Tests for rocq_compile_file
+  test_verify.py          Tests for rocq_verify
+  test_assumptions.py     Tests for rocq_assumptions
+  test_server.py          Tests for server helpers (_format_error, _parse_project_flags, etc.)
+  test_format_error.py    Tests for error formatting
+  test_query.py           Tests for rocq_query
+  test_toc.py             Tests for rocq_toc
+  test_lsp_checker.py     Tests for the coq-lsp client
+  test_interactive_lsp.py Tests for rocq_get_state / rocq_step / rocq_step_multi
+  test_memory_watchdog.py Tests for the coq-lsp memory watchdog
+  test_integration.py     Integration tests
 ```
 
 ## License

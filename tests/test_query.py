@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from rocq_mcp.interactive import run_query
-from tests.conftest import PET_AVAILABLE
+from tests.conftest import COQLSP_AVAILABLE, PET_AVAILABLE
 
 _pet_only = pytest.mark.skipif(not PET_AVAILABLE, reason="pet not available")
 
@@ -21,11 +21,12 @@ from tests.conftest import make_lifespan_state as _make_lifespan_state  # noqa: 
 
 @pytest.fixture
 def lifespan_state():
-    from rocq_mcp.server import _invalidate_pet
 
     state = _make_lifespan_state()
     yield state
-    _invalidate_pet(state)
+    checker = state.get("lsp_checker")
+    if checker is not None:
+        checker.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +118,7 @@ class TestQueryErrors:
     async def test_timeout(self, workspace):
         """A query that exceeds the timeout should return a timeout error."""
         # Use an extremely short timeout to trigger it
-        state = _make_lifespan_state(pet_timeout=0.001)
+        state = _make_lifespan_state(op_timeout=0.001)
         result = await run_query(
             command="Search _.",
             preamble="",
@@ -217,15 +218,15 @@ class TestQueryFileMode:
         vfile = tmp_path / "test.v"
         vfile.write_text("Definition x := 1.\n")
 
-        # Mock _run_with_pet to avoid needing actual pet
+        # Mock _run_with_lsp to avoid needing actual coq-lsp
         import rocq_mcp.server as _server
 
-        async def mock_run_with_pet(fn, lifespan_state, desc, **kw):
+        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace):
             # We just want to verify no mutual-exclusivity error was returned
             # before reaching pet. Return a fake success.
             return {"success": True, "output": "mock"}
 
-        monkeypatch.setattr(_server, "_run_with_pet", mock_run_with_pet)
+        monkeypatch.setattr(_server, "_run_with_lsp", mock_run_with_lsp)
 
         result = await run_query(
             command="Check x.",
@@ -244,10 +245,10 @@ class TestQueryFileMode:
 
         import rocq_mcp.server as _server
 
-        async def mock_run_with_pet(fn, lifespan_state, desc, **kw):
+        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace):
             return {"success": True, "output": "mock"}
 
-        monkeypatch.setattr(_server, "_run_with_pet", mock_run_with_pet)
+        monkeypatch.setattr(_server, "_run_with_lsp", mock_run_with_lsp)
 
         result = await run_query(
             command="Check x.",
@@ -263,15 +264,15 @@ class TestQueryFileMode:
         """Path traversal via file parameter should be rejected."""
         import rocq_mcp.server as _server
 
-        # Mock _run_with_pet to exercise the _do_query inner function
-        async def mock_run_with_pet(fn, lifespan_state, desc, **kw):
+        # Mock _run_with_lsp to exercise the _do_lsp inner function
+        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace):
             # Call fn with a mock pet to trigger the path validation
             from unittest.mock import MagicMock
 
-            mock_pet = MagicMock()
-            return fn(mock_pet)
+            mock_checker = MagicMock()
+            return fn(mock_checker)
 
-        monkeypatch.setattr(_server, "_run_with_pet", mock_run_with_pet)
+        monkeypatch.setattr(_server, "_run_with_lsp", mock_run_with_lsp)
 
         result = await run_query(
             command="Check nat.",
@@ -288,13 +289,13 @@ class TestQueryFileMode:
         """Non-existent file should return error."""
         import rocq_mcp.server as _server
 
-        async def mock_run_with_pet(fn, lifespan_state, desc, **kw):
+        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace):
             from unittest.mock import MagicMock
 
-            mock_pet = MagicMock()
-            return fn(mock_pet)
+            mock_checker = MagicMock()
+            return fn(mock_checker)
 
-        monkeypatch.setattr(_server, "_run_with_pet", mock_run_with_pet)
+        monkeypatch.setattr(_server, "_run_with_lsp", mock_run_with_lsp)
 
         result = await run_query(
             command="Check nat.",
@@ -311,13 +312,13 @@ class TestQueryFileMode:
         """Absolute file path should be rejected by containment check."""
         import rocq_mcp.server as _server
 
-        async def mock_run_with_pet(fn, lifespan_state, desc, **kw):
+        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace):
             from unittest.mock import MagicMock
 
-            mock_pet = MagicMock()
-            return fn(mock_pet)
+            mock_checker = MagicMock()
+            return fn(mock_checker)
 
-        monkeypatch.setattr(_server, "_run_with_pet", mock_run_with_pet)
+        monkeypatch.setattr(_server, "_run_with_lsp", mock_run_with_lsp)
 
         result = await run_query(
             command="Check nat.",
@@ -396,121 +397,18 @@ class TestResolveFileInWorkspace:
 # ---------------------------------------------------------------------------
 
 
-class TestGetFileEndState:
-    """Unit tests for _get_file_end_state edge cases."""
-
-    def test_no_trailing_newline_line_count(self, tmp_path):
-        """File without trailing newline should still position past the last line."""
-        from rocq_mcp.interactive import _get_file_end_state
-        from unittest.mock import MagicMock
-
-        vfile = tmp_path / "test.v"
-        vfile.write_text("Definition x := 1.")  # no trailing newline
-
-        mock_pet = MagicMock()
-        mock_state = MagicMock()
-        mock_pet.get_state_at_pos.return_value = mock_state
-
-        lifespan_state = {"current_workspace": None}
-        result = _get_file_end_state(mock_pet, "test.v", str(tmp_path), lifespan_state)
-
-        assert result is mock_state
-        # end_line should be 1 (count("\n") + 1 = 0 + 1), not 0
-        mock_pet.get_state_at_pos.assert_called_once()
-        call_args = mock_pet.get_state_at_pos.call_args
-        assert call_args[0][1] == 1  # line argument
-
-    def test_with_trailing_newline_line_count(self, tmp_path):
-        """File with trailing newline should position past the last line."""
-        from rocq_mcp.interactive import _get_file_end_state
-        from unittest.mock import MagicMock
-
-        vfile = tmp_path / "test.v"
-        vfile.write_text("Definition x := 1.\n")
-
-        mock_pet = MagicMock()
-        mock_state = MagicMock()
-        mock_pet.get_state_at_pos.return_value = mock_state
-
-        lifespan_state = {"current_workspace": None}
-        result = _get_file_end_state(mock_pet, "test.v", str(tmp_path), lifespan_state)
-
-        assert result is mock_state
-        # end_line should be 2 (count("\n") + 1 = 1 + 1)
-        call_args = mock_pet.get_state_at_pos.call_args
-        assert call_args[0][1] == 2
-
-    def test_empty_file_line_count(self, tmp_path):
-        """Empty file should position at line 1."""
-        from rocq_mcp.interactive import _get_file_end_state
-        from unittest.mock import MagicMock
-
-        vfile = tmp_path / "test.v"
-        vfile.write_text("")
-
-        mock_pet = MagicMock()
-        mock_state = MagicMock()
-        mock_pet.get_state_at_pos.return_value = mock_state
-
-        lifespan_state = {"current_workspace": None}
-        result = _get_file_end_state(mock_pet, "test.v", str(tmp_path), lifespan_state)
-
-        assert result is mock_state
-        call_args = mock_pet.get_state_at_pos.call_args
-        assert call_args[0][1] == 1  # 0 + 1
-
-    def test_forces_workspace_reset(self, tmp_path):
-        """File mode should force workspace re-set for coq-lsp re-indexing."""
-        from rocq_mcp.interactive import _get_file_end_state
-        from unittest.mock import MagicMock
-
-        vfile = tmp_path / "test.v"
-        vfile.write_text("Definition x := 1.\n")
-
-        mock_pet = MagicMock()
-        mock_pet.get_state_at_pos.return_value = MagicMock()
-
-        # Set current_workspace to the same workspace (would skip re-set normally)
-        ws = str(Path(tmp_path).resolve())
-        lifespan_state = {"current_workspace": ws}
-
-        _get_file_end_state(mock_pet, "test.v", str(tmp_path), lifespan_state)
-
-        # Should have been forced to None then re-set
-        mock_pet.set_workspace.assert_called_once()
-
-    def test_permission_error_gives_clean_message(self, tmp_path):
-        """PermissionError should not leak the resolved absolute path."""
-        from rocq_mcp.interactive import _get_file_end_state
-        from unittest.mock import MagicMock, patch
-
-        vfile = tmp_path / "secret.v"
-        vfile.write_text("Definition x := 1.\n")
-
-        mock_pet = MagicMock()
-        lifespan_state = {"current_workspace": None}
-
-        with patch.object(Path, "read_text", side_effect=PermissionError("denied")):
-            with pytest.raises(FileNotFoundError, match="not accessible"):
-                _get_file_end_state(mock_pet, "secret.v", str(tmp_path), lifespan_state)
-
-
-# ---------------------------------------------------------------------------
-# File-mode integration tests (require pet)
-# ---------------------------------------------------------------------------
-
-
 @_pet_only
 class TestQueryFileModeIntegration:
     """Integration tests for file-based query mode (require pet)."""
 
     @pytest.fixture
     def lifespan_state(self):
-        from rocq_mcp.server import _invalidate_pet
 
         state = _make_lifespan_state()
         yield state
-        _invalidate_pet(state)
+        checker = state.get("lsp_checker")
+        if checker is not None:
+            checker.stop()
 
     @pytest.mark.asyncio
     async def test_query_with_file(self, workspace, lifespan_state):
@@ -575,7 +473,7 @@ class TestRocqQueryWrapper:
         monkeypatch.setattr(_server, "run_query", mock_run_query)
         monkeypatch.setattr(_server, "_validate_workspace", lambda ws: None)
 
-        mock_ctx = _MockContext({"pet_client": None})
+        mock_ctx = _MockContext({})
 
         await rocq_query(
             command="Check nat.",
@@ -604,12 +502,20 @@ from tests.conftest import _MockContext
 
 
 class TestQueryTimeoutRunQuery:
-    """run_query forwards timeout to _run_with_pet."""
+    """run_query bakes the resolved timeout into the coq-lsp check.
+
+    In file/preamble mode the query runs by appending the command to a
+    scratch document and checking it via ``LspChecker.check_content``
+    (under ``_run_with_lsp``); the per-request timeout is forwarded as
+    that call's ``timeout`` argument.  ``None`` resolves to the
+    lifespan ``op_timeout`` default (30s); an explicit value passes
+    through unchanged.
+    """
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "timeout_arg,expected",
-        [(None, None), (60, 60)],
+        [(None, 30.0), (60, 60.0)],
         ids=["default-none", "explicit-60"],
     )
     async def test_timeout_forwarded(
@@ -617,18 +523,35 @@ class TestQueryTimeoutRunQuery:
     ):
         captured: dict = {}
 
-        async def mock_run_with_pet(fn, lifespan_state, desc, *, timeout=None, **kw):
-            captured["timeout"] = timeout
-            return {"success": True, "output": "mock"}
+        class _FakeChecker:
+            _process = None
 
-        monkeypatch.setattr(_server, "_run_with_pet", mock_run_with_pet)
+            def _is_alive(self):
+                return True
+
+            def check_content(
+                self, path, content, workspace="", timeout=0, wait_full=False
+            ):
+                captured["timeout"] = timeout
+                return {
+                    "success": True,
+                    "errors": [],
+                    "warnings": [],
+                    "info": [],
+                    "timed_out": False,
+                }
+
+        state = {
+            "op_timeout": 30.0,
+            "lsp_checker": _FakeChecker(),
+        }
 
         kwargs = {"timeout": timeout_arg} if timeout_arg is not None else {}
         result = await run_query(
             command="Check nat.",
             preamble="",
             workspace=str(tmp_path),
-            lifespan_state={"pet_client": None, "pet_timeout": 30.0},
+            lifespan_state=state,
             **kwargs,
         )
         assert result["success"] is True
@@ -656,7 +579,7 @@ class TestRocqQueryTimeout:
         result = await rocq_query(
             command="Check nat.",
             workspace=str(tmp_path),
-            ctx=_MockContext({"pet_client": None}),
+            ctx=_MockContext({}),
         )
         assert result["success"] is True
         assert captured["timeout"] is None
@@ -669,7 +592,7 @@ class TestRocqQueryTimeout:
             command="Time Eval vm_compute in 1.",
             workspace=str(tmp_path),
             timeout=60,
-            ctx=_MockContext({"pet_client": None}),
+            ctx=_MockContext({}),
         )
         assert result["success"] is True
         assert captured["timeout"] == 60
@@ -683,7 +606,7 @@ class TestRocqQueryTimeout:
             command="Check nat.",
             workspace=str(tmp_path),
             timeout=bad,
-            ctx=_MockContext({"pet_client": None}),
+            ctx=_MockContext({}),
         )
         assert result["success"] is True
         assert captured["timeout"] is None
@@ -697,7 +620,7 @@ class TestRocqQueryTimeout:
             command="Check nat.",
             workspace=str(tmp_path),
             timeout=9999,
-            ctx=_MockContext({"pet_client": None}),
+            ctx=_MockContext({}),
         )
         assert result["success"] is True
         assert captured["timeout"] == 100
@@ -711,7 +634,7 @@ class TestRocqQueryTimeout:
             command="Check nat.",
             workspace=str(tmp_path),
             timeout=100,
-            ctx=_MockContext({"pet_client": None}),
+            ctx=_MockContext({}),
         )
         assert result["success"] is True
         assert captured["timeout"] == 100
@@ -726,505 +649,66 @@ class TestRocqQueryTimeout:
 # ---------------------------------------------------------------------------
 
 
-class TestQueryFromStateUnit:
-    """Unit tests for run_query's from_state mode (no pet required)."""
-
-    @pytest.mark.asyncio
-    async def test_from_state_routes_to_state_lookup(self, monkeypatch):
-        """from_state should call _state_get_or_error, not _get_or_create_import_state."""
-        import rocq_mcp.interactive as _interactive
-        from unittest.mock import MagicMock
-
-        # Insert a fake state into the table
-        from rocq_mcp.interactive import _state_add
-
-        fake_pet_state = MagicMock()
-        fake_pet_state.proof_finished = False
-        sid = _state_add(
-            state=fake_pet_state,
-            file="",
-            theorem="t",
-            workspace="/tmp",
-            parent_id=None,
-            tactic=None,
-            step=0,
-        )
-
-        lookup_called = {"count": 0, "with_id": None}
-        original = _interactive._state_get_or_error
-
-        def spy_lookup(state_id):
-            lookup_called["count"] += 1
-            lookup_called["with_id"] = state_id
-            return original(state_id)
-
-        import_state_called = {"count": 0}
-
-        def fail_import_state(*args, **kwargs):
-            import_state_called["count"] += 1
-            raise AssertionError("_get_or_create_import_state should not be called")
-
-        monkeypatch.setattr(_interactive, "_state_get_or_error", spy_lookup)
-        monkeypatch.setattr(
-            _interactive, "_get_or_create_import_state", fail_import_state
-        )
-
-        # Stub _run_with_pet to invoke _do_query with a mock pet.
-        async def mock_run_with_pet(fn, lifespan_state, desc, **kw):
-            mock_pet = MagicMock()
-            # Make pet.run return a fake state with empty feedback.
-            new_state = MagicMock()
-            new_state.feedback = []
-            new_state.proof_finished = False
-            mock_pet.run.return_value = new_state
-            return fn(mock_pet)
-
-        monkeypatch.setattr(_server, "_run_with_pet", mock_run_with_pet)
-
-        result = await run_query(
-            command="Search nat.",
-            preamble="",
-            workspace="/tmp",
-            lifespan_state={"pet_client": None, "pet_timeout": 30.0},
-            from_state=sid,
-        )
-        assert result["success"] is True
-        assert lookup_called["count"] == 1
-        assert lookup_called["with_id"] == sid
-        assert import_state_called["count"] == 0
-
-    @pytest.mark.asyncio
-    async def test_from_state_with_evicted_state_returns_error(self, monkeypatch):
-        """If state was evicted, return a clear error pointing to rocq_start."""
-        import rocq_mcp.interactive as _interactive
-        from unittest.mock import MagicMock
-
-        # Force _state_get_or_error to return an "expired" error.
-        def fake_lookup(state_id):
-            return None, (
-                f"State {state_id} expired (evicted from table or lost to pet "
-                f"restart). Use rocq_start to begin a new session."
-            )
-
-        monkeypatch.setattr(_interactive, "_state_get_or_error", fake_lookup)
-
-        async def mock_run_with_pet(fn, lifespan_state, desc, **kw):
-            mock_pet = MagicMock()
-            return fn(mock_pet)
-
-        monkeypatch.setattr(_server, "_run_with_pet", mock_run_with_pet)
-
-        result = await run_query(
-            command="Search nat.",
-            preamble="",
-            workspace="/tmp",
-            lifespan_state={"pet_client": None, "pet_timeout": 30.0},
-            from_state=42,
-        )
-        assert result["success"] is False
-        assert "rocq_start" in result["error"]
-        assert "42" in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_from_state_nonexistent_returns_error(self, monkeypatch):
-        """If state was never created, return the helper's error verbatim."""
-        import rocq_mcp.interactive as _interactive
-        from unittest.mock import MagicMock
-
-        def fake_lookup(state_id):
-            return None, f"State {state_id} does not exist."
-
-        monkeypatch.setattr(_interactive, "_state_get_or_error", fake_lookup)
-
-        async def mock_run_with_pet(fn, lifespan_state, desc, **kw):
-            mock_pet = MagicMock()
-            return fn(mock_pet)
-
-        monkeypatch.setattr(_server, "_run_with_pet", mock_run_with_pet)
-
-        result = await run_query(
-            command="Search nat.",
-            preamble="",
-            workspace="/tmp",
-            lifespan_state={"pet_client": None, "pet_timeout": 30.0},
-            from_state=9999,
-        )
-        assert result["success"] is False
-        # Verbatim helper message (no conditional re-suffix anymore).
-        assert "9999" in result["error"]
-        assert "does not exist" in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_from_state_does_not_advance_state(self, monkeypatch):
-        """The transient query state must NOT be added to the state table."""
-        import rocq_mcp.interactive as _interactive
-        from rocq_mcp.interactive import _state_add, _state_table
-        from unittest.mock import MagicMock
-
-        fake_pet_state = MagicMock()
-        fake_pet_state.proof_finished = False
-        sid = _state_add(
-            state=fake_pet_state,
-            file="",
-            theorem="t",
-            workspace="/tmp",
-            parent_id=None,
-            tactic=None,
-            step=0,
-        )
-
-        # Snapshot the table contents.
-        table_keys_before = set(_state_table.keys())
-
-        async def mock_run_with_pet(fn, lifespan_state, desc, **kw):
-            mock_pet = MagicMock()
-            new_state = MagicMock()
-            new_state.feedback = []
-            new_state.proof_finished = False
-            mock_pet.run.return_value = new_state
-            return fn(mock_pet)
-
-        monkeypatch.setattr(_server, "_run_with_pet", mock_run_with_pet)
-
-        result = await run_query(
-            command="Search nat.",
-            preamble="",
-            workspace="/tmp",
-            lifespan_state={"pet_client": None, "pet_timeout": 30.0},
-            from_state=sid,
-        )
-        assert result["success"] is True
-        # State table should be unchanged: same set of state IDs.
-        assert set(_state_table.keys()) == table_keys_before
-        # Parent state still maps to the same pet state object.
-        assert _state_table[sid].state is fake_pet_state
-
-
-# ---------------------------------------------------------------------------
-# from_state validation — core (run_query) and wrapper forwarding
-# ---------------------------------------------------------------------------
-
-
-class TestQueryFromStateValidation:
-    """Validation tests for from_state — exercised against the core run_query."""
-
-    @pytest.mark.asyncio
-    async def test_from_state_and_file_mutually_exclusive(self):
-        """Passing both file and from_state should fail before pet is touched."""
-        result = await run_query(
-            command="Check nat.",
-            preamble="",
-            workspace="/tmp",
-            lifespan_state={"pet_client": None, "pet_timeout": 30.0},
-            file="test.v",
-            from_state=1,
-        )
-        assert result["success"] is False
-        assert "not both" in result["error"].lower()
-
-    @pytest.mark.asyncio
-    async def test_from_state_with_preamble_rejected(self):
-        """preamble + from_state must fail loudly — silent drop misleads the LLM."""
-        result = await run_query(
-            command="Check nat.",
-            preamble="Require Import Foo.",
-            workspace="/tmp",
-            lifespan_state={"pet_client": None, "pet_timeout": 30.0},
-            from_state=1,
-        )
-        assert result["success"] is False
-        assert "preamble" in result["error"].lower()
-        assert "from_state" in result["error"].lower()
-
-    @pytest.mark.asyncio
-    async def test_from_state_with_blank_preamble_allowed(self, monkeypatch):
-        """Whitespace-only preamble + from_state is fine (no information conveyed)."""
-        import rocq_mcp.interactive as _interactive
-        from rocq_mcp.interactive import _state_add
-        from unittest.mock import MagicMock
-
-        fake_pet_state = MagicMock()
-        fake_pet_state.proof_finished = False
-        sid = _state_add(
-            state=fake_pet_state,
-            file="",
-            theorem="t",
-            workspace="/tmp",
-            parent_id=None,
-            tactic=None,
-            step=0,
-        )
-
-        async def mock_run_with_pet(fn, lifespan_state, desc, **kw):
-            mock_pet = MagicMock()
-            new_state = MagicMock()
-            new_state.feedback = []
-            new_state.proof_finished = False
-            mock_pet.run.return_value = new_state
-            return fn(mock_pet)
-
-        monkeypatch.setattr(_server, "_run_with_pet", mock_run_with_pet)
-
-        result = await run_query(
-            command="Search nat.",
-            preamble="   \n  ",
-            workspace="/tmp",
-            lifespan_state={"pet_client": None, "pet_timeout": 30.0},
-            from_state=sid,
-        )
-        assert result["success"] is True
-
-
-class TestRocqQueryFromStateWrapper:
-    """The wrapper now just forwards from_state — no validation here."""
-
-    @pytest.mark.asyncio
-    async def test_from_state_forwarded_to_run_query(self, monkeypatch, tmp_path):
-        """Valid from_state should be forwarded to run_query."""
-        captured: dict = {}
-
-        async def mock_run_query(**kwargs):
-            captured.update(kwargs)
-            return {"success": True, "output": "mock"}
-
-        monkeypatch.setattr(_server, "run_query", mock_run_query)
-        monkeypatch.setattr(_server, "_validate_workspace", lambda ws: None)
-
-        result = await rocq_query(
-            command="Search nat.",
-            from_state=7,
-            workspace=str(tmp_path),
-            ctx=_MockContext({"pet_client": None}),
-        )
-        assert result["success"] is True
-        assert captured["from_state"] == 7
-
-    @pytest.mark.asyncio
-    async def test_from_state_default_none(self, monkeypatch, tmp_path):
-        """When from_state is omitted, run_query receives None (back-compat)."""
-        captured: dict = {}
-
-        async def mock_run_query(**kwargs):
-            captured.update(kwargs)
-            return {"success": True, "output": "mock"}
-
-        monkeypatch.setattr(_server, "run_query", mock_run_query)
-        monkeypatch.setattr(_server, "_validate_workspace", lambda ws: None)
-
-        await rocq_query(
-            command="Check nat.",
-            workspace=str(tmp_path),
-            ctx=_MockContext({"pet_client": None}),
-        )
-        assert captured["from_state"] is None
-
-
-# ---------------------------------------------------------------------------
-# from_state mode integration tests (require pet)
-# ---------------------------------------------------------------------------
-
-
-@_pet_only
-class TestQueryFromStateIntegration:
-    """Integration tests for from_state mode — require pet."""
-
-    @pytest.fixture
-    def lifespan_state(self):
-        from rocq_mcp.server import _invalidate_pet
-
-        state = _make_lifespan_state()
-        yield state
-        _invalidate_pet(state)
-
-    @pytest.mark.asyncio
-    async def test_from_state_search_sees_live_context(self, workspace, lifespan_state):
-        """Search via notation pattern requires the live R_scope to be open."""
-        from rocq_mcp.interactive import run_start
-
-        # Open a session with Reals + open R_scope so '+' resolves to Rplus
-        # in the parsed notation pattern.  Without R_scope being open in
-        # the queried state, "Search (_ + _)." would default to nat's plus
-        # and Rplus would NOT appear in the results.
-        start = await run_start(
-            file="",
-            theorem="",
-            workspace=str(workspace),
-            lifespan_state=lifespan_state,
-            preamble="From Coq Require Import Reals.\nOpen Scope R_scope.",
-        )
-        assert start["success"] is True
-        sid = start["state_id"]
-
-        # Notation lookup; requires R_scope to be open in the queried state.
-        result = await run_query(
-            command="Search (_ + _).",
-            preamble="",
-            workspace=str(workspace),
-            lifespan_state=lifespan_state,
-            from_state=sid,
-        )
-        assert result["success"] is True
-        # Rplus_comm / Rplus_assoc / similar Reals lemmas should appear
-        # only because R_scope is open in the queried state.
-        assert "Rplus" in result["output"]
-        # The response should echo the queried state ID per MCP F5.
-        assert result.get("from_state_id") == sid
-
-    @pytest.mark.asyncio
-    async def test_from_state_does_not_mutate_parent(self, workspace, lifespan_state):
-        """Querying via from_state must not mutate the parent state's pet state."""
-        from rocq_mcp.interactive import run_start, _state_table
-
-        start = await run_start(
-            file="",
-            theorem="",
-            workspace=str(workspace),
-            lifespan_state=lifespan_state,
-            preamble="From Coq Require Import Arith.",
-        )
-        assert start["success"] is True
-        sid = start["state_id"]
-        parent_pet_state_before = _state_table[sid].state
-
-        result = await run_query(
-            command="Check Nat.add.",
-            preamble="",
-            workspace=str(workspace),
-            lifespan_state=lifespan_state,
-            from_state=sid,
-        )
-        assert result["success"] is True
-        # Parent's pet state object identity preserved; entry untouched.
-        assert _state_table[sid].state is parent_pet_state_before
-
-    @pytest.mark.asyncio
-    async def test_from_state_surfaces_stale_warning_when_file_changed(
-        self, workspace, lifespan_state
-    ):
-        """If the .v file backing a session is modified after rocq_start,
-        a subsequent from_state query must surface ``stale_warning`` so
-        the agent knows the proof state may not match the current
-        source — same contract as rocq_check."""
-        from rocq_mcp.interactive import _state_table, run_start
-
-        vfile = Path(workspace) / "stale_query.v"
-        vfile.write_text("Theorem stale_thm : True.\nProof. exact I. Qed.\n")
-
-        start = await run_start(
-            file=str(vfile.relative_to(workspace)),
-            theorem="stale_thm",
-            workspace=str(workspace),
-            lifespan_state=lifespan_state,
-        )
-        assert start["success"] is True
-        sid = start["state_id"]
-
-        # Mutate the file's mtime (simulate an out-of-band edit).
-        entry = _state_table[sid]
-        assert entry.file_mtime is not None
-        entry.file_mtime = entry.file_mtime - 100  # pretend session is older
-
-        result = await run_query(
-            command="Check Nat.add.",
-            preamble="",
-            workspace=str(workspace),
-            lifespan_state=lifespan_state,
-            from_state=sid,
-        )
-        assert result["success"] is True
-        assert "stale_warning" in result
-        assert "modified" in result["stale_warning"].lower()
-
-
-# ---------------------------------------------------------------------------
-# LSP DiagnosticSeverity wire convention (Audit finding #2)
-# ---------------------------------------------------------------------------
-
-
-@_pet_only
-class TestLspSeverityWire:
-    """Pin pet's feedback severity convention at the wire boundary.
-
-    pet emits feedback as ``List[Tuple[int, str]]``.  Our filter
-    (``_extract_feedback`` / ``run_query``) treats integer ``2`` as
-    LSP DiagnosticSeverity.Warning.  If pet ever switched to Coq's
-    ``Feedback.level`` enum (where 2 means Notice, 3 means Info), the
-    filter would silently drop the wrong messages.
-
-    These tests trigger a real Rocq deprecation warning
-    (``From Coq Require Import …`` is deprecated in Rocq 9.x in favor
-    of ``From Stdlib Require Import …``) and verify both that the wire
-    integer is 2 *and* that the ``include_warnings=False`` filter
-    actually drops it end-to-end.
-
-    **Rocq version dependency**: the deprecation message text comes
-    from Rocq 9.0+'s standard library namespace rename.  If a future
-    Rocq stops emitting this warning (or renames the message), the
-    deprecation-text assertion below should fall back to a more
-    generic "warning"/"deprecat" substring match — but the
-    ``2 in levels`` assertion will still hold for any LSP-severity
-    warning.
+@pytest.mark.skipif(not COQLSP_AVAILABLE, reason="coq-lsp not available")
+class TestLspWarningSeverity:
+    """coq-lsp warning severity flows through run_query's include_warnings.
+
+    run_query (file / preamble mode) runs a query by appending the
+    command to a scratch document and collecting the diagnostics it
+    produces: ``info`` (LSP severity 3) is always kept, ``warnings``
+    (severity 2) only when ``include_warnings=True``.  This pins that
+    severity-2 filter end-to-end on the coq-lsp engine.
+
+    We trigger a *deterministic* deprecation warning by declaring a
+    ``#[deprecated]`` symbol in the preamble and referencing it, so the
+    test does not depend on any stdlib-version-specific deprecation text
+    (the old ``From Coq Require Import …`` deprecation was Rocq-version
+    dependent and flaky across environments).
     """
 
+    # Declaring then using a #[deprecated] definition warns at LSP
+    # severity 2 on every Rocq that supports the attribute.
+    _PREAMBLE = (
+        '#[deprecated(note="use new instead")]\n'
+        "Definition rocq_mcp_old := 0."
+    )
+
     @pytest.fixture
     def lifespan_state(self):
-        from rocq_mcp.server import _invalidate_pet
-
         state = _make_lifespan_state()
         yield state
-        _invalidate_pet(state)
+        checker = state.get("lsp_checker")
+        if checker is not None:
+            checker.stop()
 
     @pytest.mark.asyncio
-    async def test_warning_level_is_lsp_severity_2(self, workspace, lifespan_state):
-        """Direct pet probe: state.feedback for a deprecation must be (2, msg)."""
-        from rocq_mcp.server import _ensure_pet, _set_workspace_if_needed
-        from rocq_mcp.interactive import _get_or_create_import_state
-
-        pet = _ensure_pet(lifespan_state)
-        _set_workspace_if_needed(pet, str(workspace), lifespan_state)
-        # Empty initial state — no preamble cached.
-        state = _get_or_create_import_state(pet, str(workspace), [], lifespan_state)
-        # Run a deprecated import directly — feedback on the resulting state
-        # must contain the warning at LSP severity 2.
-        state = pet.run(state, "From Coq Require Import Arith.")
-        levels = [lvl for lvl, _ in (state.feedback or [])]
-        assert 2 in levels, (
-            f"Expected LSP severity 2 (Warning) in feedback levels {levels!r}; "
-            "if pet ever switched to Coq Feedback.level enum (Notice=2 / "
-            "Info=3), this test pins the convention."
-        )
-        warning_msgs = [msg for lvl, msg in (state.feedback or []) if lvl == 2]
-        joined = " ".join(warning_msgs).lower()
-        assert "deprecat" in joined or "from stdlib" in joined or "warning" in joined
-
-    @pytest.mark.asyncio
-    async def test_include_warnings_false_drops_real_warning(
+    async def test_include_warnings_true_surfaces_warning(
         self, workspace, lifespan_state
     ):
-        """End-to-end: include_warnings=False must drop the real Rocq warning
-        from rocq_query output, validating that the level==2 filter targets
-        the right messages."""
-        with_warn = await run_query(
-            command="From Coq Require Import Arith.",
-            preamble="",
+        result = await run_query(
+            command="Check rocq_mcp_old.",
+            preamble=self._PREAMBLE,
             workspace=str(workspace),
             lifespan_state=lifespan_state,
             include_warnings=True,
         )
-        assert with_warn["success"] is True
-        # Warning text must surface when include_warnings=True.
-        assert "deprecat" in with_warn["output"].lower() or (
-            "from stdlib" in with_warn["output"].lower()
-        )
+        assert result["success"] is True
+        # The Check result (info) and the deprecation warning both show.
+        assert "rocq_mcp_old" in result["output"]
+        assert "deprecated" in result["output"].lower()
 
-        without_warn = await run_query(
-            command="From Coq Require Import Arith.",
-            preamble="",
+    @pytest.mark.asyncio
+    async def test_include_warnings_false_drops_warning(
+        self, workspace, lifespan_state
+    ):
+        result = await run_query(
+            command="Check rocq_mcp_old.",
+            preamble=self._PREAMBLE,
             workspace=str(workspace),
             lifespan_state=lifespan_state,
             include_warnings=False,
         )
-        assert without_warn["success"] is True
-        # The deprecation warning must be filtered out.
-        assert "deprecat" not in without_warn["output"].lower()
-        assert "from stdlib" not in without_warn["output"].lower()
+        assert result["success"] is True
+        # The info result stays; the severity-2 deprecation warning is gone.
+        assert "rocq_mcp_old" in result["output"]
+        assert "deprecated" not in result["output"].lower()

@@ -165,7 +165,7 @@ class TestTocPathTraversal:
 
     def test_absolute_path_rejected(self, tmp_path):
         """An absolute file path outside workspace is rejected."""
-        lifespan_state = {"pet_timeout": 10}
+        lifespan_state = {"op_timeout": 10}
         result = asyncio.run(
             run_toc(
                 file="/etc/passwd",
@@ -178,7 +178,7 @@ class TestTocPathTraversal:
 
     def test_dotdot_traversal_rejected(self, tmp_path):
         """A ../ traversal outside workspace is rejected."""
-        lifespan_state = {"pet_timeout": 10}
+        lifespan_state = {"op_timeout": 10}
         result = asyncio.run(
             run_toc(
                 file="../../etc/passwd",

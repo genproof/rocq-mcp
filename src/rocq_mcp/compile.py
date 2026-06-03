@@ -704,74 +704,96 @@ def _toc_result_to_problem_structure(
     )
 
 
+def _symbol_to_toc_element(sym: dict[str, Any]) -> Any:
+    """Wrap a coq-lsp ``documentSymbol`` dict in the pytanque TocElement shape.
+
+    ``_toc_result_to_problem_structure`` was written against pet's
+    ``TocElement`` API (``.name.v`` / ``.detail`` / ``.range.start.line``
+    / ``.children``).  coq-lsp returns the same information as plain
+    dicts; wrapping them in ``SimpleNamespace`` lets the existing
+    (pure) transformer run unchanged.
+    """
+    from types import SimpleNamespace
+
+    rng = sym.get("range") or {}
+    start = rng.get("start") or {}
+    end = rng.get("end") or {}
+    name = sym.get("name")
+    return SimpleNamespace(
+        name=SimpleNamespace(v=name) if name else None,
+        detail=sym.get("detail") or "",
+        range=SimpleNamespace(
+            start=SimpleNamespace(
+                line=start.get("line", 0), character=start.get("character", 0)
+            ),
+            end=SimpleNamespace(
+                line=end.get("line", 0), character=end.get("character", 0)
+            ),
+        ),
+        children=[_symbol_to_toc_element(c) for c in (sym.get("children") or [])],
+    )
+
+
+def _symbols_to_toc_shape(symbols: list[dict[str, Any]]) -> list[Any]:
+    """Adapt a ``documentSymbol`` list to pet's ``[(section, [elements])]``."""
+    return [(None, [_symbol_to_toc_element(s) for s in (symbols or [])])]
+
+
 async def _extract_problem_structure(
     problem_statement: str,
     workspace: str,
     lifespan_state: dict[str, Any],
 ) -> ProblemStructure | dict[str, Any] | None:
-    """Extract the structure of a problem statement using pytanque toc.
+    """Extract the structure of a problem statement using coq-lsp.
 
-    Writes the problem_statement to a temp file, runs toc under the pet
-    lock, releases the lock, then transforms the toc result into a
-    ``ProblemStructure``.  The transformation is pure
-    (:func:`_toc_result_to_problem_structure`) and runs outside the
-    lock, keeping pet contention bounded.
+    Writes the problem_statement to a temp file, runs
+    ``textDocument/documentSymbol`` on it, then transforms the result
+    into a ``ProblemStructure``.  The transformation is pure
+    (:func:`_toc_result_to_problem_structure`).
 
     Three-way return:
 
     - ``ProblemStructure`` on success.
-    - A failure dict (carrying ``pet_restarted: True`` when relevant)
-      when pet died or memory was exhausted during toc.  The caller
-      must propagate this dict back to the agent rather than falling
-      through to Phase 3 — otherwise the ``pet_restarted`` signal is
-      swallowed and the agent never learns to call ``rocq_diag``.
-    - ``None`` when pet is unavailable or toc returned no data — Phase
-      3 fallback applies.
+    - A failure dict (carrying ``lsp_restarted: True``) when coq-lsp's
+      memory watchdog aborted the call — the caller must propagate it
+      rather than falling through to Phase 3.
+    - ``None`` when coq-lsp is unavailable or documentSymbol returned no
+      data — Phase 3 fallback applies.
     """
-    _temp_files: list[str] = []
 
-    def _do_toc(pet: Any) -> Any:
+    def _do_symbols(checker: Any) -> Any:
         ws = str(Path(workspace).resolve())
-        pet.set_workspace(debug=False, dir=ws)
         with tempfile.NamedTemporaryFile(
             suffix=".v", mode="w", delete=False, dir=ws
         ) as f:
             f.write(problem_statement)
             f.flush()
             tmp_path = f.name
-        _temp_files.append(tmp_path)
         try:
-            from pytanque import PetanqueError
-        except ImportError:
-            PetanqueError = Exception  # type: ignore[assignment,misc]
-        try:
-            return pet.toc(tmp_path)
-        except (PetanqueError, OSError):
-            return None
+            symbols = checker.document_symbol(tmp_path, workspace=workspace)
+            if isinstance(symbols, dict):  # {"_lsp_error": ...}
+                return None
+            return symbols
         finally:
             _server._cleanup_coqc_artifacts(tmp_path)
 
-    def _on_timeout() -> None:
-        for p in _temp_files:
-            _server._cleanup_coqc_artifacts(p)
-
-    toc_result = await _server._run_with_pet(
-        _do_toc,
+    symbols = await _server._run_with_lsp(
+        _do_symbols,
         lifespan_state,
         "rocq_verify",
-        on_timeout=_on_timeout,
+        workspace=workspace,
     )
 
-    # Distinguish three outcomes: pet-restart (must surface), other
-    # pet-side failure (Phase 3 fallback is fine), and "toc returned
-    # nothing" (also Phase 3).
-    if isinstance(toc_result, dict):
-        if toc_result.get("pet_restarted"):
-            return toc_result
+    # Distinguish: memory abort (must surface), and "no data" (Phase 3).
+    if isinstance(symbols, dict):
+        if symbols.get("lsp_restarted"):
+            return symbols
         return None
-    if toc_result is None:
+    if not symbols:
         return None
-    return _toc_result_to_problem_structure(toc_result, problem_statement)
+    return _toc_result_to_problem_structure(
+        _symbols_to_toc_shape(symbols), problem_statement
+    )
 
 
 # ---------------------------------------------------------------------------

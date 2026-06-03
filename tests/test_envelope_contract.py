@@ -31,12 +31,12 @@ import pytest
 
 from rocq_mcp.interactive import (
     run_assumptions,
-    run_check,
+    run_get_state,
     run_query,
-    run_start,
+    run_step,
     run_step_multi,
 )
-from tests.conftest import make_lifespan_state, mock_pet, patch_psutil_rss
+from tests.conftest import make_lifespan_state
 
 # Required keys on every failure envelope.  ``reason`` is required
 # because that's what agents key on to decide retry / recovery
@@ -84,7 +84,7 @@ class TestUnifiedFailureEnvelope:
 
     @pytest.mark.asyncio
     async def test_run_query_validation_failure(self):
-        """file + from_state → validation failure with the unified envelope."""
+        """position mode without a file → validation failure (unified envelope)."""
         ls = make_lifespan_state()
         ls["recent_errors"] = deque(maxlen=10)
         result = await run_query(
@@ -92,21 +92,22 @@ class TestUnifiedFailureEnvelope:
             preamble="",
             workspace="/tmp",
             lifespan_state=ls,
-            file="x.v",
-            from_state=42,
+            line=0,
+            character=0,  # position mode requires file
         )
         _assert_failure_envelope(result, expected_reason="validation")
 
     @pytest.mark.asyncio
-    async def test_run_check_oversize_failure(self):
-        """Body over the size cap → validation failure with the unified envelope."""
-        from rocq_mcp.server import ROCQ_MAX_SOURCE_SIZE
-
+    async def test_run_step_forbidden_failure(self):
+        """A forbidden command → validation failure with the unified envelope."""
         ls = make_lifespan_state()
         ls["recent_errors"] = deque(maxlen=10)
-        result = await run_check(
-            body="x" * (ROCQ_MAX_SOURCE_SIZE + 1),
-            timeout=30.0,
+        result = await run_step(
+            file="x.v",
+            line=0,
+            character=0,
+            tactics="Drop.",  # forbidden
+            workspace="/tmp",
             lifespan_state=ls,
         )
         _assert_failure_envelope(result, expected_reason="validation")
@@ -117,23 +118,26 @@ class TestUnifiedFailureEnvelope:
         ls = make_lifespan_state()
         ls["recent_errors"] = deque(maxlen=10)
         result = await run_step_multi(
+            file="x.v",
+            line=0,
+            character=0,
             tactics=[],
+            workspace="/tmp",
             lifespan_state=ls,
         )
         _assert_failure_envelope(result, expected_reason="validation")
 
     @pytest.mark.asyncio
-    async def test_run_start_validation_failure(self):
-        """Empty file + empty preamble → validation failure with the unified
-        envelope.  rocq_start requires at least one of the two."""
+    async def test_run_get_state_validation_failure(self):
+        """An out-of-range position → validation failure with the unified envelope."""
         ls = make_lifespan_state()
         ls["recent_errors"] = deque(maxlen=10)
-        result = await run_start(
-            file="",
-            theorem="",
+        result = await run_get_state(
+            file="x.v",
+            line=-1,
+            character=0,
             workspace="/tmp",
             lifespan_state=ls,
-            preamble="",
         )
         _assert_failure_envelope(result, expected_reason="validation")
 
@@ -165,11 +169,13 @@ class TestWrapperNoContextEnvelope:
         )
 
     @pytest.mark.asyncio
-    async def test_rocq_check_no_ctx(self):
-        from rocq_mcp.server import rocq_check
+    async def test_rocq_step_no_ctx(self):
+        from rocq_mcp.server import rocq_step
 
         _assert_failure_envelope(
-            await rocq_check(body="reflexivity.", ctx=None),
+            await rocq_step(
+                file="x.v", line=0, character=0, tactics="reflexivity.", ctx=None
+            ),
             expected_reason="validation",
         )
 
@@ -178,16 +184,18 @@ class TestWrapperNoContextEnvelope:
         from rocq_mcp.server import rocq_step_multi
 
         _assert_failure_envelope(
-            await rocq_step_multi(tactics=["reflexivity."], ctx=None),
+            await rocq_step_multi(
+                file="x.v", line=0, character=0, tactics=["reflexivity."], ctx=None
+            ),
             expected_reason="validation",
         )
 
     @pytest.mark.asyncio
-    async def test_rocq_start_no_ctx(self):
-        from rocq_mcp.server import rocq_start
+    async def test_rocq_get_state_no_ctx(self):
+        from rocq_mcp.server import rocq_get_state
 
         _assert_failure_envelope(
-            await rocq_start(file="x.v", theorem="t", ctx=None),
+            await rocq_get_state(file="x.v", line=0, character=0, ctx=None),
             expected_reason="validation",
         )
 
@@ -201,138 +209,12 @@ class TestWrapperNoContextEnvelope:
         )
 
     @pytest.mark.asyncio
-    async def test_rocq_notations_no_ctx(self):
-        from rocq_mcp.server import rocq_notations
-
-        _assert_failure_envelope(
-            await rocq_notations(statement="x + y", ctx=None),
-            expected_reason="validation",
-        )
-
-    @pytest.mark.asyncio
     async def test_rocq_diag_no_ctx(self):
         from rocq_mcp.server import rocq_diag
 
         _assert_failure_envelope(
             await rocq_diag(ctx=None),
             expected_reason="validation",
-        )
-
-
-class TestPetSideEnvelope:
-    """Each pet-side failure path through ``_run_with_pet`` produces the
-    unified envelope with the right ``reason``.  The prior contract
-    test only covered the ``validation`` branch — these mock-based
-    tests close the four remaining pet-side reasons (``crashed`` /
-    live PetanqueError, ``crashed`` / OSError, ``unavailable`` /
-    FileNotFoundError, ``unavailable`` / ImportError)."""
-
-    @pytest.mark.asyncio
-    async def test_live_petanque_error_envelope(self, monkeypatch):
-        """A PetanqueError with pet still alive: ``reason=crashed``,
-        no ``pet_restarted``."""
-        import rocq_mcp.server as _server
-        from rocq_mcp.server import _run_with_pet
-        from pytanque import PetanqueError
-
-        monkeypatch.setattr(_server, "ROCQ_MAX_PET_RSS_MB", 1_000_000)
-        patch_psutil_rss(monkeypatch, 1)
-        m = mock_pet()
-        ls = make_lifespan_state()
-        ls["pet_client"] = m
-        ls["recent_errors"] = deque(maxlen=10)
-        monkeypatch.setattr(_server, "_ensure_pet", lambda lstate: m)
-
-        def fn(pet):
-            raise PetanqueError(99, "Reference foo not found.")
-
-        _assert_failure_envelope(
-            await _run_with_pet(fn, ls, "rocq_query"),
-            expected_reason="crashed",
-        )
-
-    @pytest.mark.asyncio
-    async def test_dead_petanque_error_envelope(self, monkeypatch):
-        """PetanqueError with pet dead (poll() != None): ``reason=crashed``,
-        ``pet_restarted=True``."""
-        import rocq_mcp.server as _server
-        from rocq_mcp.server import _run_with_pet
-        from pytanque import PetanqueError
-
-        monkeypatch.setattr(_server, "ROCQ_MAX_PET_RSS_MB", 1_000_000)
-        patch_psutil_rss(monkeypatch, 1)
-        m = mock_pet(alive=False)
-        ls = make_lifespan_state()
-        ls["pet_client"] = m
-        ls["recent_errors"] = deque(maxlen=10)
-        monkeypatch.setattr(_server, "_ensure_pet", lambda lstate: m)
-        monkeypatch.setattr(
-            _server, "_invalidate_pet", lambda lstate: lstate.update(pet_client=None)
-        )
-
-        def fn(pet):
-            raise PetanqueError(99, "pet died mid-call")
-
-        result = await _run_with_pet(fn, ls, "rocq_query")
-        _assert_failure_envelope(result, expected_reason="crashed")
-        assert result.get("pet_restarted") is True
-
-    @pytest.mark.asyncio
-    async def test_oserror_envelope(self, monkeypatch):
-        """An OSError-class exception: ``reason=crashed``, no pet kill."""
-        import rocq_mcp.server as _server
-        from rocq_mcp.server import _run_with_pet
-
-        monkeypatch.setattr(_server, "ROCQ_MAX_PET_RSS_MB", 1_000_000)
-        patch_psutil_rss(monkeypatch, 1)
-        m = mock_pet()
-        ls = make_lifespan_state()
-        ls["pet_client"] = m
-        ls["recent_errors"] = deque(maxlen=10)
-        monkeypatch.setattr(_server, "_ensure_pet", lambda lstate: m)
-
-        def fn(pet):
-            raise OSError("disk full")
-
-        _assert_failure_envelope(
-            await _run_with_pet(fn, ls, "rocq_query"),
-            expected_reason="crashed",
-        )
-
-    @pytest.mark.asyncio
-    async def test_file_not_found_envelope(self, monkeypatch):
-        """FileNotFoundError (pet binary missing): ``reason=unavailable``."""
-        import rocq_mcp.server as _server
-        from rocq_mcp.server import _run_with_pet
-
-        monkeypatch.setattr(_server, "ROCQ_MAX_PET_RSS_MB", 1_000_000)
-        patch_psutil_rss(monkeypatch, 1)
-        m = mock_pet()
-        ls = make_lifespan_state()
-        ls["pet_client"] = m
-        ls["recent_errors"] = deque(maxlen=10)
-        monkeypatch.setattr(_server, "_ensure_pet", lambda lstate: m)
-
-        def fn(pet):
-            raise FileNotFoundError("pet binary missing")
-
-        _assert_failure_envelope(
-            await _run_with_pet(fn, ls, "rocq_query"),
-            expected_reason="unavailable",
-        )
-
-    @pytest.mark.asyncio
-    async def test_pytanque_unavailable_envelope(self, monkeypatch):
-        """ImportError on pytanque: ``reason=unavailable``."""
-        import sys
-        from rocq_mcp.server import _run_with_pet
-
-        monkeypatch.setitem(sys.modules, "pytanque", None)
-        ls = make_lifespan_state()
-        ls["recent_errors"] = deque(maxlen=10)
-        _assert_failure_envelope(
-            await _run_with_pet(lambda pet: None, ls, "rocq_query"),
-            expected_reason="unavailable",
         )
 
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import shutil
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -51,55 +50,11 @@ def _patch_compile_error(monkeypatch, stderr):
     )
 
 
-def _patch_capture_position_state(monkeypatch, async_fn):
-    """Replace the lazy-imported ``capture_position_state`` symbol."""
-    from rocq_mcp import interactive as _interactive
-
-    monkeypatch.setattr(_interactive, "capture_position_state", async_fn)
-
-
 class _MockContext:
     """Minimal mock for FastMCP Context to inject lifespan_state."""
 
     def __init__(self, lifespan_state):
         self.lifespan_context = lifespan_state
-
-
-@pytest.fixture(autouse=True)
-def _clean_state_table():
-    """Reset ``_state_table`` before/after every test for isolation.
-
-    Cheap (just clears a module-level dict) and keeps unit tests that
-    populate the state table from leaking entries into each other.
-    """
-    from rocq_mcp.interactive import _state_invalidate_all
-
-    _state_invalidate_all()
-    yield
-    _state_invalidate_all()
-
-
-def add_mock_state(parent_id, tactic, step=0):
-    """Add a mock state entry to ``_state_table`` and return its id.
-
-    Convenience helper for unit tests that exercise the state-table
-    bookkeeping (chain reconstruction, eviction, body-size limits, ...).
-    """
-    from unittest.mock import MagicMock
-
-    from rocq_mcp.interactive import _state_add
-
-    state = MagicMock()
-    state.proof_finished = False
-    return _state_add(
-        state=state,
-        file="test.v",
-        theorem="t",
-        workspace="/tmp",
-        parent_id=parent_id,
-        tactic=tactic,
-        step=step,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -249,22 +204,20 @@ def multiline_import_proof():
 # ---------------------------------------------------------------------------
 
 
-def make_lifespan_state(pet_timeout: float = 30.0, *, full: bool = False) -> dict:
+def make_lifespan_state(op_timeout: float = 30.0, *, full: bool = False) -> dict:
     """Build a lifespan_state dict for tests.
 
-    With *full=False* (default), returns the minimal subset that the
-    core pet-touching helpers actually read — sufficient for unit tests
-    that drive ``run_*`` directly.
+    With *full=False* (default), returns the minimal subset the coq-lsp
+    tools read (``op_timeout`` op-timeout default + ``lsp_checker``).
 
     With *full=True*, returns the complete schema produced by
-    ``app_lifespan`` in production: pet bookkeeping fields,
-    ``recent_errors`` ring buffer, peak/generation counters.  Use this
-    for tests that exercise ``rocq_diag`` or the memory watchdog.
+    ``app_lifespan`` in production: the coq-lsp bookkeeping fields and
+    the ``recent_errors`` ring buffer.  Use this for tests that exercise
+    ``rocq_diag`` or the memory watchdog.
     """
     state: dict = {
-        "pet_client": None,
-        "pet_timeout": pet_timeout,
-        "current_workspace": None,
+        "op_timeout": op_timeout,
+        "lsp_checker": None,
     }
     if full:
         import collections
@@ -274,12 +227,6 @@ def make_lifespan_state(pet_timeout: float = 30.0, *, full: bool = False) -> dic
         state.update(
             {
                 "workspace": "/tmp",
-                "pet_started_at": None,
-                "total_spawns": 0,
-                "peak_pet_rss_mb": 0.0,
-                "pet_generation": 0,
-                "pet_trim_count": 0,
-                "lsp_checker": None,
                 "peak_lsp_rss_mb": 0.0,
                 "lsp_generation": 0,
                 "lsp_trim_count": 0,
@@ -287,22 +234,6 @@ def make_lifespan_state(pet_timeout: float = 30.0, *, full: bool = False) -> dic
             }
         )
     return state
-
-
-def mock_pet(pid: int = 12345, alive: bool = True) -> MagicMock:
-    """Minimal mock pet client whose ``.process`` has a pid and a poll() —
-    just enough surface for ``_pet_alive`` and ``_sample_pet_rss_mb`` to
-    exercise their happy paths.  Test files used to define this verbatim
-    (test_diag.py / test_memory_watchdog.py)."""
-    m = MagicMock()
-    m.process = MagicMock()
-    m.process.pid = pid
-    m.process.poll.return_value = None if alive else 1
-    m.process.stdin = None
-    m.process.stdout = None
-    m.process.stderr = None
-    m._own_pgrp = False
-    return m
 
 
 class _FakeMemoryInfo:
