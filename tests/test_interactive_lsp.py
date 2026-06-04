@@ -147,7 +147,7 @@ class TestGetState:
         assert r["in_proof"] is True
         # proof_finished was removed: it was just in_proof and goals == [].
         assert "proof_finished" not in r
-        assert "n + m = m + n" in r["goals"]
+        assert "n + m = m + n" in r["goals"][0]["conclusion"]
 
     @pytest.mark.asyncio
     async def test_before_and_after_at_a_tactic(self, proof_ws, lstate):
@@ -160,14 +160,14 @@ class TestGetState:
             lifespan_state=lstate,
         )
         assert before["success"] is True
-        assert "forall" in before["goals"]
-        assert "n, m : nat" not in before["goals"]
+        assert "forall" in before["goals"][0]["conclusion"]
+        assert before["goals"][0]["hyps"] == []  # no hyps before intros
 
         after = await run_get_state(
             file="t.v", line=3, character=2, workspace=str(proof_ws),
             lifespan_state=lstate, before=False,
         )
-        assert "n, m : nat" in after["goals"]
+        assert {"names": ["n", "m"], "type": "nat"} in after["goals"][0]["hyps"]
 
     @pytest.mark.asyncio
     async def test_not_in_proof(self, proof_ws, lstate):
@@ -178,7 +178,7 @@ class TestGetState:
         )
         assert r["success"] is True
         assert r["in_proof"] is False
-        assert r["goals"] == ""
+        assert r["goals"] == []
 
     @pytest.mark.asyncio
     async def test_state_before_admit_in_bullet(self, tmp_path, lstate):
@@ -208,13 +208,13 @@ class TestGetState:
         )
         assert r["success"] is True
         assert r["in_proof"] is True
-        assert "1 = 1" in r["goals"]
+        assert "1 = 1" in r["goals"][0]["conclusion"]
         # before=False: the state after admit -- discharged, given-up.
         r2 = await run_get_state(
             file="b.v", line=3, character=4, workspace=str(tmp_path),
             lifespan_state=lstate, before=False,
         )
-        assert r2["goals"] == ""
+        assert r2["goals"] == []
         assert r2.get("given_up_goals") == 1
 
 
@@ -234,7 +234,7 @@ class TestStep:
         )
         assert r["success"] is True
         # induction splits into two subgoals.
-        assert "Goal 1" in r["goals"] and "Goal 2" in r["goals"]
+        assert len(r["goals"]) == 2
         # The file on disk is unchanged (speculative).
         assert (proof_ws / "t.v").read_text() == _PROOF
 

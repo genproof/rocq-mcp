@@ -1,42 +1,65 @@
-"""Tests for _format_lsp_goal_list -- goal rendering and the configurable
-ROCQ_MAX_GOAL_CHARS truncation cap (no coq-lsp required)."""
+"""Tests for _structure_goal_list -- structured goal output and the
+configurable ROCQ_MAX_GOAL_CHARS per-term cap (no coq-lsp required)."""
 
 from __future__ import annotations
 
 import os
 
 import rocq_mcp.server as _server
-from rocq_mcp.interactive import _format_lsp_goal_list
+from rocq_mcp.interactive import _MAX_GOALS_SHOWN, _structure_goal_list
 
 
 def test_default_cap_is_8000():
-    # Default holds when the env var is not set in the test environment.
     if "ROCQ_MAX_GOAL_CHARS" not in os.environ:
         assert _server.ROCQ_MAX_GOAL_CHARS == 8000
 
 
-def test_truncates_at_configured_cap(monkeypatch):
+def test_shape():
+    raw = [{
+        "hyps": [
+            {"names": ["n", "m"], "def": None, "ty": "nat"},
+            {"names": ["H"], "def": None, "ty": "n = m"},
+        ],
+        "ty": "n + 0 = m",
+    }]
+    assert _structure_goal_list(raw) == [{
+        "hyps": [
+            {"names": ["n", "m"], "type": "nat"},
+            {"names": ["H"], "type": "n = m"},
+        ],
+        "conclusion": "n + 0 = m",
+    }]
+
+
+def test_def_kept_only_when_present():
+    raw = [{"hyps": [{"names": ["k"], "def": "n + 0", "ty": "nat"}], "ty": "k = n"}]
+    assert _structure_goal_list(raw)[0]["hyps"][0] == {
+        "names": ["k"], "type": "nat", "def": "n + 0",
+    }
+
+
+def test_per_term_cap_truncates_each_field(monkeypatch):
     monkeypatch.setattr(_server, "ROCQ_MAX_GOAL_CHARS", 100)
-    out = _format_lsp_goal_list([{"hyps": [], "ty": "x" * 500}])
-    # A single goal renders as "\n|-" + the type (503 chars); the cap cuts
-    # it to 100 chars and appends the marker with the true length.
-    assert out[:100] == "\n|-" + "x" * 97
-    assert out.endswith("... (truncated, 503 chars total)")
+    raw = [{"hyps": [{"names": ["H"], "def": None, "ty": "x" * 500}], "ty": "y" * 500}]
+    g = _structure_goal_list(raw)[0]
+    assert g["hyps"][0]["type"].startswith("x" * 100)
+    assert "truncated" in g["hyps"][0]["type"]
+    assert g["conclusion"].startswith("y" * 100)
+    assert "truncated" in g["conclusion"]
 
 
-def test_no_truncation_under_cap(monkeypatch):
-    monkeypatch.setattr(_server, "ROCQ_MAX_GOAL_CHARS", 10_000)
-    out = _format_lsp_goal_list([{"hyps": [], "ty": "x" * 500}])
-    assert "truncated" not in out
-    assert out == "\n|-" + "x" * 500
+def test_conclusion_survives_huge_hyps(monkeypatch):
+    # Even with an enormous hypothesis, the conclusion comes through intact
+    # -- impossible with the old single-string char cut (hyps came first).
+    monkeypatch.setattr(_server, "ROCQ_MAX_GOAL_CHARS", 1_000_000)
+    raw = [{"hyps": [{"names": ["H"], "def": None, "ty": "z" * 50000}], "ty": "done"}]
+    g = _structure_goal_list(raw)[0]
+    assert g["conclusion"] == "done"
+    assert len(g["hyps"][0]["type"]) == 50000
 
 
-def test_raising_the_cap_keeps_more(monkeypatch):
-    # A goal that truncates at the default 8000 survives a higher cap.
-    long_ty = "y" * 9000
-    monkeypatch.setattr(_server, "ROCQ_MAX_GOAL_CHARS", 8000)
-    assert "truncated" in _format_lsp_goal_list([{"hyps": [], "ty": long_ty}])
-    monkeypatch.setattr(_server, "ROCQ_MAX_GOAL_CHARS", 20_000)
-    full = _format_lsp_goal_list([{"hyps": [], "ty": long_ty}])
-    assert "truncated" not in full
-    assert long_ty in full
+def test_goal_count_capped_at_max_shown():
+    raw = [{"hyps": [], "ty": f"g{i}"} for i in range(_MAX_GOALS_SHOWN + 5)]
+    out = _structure_goal_list(raw)
+    assert len(out) == _MAX_GOALS_SHOWN
+    assert out[0]["conclusion"] == "g0"

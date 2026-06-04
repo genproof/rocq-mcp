@@ -913,37 +913,43 @@ _LSP_REQUEST_FAILED_CODE = -32803
 _GOALS_ERROR_PREFIX = "Error in goals request: "
 
 
-def _format_lsp_goal_list(goals_list: list[Any]) -> str:
-    """Format coq-lsp ``proof/goals`` goal objects into readable text.
+def _structure_goal_list(goals_list: list[Any]) -> list[dict[str, Any]]:
+    """Convert coq-lsp ``proof/goals`` goal objects into structured dicts.
 
-    Mirrors the historical pet-based :func:`_format_goals` output exactly
-    (``hyps`` lines, ``|-`` separator, ``Goal N:`` headers, the same
-    truncation caps) but reads the coq-lsp JSON shape: each goal is
-    ``{"hyps": [{"names": [...], "def": <str|null>, "ty": <str>}], "ty": <str>}``
-    with ``pp_format="Str"`` rendering every type as a plain string.
+    coq-lsp already returns each goal as
+    ``{"hyps": [{"names": [...], "def": <str|null>, "ty": <str>}], "ty": <str>}``;
+    we reshape it to ``{"hyps": [{"names": [...], "type": str, "def"?: str}],
+    "conclusion": str}`` (``def`` is included only for let-bound
+    hypotheses).  At most :data:`_MAX_GOALS_SHOWN` goals are returned (the
+    caller surfaces the remainder via ``goals_omitted``).
+
+    Each rendered term -- every hypothesis ``type``/``def`` and each
+    ``conclusion`` -- is capped at ``ROCQ_MAX_GOAL_CHARS`` chars
+    (truncated with a marker).  Because the cap is *per term*, a single
+    huge hypothesis can't crowd out the rest, and the conclusion (its own
+    field) is never lost to truncation.
     """
-    total = len(goals_list)
-    shown = min(total, _MAX_GOALS_SHOWN)
-    parts: list[str] = []
-    for i, g in enumerate(goals_list[:shown]):
-        hyps = "\n".join(
-            f"{', '.join(h.get('names') or [])}"
-            f"{' := ' + h['def'] if h.get('def') else ''}"
-            f" : {h.get('ty', '')}"
-            for h in (g.get("hyps") or [])
-        )
-        pp = f"{hyps}\n|-{g.get('ty', '')}"
-        if total > 1:
-            parts.append(f"Goal {i + 1}:\n{pp}")
-        else:
-            parts.append(pp)
-    if total > shown:
-        parts.append(f"... ({total} goals total, showing first {shown})")
-    result = "\n\n".join(parts)
-    max_chars = _server.ROCQ_MAX_GOAL_CHARS
-    if len(result) > max_chars:
-        result = result[:max_chars] + f"... (truncated, {len(result)} chars total)"
-    return result
+    cap = _server.ROCQ_MAX_GOAL_CHARS
+
+    def _term(s: str | None) -> str:
+        s = s or ""
+        if len(s) > cap:
+            return s[:cap] + f"... (truncated, {len(s)} chars)"
+        return s
+
+    structured: list[dict[str, Any]] = []
+    for g in goals_list[:_MAX_GOALS_SHOWN]:
+        hyps: list[dict[str, Any]] = []
+        for h in g.get("hyps") or []:
+            entry: dict[str, Any] = {
+                "names": h.get("names") or [],
+                "type": _term(h.get("ty")),
+            }
+            if h.get("def"):
+                entry["def"] = _term(h.get("def"))
+            hyps.append(entry)
+        structured.append({"hyps": hyps, "conclusion": _term(g.get("ty"))})
+    return structured
 
 
 def _extract_lsp_messages(
@@ -1001,8 +1007,10 @@ def _render_goals_answer(
     The ``goals`` field of the answer is ``null`` when the position is not
     inside a proof, and a ``{"goals": [...], ...}`` object when it is (an
     empty ``goals`` list there means no foreground goals remain).  Returns
-    a dict with ``goals`` (formatted text), ``in_proof``, optional
-    ``shelved_goals`` / ``given_up_goals`` counts, and optional
+    a dict with ``goals`` (a **list** of structured ``{hyps, conclusion}``
+    goal dicts -- empty list when no foreground goals remain), ``in_proof``,
+    ``goals_omitted`` (when more than :data:`_MAX_GOALS_SHOWN` goals),
+    optional ``shelved_goals`` / ``given_up_goals`` counts, and optional
     ``messages``.  There is no ``proof_finished`` field: it was just
     ``in_proof and goals == []``, which the caller can read off ``goals``
     directly.
@@ -1010,12 +1018,14 @@ def _render_goals_answer(
     gfield = (answer or {}).get("goals")
     out: dict[str, Any] = {}
     if not isinstance(gfield, dict):
-        out["goals"] = ""
+        out["goals"] = []
         out["in_proof"] = False
     else:
         goals_list = gfield.get("goals") or []
-        out["goals"] = _format_lsp_goal_list(goals_list)
+        out["goals"] = _structure_goal_list(goals_list)
         out["in_proof"] = True
+        if len(goals_list) > _MAX_GOALS_SHOWN:
+            out["goals_omitted"] = len(goals_list) - _MAX_GOALS_SHOWN
         shelf = gfield.get("shelf") or []
         given_up = gfield.get("given_up") or []
         if shelf:
@@ -1190,8 +1200,6 @@ async def run_step(
         rendered = _render_goals_answer(payload, include_warnings=include_warnings)
         # Surface any block output (Print/Search/...) under "feedback".
         messages = rendered.pop("messages", None)
-        if not rendered.get("goals"):
-            rendered["goals"] = "No goals remaining."
         result = {
             "success": True,
             "file": file,
@@ -1287,8 +1295,6 @@ async def run_step_multi(
                 )
                 feedback = rendered.pop("messages", None)
                 rendered.pop("in_proof", None)
-                if not rendered.get("goals"):
-                    rendered["goals"] = "No goals remaining."
                 entry["success"] = True
                 entry.update(rendered)
                 if feedback:

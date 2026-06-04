@@ -40,9 +40,10 @@ ROCQ_OP_TIMEOUT: float = float(
 ROCQ_QUERY_TIMEOUT_CAP: int = int(os.environ.get("ROCQ_QUERY_TIMEOUT_CAP", "300"))
 ROCQ_COQC_BINARY: str = os.environ.get("ROCQ_COQC_BINARY", "coqc")
 ROCQ_MAX_SOURCE_SIZE: int = int(os.environ.get("ROCQ_MAX_SOURCE_SIZE", "1000000"))
-# Max characters of formatted goal text returned by the goals-driven tools
-# (rocq_get_state / rocq_step / rocq_step_multi); longer output is truncated
-# with a "... (truncated, N chars total)" marker.  See _format_lsp_goal_list.
+# Max characters per rendered term in the structured goal output of the
+# goals-driven tools (rocq_get_state / rocq_step / rocq_step_multi) -- each
+# hypothesis type/def and each goal conclusion; longer terms are truncated
+# with a "... (truncated, N chars)" marker.  See _structure_goal_list.
 ROCQ_MAX_GOAL_CHARS: int = int(os.environ.get("ROCQ_MAX_GOAL_CHARS", "8000"))
 
 
@@ -1368,9 +1369,9 @@ async def rocq_get_state(
     sentence.  Use it to inspect a proof mid-way, or to see the goals at
     an error position reported by ``rocq_compile``.
 
-    Returns ``goals`` (formatted text; empty when no foreground goals
-    remain) and ``in_proof`` (False when the position is not inside any
-    proof).  There is no ``state_id`` — run tactics from here with
+    Returns ``goals`` -- a list of ``{hyps: [{names, type, def?}],
+    conclusion}`` objects, empty when no foreground goals remain -- and
+    ``in_proof`` (False when the position is not inside any proof).  There is no ``state_id`` — run tactics from here with
     ``rocq_step`` / ``rocq_step_multi`` by passing the same position.
 
     Args:
@@ -1431,7 +1432,8 @@ async def rocq_step(
     goals are returned — **the file on disk is not modified**.  To keep a
     step, write it into the file yourself, then re-query by position.
 
-    On success returns ``goals`` (empty when no foreground goals remain).
+    On success returns ``goals`` -- a list of ``{hyps, conclusion}``
+    objects, empty when no foreground goals remain.
     If Coq rejects the block, returns ``{success: False, reason:
     "tactic_failed", error: <coq message>}``.  If the block exceeds the timeout, returns
     ``{success: False, reason: "timeout"}`` (coq-lsp keeps computing it in
@@ -1497,7 +1499,8 @@ async def rocq_step_multi(
 
     Each block in *tactics* is run speculatively from ``(line, character)``
     (the file is never modified) and its outcome recorded in ``results``
-    (order preserved).  Per block: success -> ``{tactics, goals}``;
+    (order preserved).  ``goals`` is the structured goal list (see
+    rocq_get_state).  Per block: success -> ``{tactics, goals}``;
     Coq rejection -> ``{tactics, success: False,
     reason: "tactic_failed", error}``; timeout -> ``{tactics, success:
     False, reason: "timeout", error}`` (the batch still runs to the end).
