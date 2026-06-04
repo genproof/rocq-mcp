@@ -40,6 +40,10 @@ ROCQ_OP_TIMEOUT: float = float(
 ROCQ_QUERY_TIMEOUT_CAP: int = int(os.environ.get("ROCQ_QUERY_TIMEOUT_CAP", "300"))
 ROCQ_COQC_BINARY: str = os.environ.get("ROCQ_COQC_BINARY", "coqc")
 ROCQ_MAX_SOURCE_SIZE: int = int(os.environ.get("ROCQ_MAX_SOURCE_SIZE", "1000000"))
+# Max characters of formatted goal text returned by the goals-driven tools
+# (rocq_get_state / rocq_step / rocq_step_multi); longer output is truncated
+# with a "... (truncated, N chars total)" marker.  See _format_lsp_goal_list.
+ROCQ_MAX_GOAL_CHARS: int = int(os.environ.get("ROCQ_MAX_GOAL_CHARS", "8000"))
 
 
 def _default_max_rss_mb() -> int:

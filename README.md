@@ -121,6 +121,7 @@ When a tool returns `lsp_restarted: True`, call `rocq_diag` for memory headroom 
 | `ROCQ_LSP_TRIM_RSS_MB` | `½ × ROCQ_MAX_LSP_RSS_MB` | Soft cap: above it, a successful check sends `coq/trimCaches` to free coq-lsp's memo tables without killing it. Set to `0` to disable. |
 | `ROCQ_COQC_BINARY` | `coqc` | Path to the `coqc` binary |
 | `ROCQ_MAX_SOURCE_SIZE` | `1000000` | Maximum source size in bytes |
+| `ROCQ_MAX_GOAL_CHARS` | `8000` | Max characters of formatted goal text returned by `rocq_get_state` / `rocq_step` / `rocq_step_multi`; longer output is truncated with a `... (truncated, N chars total)` marker |
 
 ## Security Model
 

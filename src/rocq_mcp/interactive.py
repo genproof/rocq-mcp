@@ -38,7 +38,6 @@ import rocq_mcp.server as _server
 # Goal / output formatting limits
 # ---------------------------------------------------------------------------
 
-_MAX_GOALS_LENGTH: int = 8000  # Max chars for formatted goals output
 _MAX_GOALS_SHOWN: int = 10  # Max number of goals to format
 _MAX_FEEDBACK_LENGTH: int = 50_000  # Max chars per feedback step
 _MAX_TOTAL_FEEDBACK: int = 200_000  # Max total chars across all feedback steps
@@ -941,8 +940,9 @@ def _format_lsp_goal_list(goals_list: list[Any]) -> str:
     if total > shown:
         parts.append(f"... ({total} goals total, showing first {shown})")
     result = "\n\n".join(parts)
-    if len(result) > _MAX_GOALS_LENGTH:
-        result = result[:_MAX_GOALS_LENGTH] + f"... (truncated, {len(result)} chars total)"
+    max_chars = _server.ROCQ_MAX_GOAL_CHARS
+    if len(result) > max_chars:
+        result = result[:max_chars] + f"... (truncated, {len(result)} chars total)"
     return result
 
 
