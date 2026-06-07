@@ -20,7 +20,7 @@ from rocq_mcp.interactive import (
     run_step,
     run_step_multi,
 )
-from tests.conftest import make_lifespan_state
+from tests.conftest import make_lifespan_state, inject_checker, stop_all_checkers
 
 COQLSP_AVAILABLE = shutil.which("coq-lsp") is not None
 _lsp_only = pytest.mark.skipif(not COQLSP_AVAILABLE, reason="coq-lsp not available")
@@ -93,9 +93,9 @@ def vfile(tmp_path):
     return tmp_path
 
 
-def _state(checker, op_timeout=7.0):
+def _state(checker, workspace, op_timeout=7.0, file="t.v"):
     state = make_lifespan_state(op_timeout=op_timeout, full=True)
-    state["lsp_checker"] = checker
+    inject_checker(state, checker, workspace=workspace, file=file)
     return state
 
 
@@ -104,7 +104,7 @@ class TestReasonMapping:
     async def test_get_state_timeout(self, vfile):
         r = await run_get_state(
             file="t.v", line=1, character=0, workspace=str(vfile),
-            lifespan_state=_state(_MockChecker()),
+            lifespan_state=_state(_MockChecker(), str(vfile)),
         )
         assert r["success"] is False
         assert r["reason"] == "timeout"
@@ -113,7 +113,7 @@ class TestReasonMapping:
     async def test_step_timeout(self, vfile):
         r = await run_step(
             file="t.v", line=2, character=0, tactics="auto.", workspace=str(vfile),
-            lifespan_state=_state(_MockChecker()),
+            lifespan_state=_state(_MockChecker(), str(vfile)),
         )
         assert r["success"] is False
         assert r["reason"] == "timeout"
@@ -126,7 +126,8 @@ class TestReasonMapping:
         r = await run_step_multi(
             file="t.v", line=2, character=0,
             tactics=["auto.", "reflexivity."],
-            workspace=str(vfile), lifespan_state=_state(_MockChecker(ok_for={"reflexivity."})),
+            workspace=str(vfile),
+            lifespan_state=_state(_MockChecker(ok_for={"reflexivity."}), str(vfile)),
         )
         assert r["success"] is True  # the batch ran (not a hard abort)
         by = {e["tactics"]: e for e in r["results"]}
@@ -157,6 +158,4 @@ class TestRealTimeout:
             assert r["success"] is False
             assert r["reason"] == "timeout"
         finally:
-            checker = state.get("lsp_checker")
-            if checker is not None:
-                checker.stop()
+            stop_all_checkers(state)

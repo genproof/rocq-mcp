@@ -85,25 +85,35 @@ _RECENT_ERRORS_MAX: int = 20
 
 @lifespan
 async def app_lifespan(server: Any) -> Any:
-    """Server lifespan. coq-lsp is spawned lazily on first tool call."""
+    """Server lifespan.  coq-lsp processes are spawned lazily, one per
+    *session* (see :func:`_session_key`), so independent agents working in
+    separate files each drive their own isolated coq-lsp subprocess through
+    this single MCP server.
+    """
     state: dict[str, Any] = {
         "workspace": ROCQ_WORKSPACE,
         # Default per-operation timeout (seconds) for the coq-lsp tools.
         "op_timeout": ROCQ_OP_TIMEOUT,
-        "lsp_checker": None,
-        # coq-lsp diagnostics (rocq_diag tool, see _build_diag_snapshot).
-        "peak_lsp_rss_mb": 0.0,
-        "lsp_generation": 0,
-        # Count of coq/trimCaches notifications sent so far (ROCQ_LSP_TRIM_RSS_MB).
-        "lsp_trim_count": 0,
+        # Pool of live coq-lsp clients: session key -> LspChecker.  Each
+        # entry is an independent subprocess with its own lock, reader
+        # thread, and memory watchdog (see _run_with_lsp / _memory_watchdog).
+        "lsp_pool": {},
+        # Per-session bookkeeping for rocq_diag: session key ->
+        # {"peak_rss_mb", "trim_count", "generation"}.  Kept separate from
+        # ``lsp_pool`` so the stats survive a checker being invalidated and
+        # respawned under the same key.
+        "lsp_meta": {},
         "recent_errors": collections.deque(maxlen=_RECENT_ERRORS_MAX),
     }
     try:
         yield state
     finally:
-        lsp = state.get("lsp_checker")
-        if lsp:
-            lsp.stop()
+        for checker in list(state.get("lsp_pool", {}).values()):
+            try:
+                checker.stop()
+            except Exception:
+                pass
+        state.get("lsp_pool", {}).clear()
         # Clean up cache file
         ws = state.get("workspace")
         if ws:
@@ -565,13 +575,71 @@ def _parse_project_flags(ws: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _invalidate_lsp(lifespan_state: dict[str, Any]) -> None:
-    """Kill coq-lsp and clear the cached checker so the next call respawns.
+_DEFAULT_SESSION_KEY = "<default>"
 
-    LspChecker holds its own per-instance ``threading.Lock``, which the
-    discarded checker takes with it -- there is no global lock to release.
+
+def _session_key(workspace: str, file: str | None = None) -> str:
+    """Pool key identifying one coq-lsp session.
+
+    With a *file*, the key is the resolved absolute file path, so each
+    file gets its own coq-lsp subprocess (parallel agents in separate
+    files never share a server, never serialize on one lock, and each
+    file's memory is isolated and watchdog-managed independently).
+    Without a file, the key is the resolved *workspace* — used by the
+    file-less paths (preamble ``rocq_query``, verify's shared-defs
+    lookup) which all share one per-workspace scratch server.
+
+    Resolution is lexical (``resolve()`` without an existence check) so
+    the key is stable regardless of whether the file exists yet, and
+    matches the path :func:`_resolve_file_in_workspace` produces.
     """
-    checker = lifespan_state.get("lsp_checker")
+    if file:
+        base = Path(workspace) if workspace else Path.cwd()
+        try:
+            return str((base / file).resolve())
+        except (OSError, ValueError):
+            return f"{workspace}::{file}"
+    if workspace:
+        try:
+            return str(Path(workspace).resolve())
+        except (OSError, ValueError):
+            return workspace
+    return _DEFAULT_SESSION_KEY
+
+
+def _meta_for(lifespan_state: dict[str, Any], key: str) -> dict[str, Any]:
+    """Return (creating if needed) the per-session stats dict for *key*."""
+    metas = lifespan_state.setdefault("lsp_meta", {})
+    return metas.setdefault(
+        key, {"peak_rss_mb": 0.0, "trim_count": 0, "generation": 0}
+    )
+
+
+def _get_or_create_checker(
+    lifespan_state: dict[str, Any], key: str, workspace: str
+) -> Any:
+    """Return the live :class:`LspChecker` for *key*, spawning it if needed."""
+    from rocq_mcp.lsp_checker import LspChecker
+
+    pool = lifespan_state.setdefault("lsp_pool", {})
+    checker = pool.get(key)
+    if checker is None or not checker._is_alive():
+        checker = LspChecker(workspace=workspace)
+        pool[key] = checker
+        _meta_for(lifespan_state, key)
+    return checker
+
+
+def _invalidate_lsp(lifespan_state: dict[str, Any], key: str) -> None:
+    """Kill the coq-lsp session *key* and drop it so the next call respawns.
+
+    LspChecker holds its own per-instance lock, which the discarded
+    checker takes with it -- there is no global lock to release.  The
+    session's stats (``lsp_meta[key]``) survive so its restart count
+    (``generation``) keeps accumulating across respawns.
+    """
+    pool = lifespan_state.setdefault("lsp_pool", {})
+    checker = pool.pop(key, None)
     if checker is not None:
         try:
             checker.stop()
@@ -579,10 +647,9 @@ def _invalidate_lsp(lifespan_state: dict[str, Any]) -> None:
             # Best-effort cleanup; the subprocess may already be dead or
             # the FDs already closed.  We only care that we tried.
             pass
-    lifespan_state["lsp_checker"] = None
-    lifespan_state["lsp_generation"] = (
-        lifespan_state.get("lsp_generation", 0) + 1
-    )
+    meta = _meta_for(lifespan_state, key)
+    meta["generation"] = int(meta.get("generation", 0)) + 1
+    meta["peak_rss_mb"] = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -699,17 +766,18 @@ def _fail(
 def _build_lsp_memory_abort_response(
     lifespan_state: dict[str, Any],
     tool: str,
+    key: str,
 ) -> dict[str, Any]:
-    """Memory-abort recovery for the coq-lsp path.
+    """Memory-abort recovery for one coq-lsp session.
 
-    Kills the coq-lsp subprocess (so the next call respawns it),
-    records the failure into ``recent_errors`` so ``rocq_diag`` surfaces
-    it, and returns the unified ``memory_exhausted`` envelope.  Unlike
-    the pet path there is no global lock to force-release -- LspChecker
-    owns its lock per-instance, and discarding the checker discards
-    its lock too.
+    Kills the *key* session's coq-lsp subprocess (so the next call for
+    that session respawns it), records the failure into ``recent_errors``
+    so ``rocq_diag`` surfaces it, and returns the unified
+    ``memory_exhausted`` envelope.  Other sessions in the pool are
+    untouched -- LspChecker owns its lock per-instance, and discarding
+    one checker discards only its lock.
     """
-    _invalidate_lsp(lifespan_state)
+    _invalidate_lsp(lifespan_state, key)
     error = (
         f"{tool} aborted: coq-lsp RSS exceeded "
         f"{ROCQ_MAX_LSP_RSS_MB} MB. coq-lsp has been restarted. "
@@ -724,15 +792,11 @@ def _build_lsp_memory_abort_response(
     }
 
 
-def _lsp_process_from_state(lifespan_state: dict[str, Any]) -> Any:
-    """Return the coq-lsp subprocess (with ``.pid``) or None if not running."""
-    checker = lifespan_state.get("lsp_checker")
+def _checker_process(checker: Any) -> Any:
+    """Return *checker*'s coq-lsp subprocess (with ``.pid``) or None."""
     if checker is None:
         return None
-    process = getattr(checker, "_process", None)
-    if process is None:
-        return None
-    return process
+    return getattr(checker, "_process", None)
 
 
 # ---------------------------------------------------------------------------
@@ -753,26 +817,26 @@ def _lsp_process_from_state(lifespan_state: dict[str, Any]) -> Any:
 # same successful call that produced the evictions -- never carried across
 # a pet generation.
 async def _memory_watchdog(
-    lifespan_state: dict[str, Any],
     max_rss_mb: int,
     main_task: asyncio.Task,
     event: asyncio.Event,
     interval: float | None = None,
     *,
-    get_process: Callable[[dict[str, Any]], Any] = _lsp_process_from_state,
-    peak_key: str = "peak_lsp_rss_mb",
+    get_process: Callable[[], Any],
+    on_rss: Callable[[int], None] | None = None,
 ) -> None:
-    """Sample subprocess RSS; on threshold breach, set *event* and cancel *main_task*.
+    """Sample one subprocess's RSS; on breach, set *event* + cancel *main_task*.
 
-    Runs concurrently with the main work thread.  When the subprocess
-    RSS exceeds ``max_rss_mb`` MB, signals memory exhaustion via
-    *event* and cancels the main task so the caller's recovery path
-    can reclaim resources and respawn the subprocess.
+    Runs concurrently with the main work thread, watching a *single*
+    coq-lsp process (one per session — see :func:`_run_with_lsp`).  When
+    that process's RSS exceeds ``max_rss_mb`` MB, it signals memory
+    exhaustion via *event* and cancels the main task so the caller's
+    recovery path can kill and respawn just that session's subprocess.
 
-    ``get_process`` returns a subprocess-like object with a ``.pid``
-    attribute (or ``None`` if not yet spawned).  Defaults to the coq-lsp
-    process.  ``peak_key`` is the lifespan-state field used to track the
-    peak RSS seen during this run (``peak_lsp_rss_mb`` for coq-lsp).
+    ``get_process`` returns the subprocess-like object (with a ``.pid``)
+    to watch, or ``None`` if it is not yet spawned.  ``on_rss`` (if
+    given) is called with each live RSS sample (MB) -- used to track the
+    per-session peak.
 
     Tolerates:
     - ``psutil`` not installed -- exits silently (no monitoring).
@@ -789,7 +853,7 @@ async def _memory_watchdog(
             await asyncio.sleep(interval)
             if main_task.done():
                 return
-            process = get_process(lifespan_state)
+            process = get_process()
             if process is None:
                 continue
             try:
@@ -801,8 +865,8 @@ async def _memory_watchdog(
                 # between Process() construction and memory_info().
                 continue
             rss_mb = rss_bytes // (1024 * 1024)
-            if rss_mb > lifespan_state.get(peak_key, 0):
-                lifespan_state[peak_key] = float(rss_mb)
+            if on_rss is not None:
+                on_rss(rss_mb)
             if rss_mb > max_rss_mb:
                 event.set()
                 main_task.cancel()
@@ -817,16 +881,20 @@ async def _run_with_lsp(
     tool: str,
     *,
     workspace: str,
+    key: str | None = None,
 ) -> Any:
-    """Run *fn(checker)* against the coq-lsp client with a memory watchdog.
+    """Run *fn(checker)* against one coq-lsp session with a memory watchdog.
 
-    The coq-lsp analogue of :func:`_run_with_pet`.  Lazily creates the
-    :class:`~rocq_mcp.lsp_checker.LspChecker`, runs *fn* in a worker
-    thread, and monitors coq-lsp RSS against ``ROCQ_MAX_LSP_RSS_MB``; on
-    breach the subprocess is killed and the unified ``memory_exhausted``
-    envelope is returned (see :func:`_build_lsp_memory_abort_response`).
-    On success, soft-trims coq-lsp's global memo tables when RSS crosses
-    ``ROCQ_LSP_TRIM_RSS_MB`` (see :func:`_maybe_trim_lsp_caches`).
+    Resolves the session *key* (defaults to the per-workspace session;
+    file tools pass ``key=_session_key(workspace, file)`` so each file
+    gets its own subprocess), looks it up in / adds it to the pool, runs
+    *fn* in a worker thread, and monitors *that* coq-lsp process's RSS
+    against ``ROCQ_MAX_LSP_RSS_MB``.  On breach only that session's
+    subprocess is killed and the unified ``memory_exhausted`` envelope is
+    returned (see :func:`_build_lsp_memory_abort_response`); sibling
+    sessions keep running.  On success, soft-trims that session's global
+    memo tables when its RSS crosses ``ROCQ_LSP_TRIM_RSS_MB`` (see
+    :func:`_maybe_trim_lsp_caches`).
 
     *fn* receives the live ``LspChecker`` and must embed its own
     per-request timeout (the checker's ``goals`` / ``check_*`` /
@@ -836,23 +904,24 @@ async def _run_with_lsp(
     serializes requests on its own per-instance lock, so the request
     drains via the checker's internal timeout instead.
     """
-    from rocq_mcp.lsp_checker import LspChecker
+    if key is None:
+        key = _session_key(workspace)
+    checker = _get_or_create_checker(lifespan_state, key, workspace)
+    meta = _meta_for(lifespan_state, key)
 
-    checker = lifespan_state.get("lsp_checker")
-    if checker is None or not checker._is_alive():
-        checker = LspChecker(workspace=workspace)
-        lifespan_state["lsp_checker"] = checker
+    def _track_peak(rss_mb: int) -> None:
+        if rss_mb > meta.get("peak_rss_mb", 0.0):
+            meta["peak_rss_mb"] = float(rss_mb)
 
     main_task = asyncio.create_task(asyncio.to_thread(fn, checker))
     mem_event = asyncio.Event()
     monitor_task = asyncio.create_task(
         _memory_watchdog(
-            lifespan_state,
             ROCQ_MAX_LSP_RSS_MB,
             main_task,
             mem_event,
-            get_process=_lsp_process_from_state,
-            peak_key="peak_lsp_rss_mb",
+            get_process=lambda: _checker_process(checker),
+            on_rss=_track_peak,
         )
     )
     try:
@@ -866,14 +935,14 @@ async def _run_with_lsp(
                 except asyncio.CancelledError:
                     pass
     except asyncio.CancelledError:
-        # Watchdog cancelled the worker because coq-lsp RSS breached the
-        # threshold; build the memory_exhausted envelope (which also
-        # restarts coq-lsp).  An external cancel (mem_event unset) must
-        # propagate.
+        # Watchdog cancelled the worker because this session's coq-lsp RSS
+        # breached the threshold; build the memory_exhausted envelope
+        # (which also restarts this session's coq-lsp).  An external cancel
+        # (mem_event unset) must propagate.
         if mem_event.is_set():
-            return _build_lsp_memory_abort_response(lifespan_state, tool)
+            return _build_lsp_memory_abort_response(lifespan_state, tool, key)
         raise
-    _maybe_trim_lsp_caches(lifespan_state, checker)
+    _maybe_trim_lsp_caches(lifespan_state, checker, meta)
     return result
 
 
@@ -1560,16 +1629,27 @@ async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
 
     Does NOT spawn coq-lsp if it's not running; just reports state.
 
+    rocq-mcp runs **one coq-lsp subprocess per file** (so parallel
+    agents working in separate files stay isolated); this tool reports
+    each as a *session*.
+
     Response shape:
 
-    - ``lsp``: ``{pid, generation, trim_count}`` -- coq-lsp subprocess
-      bookkeeping.  ``pid`` is ``None`` when coq-lsp is not running.
-      ``trim_count`` is the number of ``coq/trimCaches`` notifications
-      sent so far (see ``ROCQ_LSP_TRIM_RSS_MB``).
+    - ``lsp``: ``{count, pid, generation, trim_count, sessions}`` --
+      pool-wide bookkeeping.  ``count`` is the number of live coq-lsp
+      subprocesses; ``pid`` is a representative live pid (``None`` when
+      none are running); ``generation`` / ``trim_count`` are summed
+      across all sessions (total respawns / ``coq/trimCaches``
+      notifications).  ``sessions`` is a list, one entry per session:
+      ``{key, pid, rss_mb, peak_rss_mb, generation, trim_count,
+      sample_status}`` where ``key`` is the file path (or workspace for
+      the shared scratch session).
     - ``memory``: ``{lsp_rss_mb, peak_lsp_rss_mb, lsp_max_rss_mb_threshold,
-      lsp_trim_rss_mb_threshold, lsp_sample_status}``.  ``lsp_sample_status``
-      is ``"ok"`` / ``"no_lsp"`` / ``"psutil_error"`` and disambiguates a
-      ``None`` RSS reading.
+      lsp_trim_rss_mb_threshold, lsp_sample_status}``.  ``lsp_rss_mb`` is
+      the summed live RSS across all sessions; ``peak_lsp_rss_mb`` is the
+      largest per-session peak.  ``lsp_sample_status`` is ``"ok"`` /
+      ``"no_lsp"`` / ``"psutil_error"`` and disambiguates a ``None`` RSS
+      reading.  Thresholds are per-process.
     - ``recent_errors``: ring buffer of the last 20 errors, each
       ``{tool, message, reason, ago_seconds}``.  ``reason`` is one of:
 
@@ -1702,7 +1782,11 @@ async def rocq_compile_lsp(
     # (memory_exhausted envelope on breach), and the post-success soft
     # trim (coq/trimCaches when RSS crosses ROCQ_LSP_TRIM_RSS_MB).
     result = await _run_with_lsp(
-        _check, lifespan_state, "rocq_compile_lsp", workspace=workspace
+        _check,
+        lifespan_state,
+        "rocq_compile_lsp",
+        workspace=workspace,
+        key=_session_key(workspace, file),
     )
 
     # On a memory abort the envelope carries no warnings/info keys to pop.
@@ -1721,19 +1805,23 @@ async def rocq_compile_lsp(
 
 
 def _maybe_trim_lsp_caches(
-    lifespan_state: dict[str, Any], checker: Any
+    lifespan_state: dict[str, Any], checker: Any, meta: dict[str, Any]
 ) -> None:
-    """Send ``coq/trimCaches`` to coq-lsp when RSS is above the soft cap.
+    """Trim one session's coq-lsp caches when its RSS is above the soft cap.
+
+    Per-session counterpart to the hard watchdog: samples *checker*'s own
+    coq-lsp RSS and, when it crosses ``ROCQ_LSP_TRIM_RSS_MB``, sends that
+    process ``coq/trimCaches`` to free its global memo tables WITHOUT
+    killing it -- preserving incremental cache for the active file.
 
     No-op when ``ROCQ_LSP_TRIM_RSS_MB <= 0`` or when the live RSS sample
-    is unavailable / below the threshold.  On success, increments
-    ``lifespan_state["lsp_trim_count"]`` and resets
-    ``peak_lsp_rss_mb`` so future peak tracking reflects post-trim
-    growth.
+    is unavailable / below the threshold.  On success, increments this
+    session's ``meta["trim_count"]`` and resets its ``meta["peak_rss_mb"]``
+    so future peak tracking reflects post-trim growth.
     """
     if ROCQ_LSP_TRIM_RSS_MB <= 0:
         return
-    process = _lsp_process_from_state(lifespan_state)
+    process = _checker_process(checker)
     if process is None:
         return
     try:
@@ -1749,12 +1837,10 @@ def _maybe_trim_lsp_caches(
         # trim_caches itself is best-effort; never let a trim failure
         # turn a successful check into a tool-level error.
         return
-    lifespan_state["lsp_trim_count"] = (
-        lifespan_state.get("lsp_trim_count", 0) + 1
-    )
+    meta["trim_count"] = int(meta.get("trim_count", 0)) + 1
     # Reset peak so the watchdog's peak tracking shows the post-trim
     # high-water mark on subsequent calls.
-    lifespan_state["peak_lsp_rss_mb"] = 0.0
+    meta["peak_rss_mb"] = 0.0
 
 
 # ---------------------------------------------------------------------------

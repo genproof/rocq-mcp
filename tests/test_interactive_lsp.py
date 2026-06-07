@@ -18,7 +18,7 @@ from rocq_mcp.interactive import (
     run_step,
     run_step_multi,
 )
-from tests.conftest import make_lifespan_state
+from tests.conftest import make_lifespan_state, stop_all_checkers
 
 COQLSP_AVAILABLE = shutil.which("coq-lsp") is not None
 _lsp_only = pytest.mark.skipif(not COQLSP_AVAILABLE, reason="coq-lsp not available")
@@ -56,9 +56,7 @@ def lstate():
     """A lifespan_state whose coq-lsp checker is shut down on teardown."""
     state = make_lifespan_state(op_timeout=30.0)
     yield state
-    checker = state.get("lsp_checker")
-    if checker is not None:
-        checker.stop()
+    stop_all_checkers(state)
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ import shutil
 import pytest
 
 import rocq_mcp.server as _server
-from tests.conftest import make_lifespan_state
+from tests.conftest import make_lifespan_state, stop_all_checkers
 
 COQLSP_AVAILABLE = shutil.which("coq-lsp") is not None
 _lsp_only = pytest.mark.skipif(not COQLSP_AVAILABLE, reason="coq-lsp not available")
@@ -66,9 +66,7 @@ def lstate(tmp_path, monkeypatch):
     state = make_lifespan_state(full=True)
     state["workspace"] = str(tmp_path)
     yield state
-    checker = state.get("lsp_checker")
-    if checker is not None:
-        checker.stop()
+    stop_all_checkers(state)
 
 
 @pytest.fixture

@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from rocq_mcp.interactive import run_query
-from tests.conftest import COQLSP_AVAILABLE, PET_AVAILABLE
+from tests.conftest import COQLSP_AVAILABLE, PET_AVAILABLE, inject_checker, stop_all_checkers
 
 _pet_only = pytest.mark.skipif(not PET_AVAILABLE, reason="pet not available")
 
@@ -24,9 +24,7 @@ def lifespan_state():
 
     state = _make_lifespan_state()
     yield state
-    checker = state.get("lsp_checker")
-    if checker is not None:
-        checker.stop()
+    stop_all_checkers(state)
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +219,7 @@ class TestQueryFileMode:
         # Mock _run_with_lsp to avoid needing actual coq-lsp
         import rocq_mcp.server as _server
 
-        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace):
+        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace, key=None):
             # We just want to verify no mutual-exclusivity error was returned
             # before reaching pet. Return a fake success.
             return {"success": True, "output": "mock"}
@@ -245,7 +243,7 @@ class TestQueryFileMode:
 
         import rocq_mcp.server as _server
 
-        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace):
+        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace, key=None):
             return {"success": True, "output": "mock"}
 
         monkeypatch.setattr(_server, "_run_with_lsp", mock_run_with_lsp)
@@ -265,7 +263,7 @@ class TestQueryFileMode:
         import rocq_mcp.server as _server
 
         # Mock _run_with_lsp to exercise the _do_lsp inner function
-        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace):
+        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace, key=None):
             # Call fn with a mock pet to trigger the path validation
             from unittest.mock import MagicMock
 
@@ -289,7 +287,7 @@ class TestQueryFileMode:
         """Non-existent file should return error."""
         import rocq_mcp.server as _server
 
-        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace):
+        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace, key=None):
             from unittest.mock import MagicMock
 
             mock_checker = MagicMock()
@@ -312,7 +310,7 @@ class TestQueryFileMode:
         """Absolute file path should be rejected by containment check."""
         import rocq_mcp.server as _server
 
-        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace):
+        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace, key=None):
             from unittest.mock import MagicMock
 
             mock_checker = MagicMock()
@@ -406,9 +404,7 @@ class TestQueryFileModeIntegration:
 
         state = _make_lifespan_state()
         yield state
-        checker = state.get("lsp_checker")
-        if checker is not None:
-            checker.stop()
+        stop_all_checkers(state)
 
     @pytest.mark.asyncio
     async def test_query_with_file(self, workspace, lifespan_state):
@@ -541,10 +537,8 @@ class TestQueryTimeoutRunQuery:
                     "timed_out": False,
                 }
 
-        state = {
-            "op_timeout": 30.0,
-            "lsp_checker": _FakeChecker(),
-        }
+        state = {"op_timeout": 30.0, "lsp_pool": {}, "lsp_meta": {}}
+        inject_checker(state, _FakeChecker(), workspace=str(tmp_path))
 
         kwargs = {"timeout": timeout_arg} if timeout_arg is not None else {}
         result = await run_query(
@@ -677,9 +671,7 @@ class TestLspWarningSeverity:
     def lifespan_state(self):
         state = _make_lifespan_state()
         yield state
-        checker = state.get("lsp_checker")
-        if checker is not None:
-            checker.stop()
+        stop_all_checkers(state)
 
     @pytest.mark.asyncio
     async def test_include_warnings_true_surfaces_warning(

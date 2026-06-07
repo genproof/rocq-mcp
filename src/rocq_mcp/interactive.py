@@ -416,8 +416,14 @@ async def run_query(
             max_results=max_results,
         )
 
+    # File / position mode get a per-file session (parallel with other
+    # files); preamble mode shares the per-workspace scratch session.
     return await _server._run_with_lsp(
-        _do_lsp, lifespan_state, "rocq_query", workspace=workspace
+        _do_lsp,
+        lifespan_state,
+        "rocq_query",
+        workspace=workspace,
+        key=_server._session_key(workspace, file or None),
     )
 
 
@@ -833,6 +839,7 @@ async def _fetch_available_in_file(
             lifespan_state,
             tool,
             workspace=workspace,
+            key=_server._session_key(workspace, file),
         )
     except Exception:
         return _AvailableInFile([], False, 0)
@@ -886,6 +893,7 @@ async def run_toc(
         lifespan_state,
         "rocq_toc",
         workspace=workspace,
+        key=_server._session_key(workspace, file),
     )
 
 
@@ -1136,7 +1144,11 @@ async def run_get_state(
         }
 
     return await _server._run_with_lsp(
-        _do, lifespan_state, "rocq_get_state", workspace=workspace
+        _do,
+        lifespan_state,
+        "rocq_get_state",
+        workspace=workspace,
+        key=_server._session_key(workspace, file),
     )
 
 
@@ -1212,7 +1224,11 @@ async def run_step(
         return result
 
     return await _server._run_with_lsp(
-        _do, lifespan_state, "rocq_step", workspace=workspace
+        _do,
+        lifespan_state,
+        "rocq_step",
+        workspace=workspace,
+        key=_server._session_key(workspace, file),
     )
 
 
@@ -1309,7 +1325,11 @@ async def run_step_multi(
         }
 
     return await _server._run_with_lsp(
-        _do, lifespan_state, "rocq_step_multi", workspace=workspace
+        _do,
+        lifespan_state,
+        "rocq_step_multi",
+        workspace=workspace,
+        key=_server._session_key(workspace, file),
     )
 
 

@@ -52,7 +52,7 @@ def _patch_run_with_lsp(monkeypatch):
 
     mock_checker = MockChecker()
 
-    async def mock_run_with_lsp(fn, lifespan_state, label, *, workspace):
+    async def mock_run_with_lsp(fn, lifespan_state, label, *, workspace, key=None):
         return fn(mock_checker)
 
     monkeypatch.setattr(_server, "_run_with_lsp", mock_run_with_lsp)

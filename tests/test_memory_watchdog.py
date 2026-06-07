@@ -23,8 +23,11 @@ import rocq_mcp.server as _server
 
 from tests.conftest import (
     FakePsutilProcess as _FakePsutilProcess,
+    inject_checker,
     make_lifespan_state,
     patch_psutil_rss as _patch_psutil_rss,
+    pool_checker,
+    session_meta,
 )
 
 
@@ -64,7 +67,7 @@ class TestWatchdogCoroutine:
         """Threshold breach -> mem_event set + main task cancelled."""
         _patch_psutil_rss(monkeypatch, 500)
 
-        lifespan_state = {"lsp_checker": _FakeLspChecker()}
+        checker = _FakeLspChecker()
         event = asyncio.Event()
 
         async def long_running():
@@ -76,7 +79,7 @@ class TestWatchdogCoroutine:
         main_task = asyncio.create_task(long_running())
         watch_task = asyncio.create_task(
             _server._memory_watchdog(
-                lifespan_state, max_rss_mb=100, main_task=main_task, event=event
+                100, main_task, event, get_process=lambda: checker._process
             )
         )
         # Wait for the watchdog to do its job.
@@ -92,7 +95,7 @@ class TestWatchdogCoroutine:
         """Watchdog notices main_task finished and exits cleanly."""
         _patch_psutil_rss(monkeypatch, 1)
 
-        lifespan_state = {"lsp_checker": _FakeLspChecker()}
+        checker = _FakeLspChecker()
         event = asyncio.Event()
 
         async def quick():
@@ -102,7 +105,7 @@ class TestWatchdogCoroutine:
         await main_task  # ensure it's done
         watch_task = asyncio.create_task(
             _server._memory_watchdog(
-                lifespan_state, max_rss_mb=100, main_task=main_task, event=event
+                100, main_task, event, get_process=lambda: checker._process
             )
         )
         await watch_task  # should exit promptly
@@ -113,7 +116,7 @@ class TestWatchdogCoroutine:
         """External cancel of the watchdog returns silently."""
         _patch_psutil_rss(monkeypatch, 1)
 
-        lifespan_state = {"lsp_checker": _FakeLspChecker()}
+        checker = _FakeLspChecker()
         event = asyncio.Event()
 
         async def long_running():
@@ -122,7 +125,7 @@ class TestWatchdogCoroutine:
         main_task = asyncio.create_task(long_running())
         watch_task = asyncio.create_task(
             _server._memory_watchdog(
-                lifespan_state, max_rss_mb=100_000, main_task=main_task, event=event
+                100_000, main_task, event, get_process=lambda: checker._process
             )
         )
         await asyncio.sleep(0.05)  # let it sample once
@@ -194,7 +197,7 @@ class TestLspMemoryWatchdogBreach:
         ls = make_lifespan_state(full=True)
         ls["workspace"] = str(tmp_path)
         checker = _mock_lsp_checker()
-        ls["lsp_checker"] = checker
+        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
 
         ctx = _MockLspContext(ls)
         result = await rocq_compile_lsp(
@@ -206,11 +209,13 @@ class TestLspMemoryWatchdogBreach:
         assert result["lsp_restarted"] is True
         assert "coq-lsp RSS exceeded" in result["error"]
         assert "100 MB" in result["error"]
-        # _invalidate_lsp was called -> checker.stop() fired and
-        # lifespan_state["lsp_checker"] cleared so the next call respawns.
+        # _invalidate_lsp was called -> checker.stop() fired and the
+        # session was dropped from the pool so the next call respawns it.
         assert checker.stop.called
-        assert ls["lsp_checker"] is None
-        assert ls["lsp_generation"] == 1
+        assert pool_checker(ls, workspace=str(tmp_path), file=str(vfile)) is None
+        assert session_meta(ls, workspace=str(tmp_path), file=str(vfile))[
+            "generation"
+        ] == 1
         # Recent-errors deque records this under memory_exhausted.
         assert any(
             e.get("reason") == "memory_exhausted"
@@ -236,7 +241,7 @@ class TestLspMemoryWatchdogBreach:
         checker.check_file.side_effect = lambda *a, **kw: {
             "success": True, "errors": [], "warnings": [], "check_time_ms": 1,
         }
-        ls["lsp_checker"] = checker
+        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
 
         ctx = _MockLspContext(ls)
         result = await rocq_compile_lsp(
@@ -247,8 +252,10 @@ class TestLspMemoryWatchdogBreach:
         assert "lsp_restarted" not in result
         assert "reason" not in result or result["reason"] != "memory_exhausted"
         # Checker was reused, not replaced.
-        assert ls["lsp_checker"] is checker
-        assert ls["lsp_generation"] == 0
+        assert pool_checker(ls, workspace=str(tmp_path), file=str(vfile)) is checker
+        assert session_meta(ls, workspace=str(tmp_path), file=str(vfile))[
+            "generation"
+        ] == 0
         assert not checker.stop.called
 
     @pytest.mark.asyncio
@@ -270,11 +277,13 @@ class TestLspMemoryWatchdogBreach:
             time.sleep(0.1)
             or {"success": True, "errors": [], "warnings": [], "check_time_ms": 100}
         )
-        ls["lsp_checker"] = checker
+        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
 
         ctx = _MockLspContext(ls)
         await rocq_compile_lsp(file=str(vfile), workspace=str(tmp_path), ctx=ctx)
-        assert ls["peak_lsp_rss_mb"] >= 333.0
+        assert session_meta(ls, workspace=str(tmp_path), file=str(vfile))[
+            "peak_rss_mb"
+        ] >= 333.0
 
 
 class TestLspSoftThresholdTrim:
@@ -308,7 +317,7 @@ class TestLspSoftThresholdTrim:
         checker.check_file.side_effect = lambda *a, **kw: {
             "success": True, "errors": [], "warnings": [], "check_time_ms": 1,
         }
-        ls["lsp_checker"] = checker
+        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
 
         ctx = _MockLspContext(ls)
         result = await rocq_compile_lsp(
@@ -317,10 +326,12 @@ class TestLspSoftThresholdTrim:
 
         assert result["success"] is True
         assert checker.trim_caches.call_count == 1
-        assert ls.get("lsp_trim_count", 0) == 1
+        assert session_meta(ls, workspace=str(tmp_path), file=str(vfile))[
+            "trim_count"
+        ] == 1
         # Soft trim must NOT kill coq-lsp (that's the hard cap's job).
         assert not checker.stop.called
-        assert ls["lsp_checker"] is checker
+        assert pool_checker(ls, workspace=str(tmp_path), file=str(vfile)) is checker
 
     @pytest.mark.asyncio
     async def test_low_rss_does_not_trigger_trim(self, tmp_path, monkeypatch):
@@ -340,13 +351,15 @@ class TestLspSoftThresholdTrim:
         checker.check_file.side_effect = lambda *a, **kw: {
             "success": True, "errors": [], "warnings": [], "check_time_ms": 1,
         }
-        ls["lsp_checker"] = checker
+        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
 
         ctx = _MockLspContext(ls)
         await rocq_compile_lsp(file=str(vfile), workspace=str(tmp_path), ctx=ctx)
 
         assert not checker.trim_caches.called
-        assert ls.get("lsp_trim_count", 0) == 0
+        assert session_meta(ls, workspace=str(tmp_path), file=str(vfile)).get(
+            "trim_count", 0
+        ) == 0
 
     @pytest.mark.asyncio
     async def test_trim_threshold_disabled_when_zero(self, tmp_path, monkeypatch):
@@ -366,7 +379,7 @@ class TestLspSoftThresholdTrim:
         checker.check_file.side_effect = lambda *a, **kw: {
             "success": True, "errors": [], "warnings": [], "check_time_ms": 1,
         }
-        ls["lsp_checker"] = checker
+        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
 
         ctx = _MockLspContext(ls)
         await rocq_compile_lsp(file=str(vfile), workspace=str(tmp_path), ctx=ctx)
@@ -409,7 +422,7 @@ class TestRocqCompileLspInfoFilter:
             }],
             "check_time_ms": 1,
         }
-        ls["lsp_checker"] = checker
+        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
 
         ctx = _MockLspContext(ls)
         result = await rocq_compile_lsp(
@@ -448,7 +461,7 @@ class TestRocqCompileLspInfoFilter:
             "info": list(expected_info),
             "check_time_ms": 1,
         }
-        ls["lsp_checker"] = checker
+        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
 
         ctx = _MockLspContext(ls)
         result = await rocq_compile_lsp(

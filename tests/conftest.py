@@ -208,16 +208,23 @@ def make_lifespan_state(op_timeout: float = 30.0, *, full: bool = False) -> dict
     """Build a lifespan_state dict for tests.
 
     With *full=False* (default), returns the minimal subset the coq-lsp
-    tools read (``op_timeout`` op-timeout default + ``lsp_checker``).
+    tools read (``op_timeout`` op-timeout default + the ``lsp_pool`` /
+    ``lsp_meta`` session pool).
 
     With *full=True*, returns the complete schema produced by
-    ``app_lifespan`` in production: the coq-lsp bookkeeping fields and
-    the ``recent_errors`` ring buffer.  Use this for tests that exercise
+    ``app_lifespan`` in production: the coq-lsp session pool and the
+    ``recent_errors`` ring buffer.  Use this for tests that exercise
     ``rocq_diag`` or the memory watchdog.
+
+    rocq-mcp runs one coq-lsp subprocess per file, keyed by
+    ``server._session_key(workspace, file)``; use :func:`inject_checker`
+    / :func:`pool_checker` to place / read a (mock) checker under the
+    right key.
     """
     state: dict = {
         "op_timeout": op_timeout,
-        "lsp_checker": None,
+        "lsp_pool": {},
+        "lsp_meta": {},
     }
     if full:
         import collections
@@ -227,13 +234,53 @@ def make_lifespan_state(op_timeout: float = 30.0, *, full: bool = False) -> dict
         state.update(
             {
                 "workspace": "/tmp",
-                "peak_lsp_rss_mb": 0.0,
-                "lsp_generation": 0,
-                "lsp_trim_count": 0,
                 "recent_errors": collections.deque(maxlen=_server._RECENT_ERRORS_MAX),
             }
         )
     return state
+
+
+def inject_checker(state: dict, checker, *, workspace: str, file=None):
+    """Place *checker* in the session pool under the key a tool will derive.
+
+    Mirrors what ``_run_with_lsp`` looks up: ``_session_key(workspace,
+    file)``.  Also seeds the per-session ``lsp_meta`` stats so the tool's
+    peak / trim bookkeeping has somewhere to write.  Returns the key.
+    """
+    import rocq_mcp.server as _server
+
+    key = _server._session_key(workspace, file)
+    state.setdefault("lsp_pool", {})[key] = checker
+    state.setdefault("lsp_meta", {}).setdefault(
+        key, {"peak_rss_mb": 0.0, "trim_count": 0, "generation": 0}
+    )
+    return key
+
+
+def stop_all_checkers(state: dict) -> None:
+    """Stop every coq-lsp checker in the session pool (test teardown)."""
+    for checker in list(state.get("lsp_pool", {}).values()):
+        if checker is not None:
+            try:
+                checker.stop()
+            except Exception:
+                pass
+
+
+def pool_checker(state: dict, *, workspace: str, file=None):
+    """Return the pooled checker a tool would use for (workspace, file)."""
+    import rocq_mcp.server as _server
+
+    key = _server._session_key(workspace, file)
+    return state.get("lsp_pool", {}).get(key)
+
+
+def session_meta(state: dict, *, workspace: str, file=None) -> dict:
+    """Return the per-session stats dict for (workspace, file)."""
+    import rocq_mcp.server as _server
+
+    key = _server._session_key(workspace, file)
+    return state.get("lsp_meta", {}).get(key, {})
 
 
 class _FakeMemoryInfo:

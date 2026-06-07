@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import COQC_AVAILABLE, PET_AVAILABLE, _MockContext
+from tests.conftest import COQC_AVAILABLE, PET_AVAILABLE, _MockContext, stop_all_checkers
 
 
 def _call_rocq_compile(**kwargs):
@@ -336,9 +336,7 @@ class TestSharedDefsVerifyWorkflow:
 
         state = {"op_timeout": 30.0}
         yield state
-        checker = state.get("lsp_checker")
-        if checker is not None:
-            checker.stop()
+        stop_all_checkers(state)
 
     async def test_phase2_verify_with_inductive(self, lifespan_state, workspace):
         """Inductive type in problem triggers Phase 2 and succeeds."""

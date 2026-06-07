@@ -49,10 +49,13 @@ class TestDiagSchema:
         }
         assert snap["success"] is True
         assert set(snap["lsp"].keys()) == {
+            "count",
             "pid",
             "generation",
             "trim_count",
+            "sessions",
         }
+        assert isinstance(snap["lsp"]["sessions"], list)
         assert set(snap["memory"].keys()) == {
             "lsp_rss_mb",
             "peak_lsp_rss_mb",

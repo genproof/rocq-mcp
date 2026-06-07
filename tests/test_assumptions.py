@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from rocq_mcp.interactive import run_assumptions
-from tests.conftest import PET_AVAILABLE
+from tests.conftest import PET_AVAILABLE, stop_all_checkers
 
 _pet_only = pytest.mark.skipif(not PET_AVAILABLE, reason="pet not available")
 
@@ -365,9 +365,7 @@ class TestAssumptionsFileModeIntegration:
 
         state = _make_lifespan_state()
         yield state
-        checker = state.get("lsp_checker")
-        if checker is not None:
-            checker.stop()
+        stop_all_checkers(state)
 
     @pytest.mark.asyncio
     async def test_closed_theorem_via_file(self, workspace, lifespan_state):
