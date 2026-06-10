@@ -51,11 +51,12 @@ These are **stateless and position-addressed**: every proof state is referred to
 | **`rocq_query`** | Search the Rocq environment — find lemmas, check types, inspect definitions. Three context modes: **preamble** (import commands as a string), **file** (a `.v` file path whose definitions are in scope), or **position** (`file` + `line` + `character` to query at a point in a proof, where local hypotheses are visible). Optional `max_results` limits output. Does not modify anything. |
 | **`rocq_assumptions`** | List the axioms a theorem depends on. Takes a required `file` parameter (path to the `.v` file where the theorem is defined) to set up the full environment. Returns `assumptions: list[str]` of `"name : type"` pairs from `Print Assumptions` (empty when the theorem is closed under the global context) plus the full `raw_output`. No classification — pure introspection. Use `rocq_verify` for a sandboxed trust decision. |
 | **`rocq_toc`** | Get the structure of a `.v` file: all definitions, lemmas, theorems, and sections as an outline. Does not require a session. |
+| **`rocq_extract`** | Split the goal at a `(file, line, character)` position (0-indexed, on the goal's tactic) into a standalone `<name>_goal.v` (the fully-closed goal as `Definition <name>_Goal`) and `<name>_proof.v` (a `Lemma <name>_proof` skeleton whose proof state equals the state at the extraction point). Re-running rewrites `<name>_goal.v` and refreshes only the first `intros` of an existing `<name>_proof.v`. By default also wires a `confirm_extraction "<hash>"` staleness tripwire into the source (`annotate=false` leaves it untouched). Drives `coq/extract` on the **live session**, so a warm file replies instantly; refuses if any sentence before the point is broken. (The CLI equivalent is rocq-lsp's `tools/extract.py`.) |
 | **`rocq_diag`** | Operational diagnostics: coq-lsp pid / memory headroom and recent errors. Use before a long `vm_compute` to check memory headroom, or after a `memory_exhausted` failure. |
 
 > **Live file:** the interactive tools read the file on disk at call time (coq-lsp re-syncs on each call), so there is no session to go stale — edit the file and re-query. `rocq_step` / `rocq_step_multi` never modify the file; they show what a tactic block *would* do.
 
-> **Workspace auto-detection:** When a file-accepting tool (`rocq_compile_file`, `rocq_compile_lsp`, `rocq_query`, `rocq_assumptions`, `rocq_toc`, `rocq_get_state`, `rocq_step`, `rocq_step_multi`) is called without an explicit `workspace`, the server walks up from the file's directory looking for `_RocqProject`, `_CoqProject`, or `dune-project` markers and uses the directory of the innermost match. Falls back to `ROCQ_WORKSPACE` if no marker is found.
+> **Workspace auto-detection:** When a file-accepting tool (`rocq_compile_file`, `rocq_compile_lsp`, `rocq_query`, `rocq_assumptions`, `rocq_toc`, `rocq_get_state`, `rocq_step`, `rocq_step_multi`, `rocq_extract`) is called without an explicit `workspace`, the server walks up from the file's directory looking for `_RocqProject`, `_CoqProject`, or `dune-project` markers and uses the directory of the innermost match. Falls back to `ROCQ_WORKSPACE` if no marker is found.
 
 ## Recommended usage patterns
 
@@ -108,6 +109,19 @@ Every failure response carries `{success: False, error: str, reason: str}` so an
 
 When a tool returns `lsp_restarted: True`, call `rocq_diag` for memory headroom and recent-error history.
 
+## Warm-start cache (`.vof`)
+
+Checking a large file (e.g. a heavy VST proof) can take minutes. To avoid paying that cost again every time a coq-lsp process is (re)started, the server can persist a file's fully-checked state and reload it instead of re-elaborating.
+
+After a full file check (`rocq_compile_lsp` without a position, or any tool that checks the whole file) completes, the document's coq-lsp snapshot is written next to the source as `<file>.vof`, with a sidecar `<file>.vof.meta` recording a fingerprint: the file's content hash, a fingerprint of its dependency `.vo` files, and the coq-lsp toolchain id. On the next *fresh* session for that file — after an MCP restart, a memory-watchdog eviction, or `rocq_restart` — the interactive tools reload the snapshot via `coq/loadVof` (no re-check) as long as that fingerprint still matches. Typical reload is a few seconds versus a multi-minute cold check.
+
+It is a latency win, not a memory one (the reload restores the full state). It helps only when the file **and its dependencies** are unchanged; editing the file or rebuilding a dependency `.vo` invalidates the snapshot, and the next full check re-saves a fresh one.
+
+**Requirements & notes:**
+- Requires a coq-lsp build exposing the `coq/saveVof` / `coq/loadVof` methods (the [`genproof/rocq-lsp`](https://github.com/genproof/rocq-lsp) fork). On a stock coq-lsp the save silently no-ops and every other tool still works.
+- `.vof` / `.vof.meta` are toolchain-locked binary caches (invalid after any coq-lsp / Coq / plugin rebuild) — add `*.vof` and `*.vof.meta` to `.gitignore`; never commit them.
+- Toggle with `ROCQ_VOF_CACHE` (default on) — see Environment Variables.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -119,6 +133,8 @@ When a tool returns `lsp_restarted: True`, call `rocq_diag` for memory headroom 
 | `ROCQ_QUERY_TIMEOUT_CAP` | `300` | Cap (seconds) on the per-call `timeout` parameter of `rocq_query`; larger values are clamped and the response carries `clamped_timeout: <cap>` |
 | `ROCQ_MAX_LSP_RSS_MB` | `min(50% of system RAM, 16384)` | Maximum coq-lsp subprocess RSS (MB). On breach the call aborts; response includes `reason: "memory_exhausted"` and `lsp_restarted: True`. |
 | `ROCQ_LSP_TRIM_RSS_MB` | `½ × ROCQ_MAX_LSP_RSS_MB` | Soft cap: above it, a successful check sends `coq/trimCaches` to free coq-lsp's memo tables without killing it. Set to `0` to disable. |
+| `ROCQ_VOF_CACHE` | `1` | Enable the [`.vof` warm-start cache](#warm-start-cache-vof). After a full file check the document's coq-lsp state is saved as `<file>.vof` (+ `<file>.vof.meta`) and a later *fresh* session reloads it via `coq/loadVof` instead of re-checking. Set to `0` to disable (no `.vof` written or read). Requires the `coq/saveVof` / `coq/loadVof` methods (the `genproof/rocq-lsp` fork); on stock coq-lsp saving silently no-ops. |
+| `ROCQ_VOF_SAVE_TIMEOUT` | `300` | Timeout (seconds) for the `coq/saveVof` request that writes a `.vof` snapshot — generous because marshaling a heavy document is slow (~70 s for a large VST file). |
 | `ROCQ_COQC_BINARY` | `coqc` | Path to the `coqc` binary |
 | `ROCQ_MAX_SOURCE_SIZE` | `1000000` | Maximum source size in bytes |
 | `ROCQ_MAX_GOAL_CHARS` | `8000` | Max characters per rendered term (each hypothesis type/def and each goal conclusion) in the structured goal output of `rocq_get_state` / `rocq_step` / `rocq_step_multi`; longer terms are truncated with a `... (truncated, N chars)` marker |
