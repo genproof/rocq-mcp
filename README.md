@@ -28,7 +28,7 @@ uv pip install -e ".[dev]"
 
 ## Tools
 
-The server exposes ten MCP tools:
+The server exposes thirteen MCP tools:
 
 ### Compilation tools (coqc-based)
 
@@ -53,6 +53,7 @@ These are **stateless and position-addressed**: every proof state is referred to
 | **`rocq_toc`** | Get the structure of a `.v` file: all definitions, lemmas, theorems, and sections as an outline. Does not require a session. |
 | **`rocq_extract`** | Split the goal at a `(file, line, character)` position (0-indexed, on the goal's tactic) into a standalone `<name>_goal.v` (the fully-closed goal as `Definition <name>_Goal`) and `<name>_proof.v` (a `Lemma <name>_proof` skeleton whose proof state equals the state at the extraction point). Re-running rewrites `<name>_goal.v` and refreshes only the first `intros` of an existing `<name>_proof.v`. By default also wires a `confirm_extraction "<hash>"` staleness tripwire into the source (`annotate=false` leaves it untouched). Drives `coq/extract` on the **live session**, so a warm file replies instantly; refuses if any sentence before the point is broken. (The CLI equivalent is rocq-lsp's `tools/extract.py`.) |
 | **`rocq_diag`** | Operational diagnostics: coq-lsp pid / memory headroom and recent errors. Use before a long `vm_compute` to check memory headroom, or after a `memory_exhausted` failure. |
+| **`rocq_restart`** | Restart the underlying coq-lsp subprocess(es). The server keeps one coq-lsp process **per file**; pass `file` to restart only that file's session (e.g. after rebuilding a dependency `.vo`, or when a tool reported a stale-import warning), `workspace` for that workspace's shared session, or neither to restart **all** sessions. Restart is lazy — the next call respawns a fresh process that reloads `.vo` files from disk (and any still-valid [`.vof`](#warm-start-cache-vof) snapshot). |
 
 > **Live file:** the interactive tools read the file on disk at call time (coq-lsp re-syncs on each call), so there is no session to go stale — edit the file and re-query. `rocq_step` / `rocq_step_multi` never modify the file; they show what a tactic block *would* do.
 
