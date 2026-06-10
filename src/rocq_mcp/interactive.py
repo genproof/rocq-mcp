@@ -1152,6 +1152,169 @@ async def run_get_state(
     )
 
 
+# ---------------------------------------------------------------------------
+# Tool: rocq_extract (coq/extract via the live session)
+# ---------------------------------------------------------------------------
+#
+# Mirrors rocq-lsp's tools/extract.py, but drives the already-running coq-lsp
+# session for the file instead of spawning a fresh subprocess: a warm session
+# replies the moment the check reaches the point (often instantly).  The server
+# (controller/rq_extract.ml) writes <name>_goal.v / <name>_proof.v itself; the
+# only client-side work is the source annotation below.
+
+_CONFIRM_ML = "coq-lsp.confirm-extraction"
+_CONFIRM_PAT = re.compile(r'(confirm_extraction\s+")[0-9a-f]+(")')
+# A Coq qualified identifier suffix is fine as an extraction name.
+_VALID_EXTRACT_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def _annotate_extraction_source(
+    resolved: str,
+    idx: int,
+    name: str,
+    proof_module: str,
+    apply_with: str,
+    hash_: str,
+) -> str | None:
+    """Wire the ``confirm_extraction "<hash>"`` tripwire at the extraction site.
+
+    *idx* is the 0-indexed line of the goal's tactic (the position passed to
+    ``rocq_extract``).  Re-extraction (the line, or the one just below it,
+    already holds a ``confirm_extraction``): refresh the hash there in place.
+    Fresh extraction: replace that tactic with an active
+    ``confirm_extraction "<hash>"`` (it admits the goal and guards staleness)
+    and insert the explanatory comment block above it.  Returns
+    ``"updated"`` / ``"unchanged"`` / ``"inserted"`` / ``None`` (out of range).
+    Kept byte-for-byte in step with ``tools/extract.py:annotate_source``.
+    """
+    try:
+        text = Path(resolved).read_text()
+    except (OSError, PermissionError):
+        return None
+    lines = text.split("\n")
+    if not (0 <= idx < len(lines)):
+        return None
+    # On (or right before) a confirm_extraction line: refresh the hash only.
+    for j in (idx, idx + 1):
+        if 0 <= j < len(lines) and "confirm_extraction" in lines[j]:
+            new = _CONFIRM_PAT.sub(r"\g<1>" + hash_ + r"\g<2>", lines[j])
+            if new != lines[j]:
+                lines[j] = new
+                Path(resolved).write_text("\n".join(lines))
+                return "updated"
+            return "unchanged"
+    # Fresh site.
+    src = lines[idx]
+    indent = src[: len(src) - len(src.lstrip())]
+    block = [
+        f"{indent}(* --- coq-lsp extract: this goal is now extracted to {name}_proof.v --- *)",
+        f"{indent}(* `confirm_extraction` tactic is here to ensure the extracted goal is up to date. It admits the goal. *)",
+        f"{indent}(* To wire it add: *)",
+        f'{indent}(* 1. near the top of this file:  Declare ML Module "{_CONFIRM_ML}".',
+        f"{indent}                       Require Import {proof_module}. *)",
+        f"{indent}(* 2. replace the `confirm_extraction` tactic with *)",
+        f"{indent}(* {apply_with}; try eassumption. *)",
+    ]
+    lines[idx] = f'{indent}confirm_extraction "{hash_}".'
+    lines[idx:idx] = block
+    Path(resolved).write_text("\n".join(lines))
+    return "inserted"
+
+
+async def run_extract(
+    file: str,
+    line: int,
+    character: int,
+    name: str,
+    workspace: str,
+    lifespan_state: dict[str, Any],
+    *,
+    annotate: bool = True,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Extract the goal at a position into ``<name>_goal.v`` / ``<name>_proof.v``.
+
+    Drives ``coq/extract`` on the live session for *file* (0-indexed
+    *line*/*character* on the goal's tactic, the same address the other
+    position tools use).  The server writes both files next to *file*;
+    when *annotate* (default), the source is also edited to drop in the
+    ``confirm_extraction "<hash>"`` tripwire (and the explanatory block on
+    a fresh site, or just a hash refresh on re-extraction).  Refuses with
+    an error when any sentence before the point is broken.
+    """
+    err = _validate_position(line, character, lifespan_state, "rocq_extract")
+    if err:
+        return err
+    if not name or not _VALID_EXTRACT_NAME.match(name):
+        return _server._fail(
+            lifespan_state,
+            "rocq_extract",
+            "name must match [A-Za-z][A-Za-z0-9_]* (it becomes the "
+            f"<name>_goal / <name>_proof module names); got {name!r}.",
+            "validation",
+        )
+    try:
+        resolved = _server._resolve_file_in_workspace(file, workspace)
+    except (ValueError, FileNotFoundError) as e:
+        return _server._fail(lifespan_state, "rocq_extract", str(e))
+
+    # Extraction needs the document checked up to the point, which on a cold
+    # session can take a while; default generous, allow override.
+    _t = float(timeout) if timeout and timeout > 0 else 600.0
+
+    def _do(checker: Any) -> dict[str, Any]:
+        res = checker.extract(resolved, line, character, name, timeout=_t)
+        if isinstance(res, dict) and "_lsp_error" in res:
+            lerr = res["_lsp_error"]
+            if res.get("_lsp_timeout"):
+                return _server._fail(
+                    lifespan_state,
+                    "rocq_extract",
+                    f"Timed out after {_t:.0f}s reaching the extraction point.",
+                    "timeout",
+                )
+            # The server refuses upstream-broken proofs and other errors here.
+            msg = lerr.get("message") if isinstance(lerr, dict) else str(lerr)
+            return _server._fail(lifespan_state, "rocq_extract", str(msg), "crashed")
+        if not isinstance(res, dict):
+            return _server._fail(
+                lifespan_state, "rocq_extract", f"unexpected reply: {res!r}", "crashed"
+            )
+        out: dict[str, Any] = {
+            "success": True,
+            "file": file,
+            "line": line,
+            "character": character,
+            **res,
+        }
+        if annotate:
+            gm = res.get("goal_module", "")
+            proof_module = (
+                gm[: -len("_goal")] + "_proof"
+                if gm.endswith("_goal")
+                else name + "_proof"
+            )
+            apply_with = res.get("apply_with", "eapply " + name + "_proof")
+            outcome = _annotate_extraction_source(
+                resolved,
+                line,
+                name,
+                proof_module,
+                apply_with,
+                res.get("hash", ""),
+            )
+            out["annotation"] = outcome or "skipped"
+        return out
+
+    return await _server._run_with_lsp(
+        _do,
+        lifespan_state,
+        "rocq_extract",
+        workspace=workspace,
+        key=_server._session_key(workspace, file),
+    )
+
+
 async def run_step(
     file: str,
     line: int,

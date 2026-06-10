@@ -771,6 +771,62 @@ class LspChecker:
             return self._request("proof/goals", params, timeout=timeout)
 
     # ------------------------------------------------------------------
+    # coq/extract (split an open goal into <name>_goal.v / <name>_proof.v)
+    # ------------------------------------------------------------------
+
+    def extract(
+        self,
+        file_path: str,
+        line: int,
+        character: int,
+        name: str,
+        *,
+        content: str | None = None,
+        timeout: float = _DEFAULT_REQUEST_TIMEOUT,
+    ) -> Any:
+        """Run ``coq/extract`` at a point in an open proof.
+
+        Splits the goal the sentence at *(line, character)* operates on
+        into a standalone ``<name>_goal.v`` (the closed goal as
+        ``Definition <name>_Goal``) and ``<name>_proof.v`` (a
+        ``Lemma <name>_proof`` skeleton).  Both files are written by the
+        **server**, next to *file_path*; this call only triggers it and
+        returns the result.  Re-running rewrites ``<name>_goal.v`` and
+        refreshes the first ``intros`` of an existing ``<name>_proof.v``.
+
+        Like ``proof/goals`` this is a *postponed* position request:
+        coq-lsp answers the moment the check reaches the point, so a warm
+        session that has already checked past it replies immediately.  The
+        server refuses (an error reply) when any sentence *before* the
+        point is broken — the extracted goal would be unsound.
+
+        Returns the raw result dict (keys include ``goal_file``,
+        ``proof_file``, ``goal_module``, ``apply_with``, ``hash``,
+        ``confirm_with``, ``created_proof``, ``updated_proof_intros``,
+        ``n_binders``) or a ``{"_lsp_error": ...}`` dict on transport
+        failure / timeout / the server's upstream-error refusal.
+        """
+        with self._lock:
+            self._ensure_started()
+            resolved = str(Path(file_path).resolve())
+            if content is None:
+                try:
+                    content = Path(resolved).read_text()
+                except (OSError, PermissionError) as e:
+                    return {"_lsp_error": str(e)}
+            uri = Path(resolved).as_uri()
+            self._ensure_open(uri, content, file_path=resolved)
+            return self._request(
+                "coq/extract",
+                {
+                    "textDocument": {"uri": uri},
+                    "position": {"line": line, "character": character},
+                    "name": name,
+                },
+                timeout=timeout,
+            )
+
+    # ------------------------------------------------------------------
     # textDocument/documentSymbol (file outline / TOC)
     # ------------------------------------------------------------------
 
