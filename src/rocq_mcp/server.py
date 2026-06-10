@@ -626,7 +626,9 @@ def _get_or_create_checker(
     if checker is None or not checker._is_alive():
         checker = LspChecker(workspace=workspace)
         pool[key] = checker
-        _meta_for(lifespan_state, key)
+        # Stamp the (re)spawn time so stale-import detection can tell when a
+        # dependency .vo was rebuilt after this session loaded it.
+        _meta_for(lifespan_state, key)["spawned_at"] = time.time()
     return checker
 
 
@@ -797,6 +799,40 @@ def _checker_process(checker: Any) -> Any:
     if checker is None:
         return None
     return getattr(checker, "_process", None)
+
+
+def _attach_stale_warning(
+    result: Any,
+    file: str,
+    workspace: str,
+    lifespan_state: dict[str, Any] | None,
+) -> Any:
+    """Add ``result["stale_warning"]`` when *file*'s compiled imports are stale.
+
+    coq-lsp loads ``Require``d libraries from their ``.vo`` and never
+    rebuilds or staleness-checks them; this surfaces that risk to the
+    agent.  Best-effort: only mutates *result* when it is a dict, *file*
+    is set, and a warning is produced; never raises.  See
+    :mod:`rocq_mcp.staleness`.
+    """
+    if not isinstance(result, dict) or not file:
+        return result
+    try:
+        from rocq_mcp.staleness import stale_warning
+
+        started = None
+        if lifespan_state is not None:
+            key = _session_key(workspace, file)
+            started = (
+                lifespan_state.get("lsp_meta", {}).get(key, {}).get("spawned_at")
+            )
+        warning = stale_warning(file, workspace, session_started_at=started)
+        if warning:
+            result["stale_warning"] = warning
+    except Exception:
+        # Detection must never break a tool result.
+        pass
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1073,11 +1109,14 @@ async def rocq_compile_file(
             "validation",
         )
 
-    return run_compile_file(
+    result = run_compile_file(
         file=file,
         workspace=workspace,
         timeout=timeout,
         include_warnings=include_warnings,
+    )
+    return _attach_stale_warning(
+        result, file, workspace, ctx.lifespan_context if ctx else None
     )
 
 
@@ -1276,7 +1315,7 @@ async def rocq_query(
     )
     if clamped:
         result["clamped_timeout"] = ROCQ_QUERY_TIMEOUT_CAP
-    return result
+    return _attach_stale_warning(result, file, workspace, ctx.lifespan_context)
 
 
 # ---------------------------------------------------------------------------
@@ -1353,12 +1392,13 @@ async def rocq_assumptions(
             "error": "Internal error: no MCP context.",
         }
 
-    return await run_assumptions(
+    result = await run_assumptions(
         name=name,
         file=file,
         workspace=workspace,
         lifespan_state=ctx.lifespan_context,
     )
+    return _attach_stale_warning(result, file, workspace, ctx.lifespan_context)
 
 
 # ---------------------------------------------------------------------------
@@ -1405,11 +1445,12 @@ async def rocq_toc(
             "error": "Internal error: no MCP context.",
         }
 
-    return await run_toc(
+    result = await run_toc(
         file=file,
         workspace=workspace,
         lifespan_state=ctx.lifespan_context,
     )
+    return _attach_stale_warning(result, file, workspace, ctx.lifespan_context)
 
 
 # ---------------------------------------------------------------------------
@@ -1466,7 +1507,7 @@ async def rocq_get_state(
             "reason": "validation",
             "error": "Internal error: no MCP context.",
         }
-    return await run_get_state(
+    result = await run_get_state(
         file=file,
         line=line,
         character=character,
@@ -1475,6 +1516,7 @@ async def rocq_get_state(
         include_warnings=include_warnings,
         before=before,
     )
+    return _attach_stale_warning(result, file, workspace, ctx.lifespan_context)
 
 
 # ---------------------------------------------------------------------------
@@ -1534,7 +1576,7 @@ async def rocq_step(
             "error": "Internal error: no MCP context.",
         }
     _t = float(timeout) if timeout and timeout > 0 else None
-    return await run_step(
+    result = await run_step(
         file=file,
         line=line,
         character=character,
@@ -1545,6 +1587,7 @@ async def rocq_step(
         before=before,
         timeout=_t,
     )
+    return _attach_stale_warning(result, file, workspace, ctx.lifespan_context)
 
 
 # ---------------------------------------------------------------------------
@@ -1606,7 +1649,7 @@ async def rocq_step_multi(
             "error": "Internal error: no MCP context.",
         }
     _t = float(timeout) if timeout and timeout > 0 else None
-    return await run_step_multi(
+    result = await run_step_multi(
         file=file,
         line=line,
         character=character,
@@ -1617,6 +1660,7 @@ async def rocq_step_multi(
         before=before,
         timeout=_t,
     )
+    return _attach_stale_warning(result, file, workspace, ctx.lifespan_context)
 @mcp.tool
 async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
     """Operational diagnostics: coq-lsp health, memory headroom, recent errors.
@@ -1670,6 +1714,72 @@ async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
             "error": "Internal error: no MCP context.",
         }
     return _build_diag_snapshot(ctx.lifespan_context)
+
+
+# ---------------------------------------------------------------------------
+# Tool: rocq_restart
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+async def rocq_restart(
+    file: str = "",
+    workspace: str = "",
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Restart the underlying coq-lsp subprocess(es).
+
+    rocq-mcp keeps one long-lived coq-lsp process **per file** (a
+    *session*).  A session caches the compiled libraries it has loaded
+    (``Memo.Require``), so after you rebuild a dependency's ``.vo`` on
+    disk the warm process keeps serving the *old* library until it is
+    restarted.  Use this tool to force a fresh reload — e.g. after a
+    ``dune build`` / ``make``, or when a tool result carried a
+    ``stale_warning`` asking you to reload.
+
+    Scope:
+    - ``file`` set: restart only that file's session (recommended — does
+      not disturb other agents working in other files).
+    - ``workspace`` only: restart that workspace's shared scratch session
+      (used by preamble ``rocq_query``).
+    - neither: restart **all** sessions in the pool.  Note this affects
+      every file currently open, including other parallel agents.
+
+    Restart is lazy: the session is stopped and dropped now, and the
+    next tool call for it respawns a fresh coq-lsp that reloads ``.vo``
+    files from disk.
+
+    Returns ``{success, restarted: [<session keys>], count}``.
+    """
+    if ctx is None:
+        return {
+            "success": False,
+            "reason": "validation",
+            "error": "Internal error: no MCP context.",
+        }
+    lifespan_state = ctx.lifespan_context
+    pool = lifespan_state.get("lsp_pool", {})
+
+    if file:
+        ws = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
+        keys = [_session_key(ws, file)]
+    elif workspace:
+        keys = [_session_key(workspace)]
+    else:
+        keys = list(pool.keys())
+
+    # Only act on sessions that actually exist; report what was restarted.
+    targets = [k for k in keys if k in pool]
+
+    def _do_restart() -> None:
+        for k in targets:
+            _invalidate_lsp(lifespan_state, k)
+
+    # checker.stop() joins the reader thread (can take ~seconds); keep it
+    # off the event loop.
+    await asyncio.to_thread(_do_restart)
+
+    return {"success": True, "restarted": targets, "count": len(targets)}
 
 
 # ---------------------------------------------------------------------------
@@ -1801,7 +1911,7 @@ async def rocq_compile_lsp(
     if line is not None and result.get("reason") != "memory_exhausted":
         result["checked_through"] = {"line": line, "character": character}
 
-    return result
+    return _attach_stale_warning(result, file, workspace, lifespan_state)
 
 
 def _maybe_trim_lsp_caches(

@@ -271,6 +271,111 @@ class TestDiagAggregatesPool:
 
 
 # ---------------------------------------------------------------------------
+# rocq_restart
+# ---------------------------------------------------------------------------
+
+
+class TestRocqRestart:
+    def _ctx(self, ls):
+        return type("C", (), {"lifespan_context": ls})()
+
+    @pytest.mark.asyncio
+    async def test_restart_specific_file_only(self, monkeypatch, tmp_path):
+        from rocq_mcp.server import rocq_restart
+
+        ls = make_lifespan_state(full=True)
+        ka = _server._session_key(str(tmp_path), "a.v")
+        kb = _server._session_key(str(tmp_path), "b.v")
+        ca, cb = _live_mock_checker(1), _live_mock_checker(2)
+        ls["lsp_pool"] = {ka: ca, kb: cb}
+        ls["lsp_meta"] = {
+            ka: {"peak_rss_mb": 0.0, "trim_count": 0, "generation": 0},
+            kb: {"peak_rss_mb": 0.0, "trim_count": 0, "generation": 0},
+        }
+
+        result = await rocq_restart(
+            file="a.v", workspace=str(tmp_path), ctx=self._ctx(ls)
+        )
+
+        assert result["success"] is True
+        assert result["restarted"] == [ka]
+        assert result["count"] == 1
+        assert ca.stop.called  # dropped + stopped
+        assert ka not in ls["lsp_pool"]
+        # Sibling untouched.
+        assert ls["lsp_pool"][kb] is cb
+        assert not cb.stop.called
+
+    @pytest.mark.asyncio
+    async def test_restart_all_when_no_args(self, tmp_path):
+        from rocq_mcp.server import rocq_restart
+
+        ls = make_lifespan_state(full=True)
+        k1, k2 = "x", "y"
+        c1, c2 = _live_mock_checker(1), _live_mock_checker(2)
+        ls["lsp_pool"] = {k1: c1, k2: c2}
+        ls["lsp_meta"] = {
+            k1: {"peak_rss_mb": 0.0, "trim_count": 0, "generation": 0},
+            k2: {"peak_rss_mb": 0.0, "trim_count": 0, "generation": 0},
+        }
+
+        result = await rocq_restart(ctx=self._ctx(ls))
+
+        assert result["success"] is True
+        assert set(result["restarted"]) == {k1, k2}
+        assert result["count"] == 2
+        assert c1.stop.called and c2.stop.called
+        assert ls["lsp_pool"] == {}
+
+    @pytest.mark.asyncio
+    async def test_restart_unknown_session_is_noop(self, tmp_path):
+        from rocq_mcp.server import rocq_restart
+
+        ls = make_lifespan_state(full=True)
+        ls["lsp_pool"] = {}
+        result = await rocq_restart(
+            file="ghost.v", workspace=str(tmp_path), ctx=self._ctx(ls)
+        )
+        assert result["success"] is True
+        assert result["restarted"] == []
+        assert result["count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_restart_no_context(self):
+        from rocq_mcp.server import rocq_restart
+
+        result = await rocq_restart(ctx=None)
+        assert result["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_next_call_respawns_after_restart(self, monkeypatch):
+        """After restart the session is gone; the next _run_with_lsp respawns."""
+        from rocq_mcp.server import rocq_restart
+
+        class _Fake:
+            def __init__(self, workspace=""):
+                self._process = None
+
+            def _is_alive(self):
+                return True
+
+            def stop(self):
+                pass
+
+        monkeypatch.setattr("rocq_mcp.lsp_checker.LspChecker", _Fake)
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 1_000_000)
+        monkeypatch.setattr(_server, "ROCQ_LSP_TRIM_RSS_MB", 0)
+
+        ls = make_lifespan_state(full=True)
+        first = _server._get_or_create_checker(ls, "k", "/ws")
+        # Restart all sessions.
+        await rocq_restart(ctx=self._ctx(ls))
+        assert "k" not in ls["lsp_pool"]
+        second = _server._get_or_create_checker(ls, "k", "/ws")
+        assert second is not first  # respawned fresh
+
+
+# ---------------------------------------------------------------------------
 # End-to-end with a real coq-lsp
 # ---------------------------------------------------------------------------
 
