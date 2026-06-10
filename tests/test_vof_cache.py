@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import shutil
 import time
+from pathlib import Path
 
 import pytest
 
@@ -194,5 +195,142 @@ class TestLspCheckerVof:
             r = c.check_file(f, str(tmp_path), 0.0)
             assert r["success"] is True
             assert not (tmp_path / "Foo.vof").exists()
+        finally:
+            c.stop()
+
+
+# ---------------------------------------------------------------------------
+# Warm reload is fast, and the reloaded doc is fully usable (edits + new
+# tactics produce correct states)
+# ---------------------------------------------------------------------------
+
+# A file whose check is dominated by a vm_compute (naive Fibonacci over
+# binary N, n=38 ~ several seconds) so the cold elaboration and the warm
+# reload are clearly separable on the clock.
+_SLOW = (
+    "From Coq Require Import NArith.\n"
+    "Definition slow : bool := Eval vm_compute in N.even (\n"
+    "  (fix f (k:nat):N := match k with 0=>0%N|S m=>match m with 0=>1%N"
+    "|S j=>(f j+f m)%N end end) 38).\n"
+    "Theorem t : forall n:nat, slow = slow /\\ n = n.\n"
+    "Proof.\n"
+    "intros n.\n"
+    "Admitted.\n"
+)
+
+# A proof we can extend with real tactics after a warm reload.
+_COMM = (
+    "From Coq Require Import Arith.\n"  # line 0
+    "Theorem t : forall n m:nat, n + m = m + n.\n"  # line 1
+    "Proof.\n"  # line 2
+    "intros n m.\n"  # line 3
+    "Admitted.\n"  # line 4
+)
+
+
+@_lsp_only
+class TestVofWarmReload:
+    def _seed_vof(self, tmp_path, text):
+        """Write *text*, cold-check it once (writes the .vof), return path."""
+        from rocq_mcp.lsp_checker import LspChecker
+
+        (tmp_path / "_CoqProject").write_text("-R . Top\n")
+        f = tmp_path / "F.v"
+        f.write_text(text)
+        fp = str(f.resolve())
+        c = LspChecker(workspace=str(tmp_path))
+        try:
+            c.check_file(fp, str(tmp_path), 0.0)
+        finally:
+            c.stop()
+        return fp
+
+    @pytest.mark.slow
+    def test_reload_is_faster_than_cold_check(self, tmp_path):
+        """A fresh session reloading the .vof is far faster than re-checking.
+
+        The file's cost is a multi-second ``vm_compute``; the warm reload
+        skips it entirely, so wall-clock proves the snapshot is actually
+        being loaded rather than re-elaborated.
+        """
+        from rocq_mcp.lsp_checker import LspChecker
+
+        (tmp_path / "_CoqProject").write_text("-R . Top\n")
+        f = tmp_path / "F.v"
+        f.write_text(_SLOW)
+        fp = str(f.resolve())
+
+        # Cold: fresh process, full elaboration (also writes the .vof).
+        c1 = LspChecker(workspace=str(tmp_path))
+        t = time.monotonic()
+        r = c1.check_file(fp, str(tmp_path), 0.0)
+        cold = time.monotonic() - t
+        c1.stop()
+        assert r["success"] is True
+        assert vc.is_valid(fp, str(tmp_path))
+
+        # Warm: a brand-new process reloads the snapshot via coq/loadVof.
+        c2 = LspChecker(workspace=str(tmp_path))
+        t = time.monotonic()
+        glist = (c2.goals(fp, 6, 0, mode="Prev").get("goals") or {}).get("goals")
+        warm = time.monotonic() - t
+        c2.stop()
+
+        assert glist, "warm reload returned no goals"
+        assert glist[0]["ty"] == "slow = slow /\\ n = n"
+        # The reload must be dramatically cheaper than the cold check.
+        assert warm < cold / 2, (
+            f"warm reload {warm:.2f}s not < half of cold check {cold:.2f}s"
+        )
+
+    def test_new_tactic_on_warm_doc(self, tmp_path):
+        """A *new* tactic run speculatively against the reloaded state
+        produces the correct resulting goal (the reloaded Evd/EConstr is
+        live, not just readable)."""
+        from rocq_mcp.lsp_checker import LspChecker
+
+        fp = self._seed_vof(tmp_path, _COMM)
+        c = LspChecker(workspace=str(tmp_path))  # fresh -> warm reload
+        try:
+            # Base warm state: after `intros n m.` (line 4 Prev).
+            base = (c.goals(fp, 4, 0, mode="Prev").get("goals") or {}).get("goals")
+            assert base and base[0]["ty"] == "n + m = m + n"
+            # Run a NEW tactic against the reloaded state via pretac.
+            res = c.goals(fp, 4, 0, command="rewrite Nat.add_comm.", mode="Prev")
+            gl = (res.get("goals") or {}).get("goals")
+            assert res.get("error") is None, res
+            assert gl and gl[0]["ty"] == "m + n = m + n", res
+        finally:
+            c.stop()
+
+    def test_edit_after_warm_load_rechecks_incrementally(self, tmp_path):
+        """After a warm reload, editing the file (adding real tactics) and
+        re-querying returns correct incrementally-rechecked states."""
+        from rocq_mcp.lsp_checker import LspChecker
+
+        fp = self._seed_vof(tmp_path, _COMM)
+        c = LspChecker(workspace=str(tmp_path))  # fresh
+        try:
+            # Warm-load by querying once.
+            _ = c.goals(fp, 4, 0, mode="Prev")
+            # Replace `Admitted.` with a real proof that adds two tactics.
+            edited = (
+                "From Coq Require Import Arith.\n"  # 0
+                "Theorem t : forall n m:nat, n + m = m + n.\n"  # 1
+                "Proof.\n"  # 2
+                "intros n m.\n"  # 3
+                "rewrite Nat.add_comm.\n"  # 4 (new)
+                "reflexivity.\n"  # 5 (new)
+                "Qed.\n"  # 6
+            )
+            Path(fp).write_text(edited)
+            # State the new tactic produced: before `reflexivity.` (line 5 Prev)
+            # -> after the rewrite -> `m + n = m + n`.  Reaching it means the
+            # edited tail was re-checked against the reloaded base.
+            gl = (c.goals(fp, 5, 0, mode="Prev").get("goals") or {}).get("goals")
+            assert gl and gl[0]["ty"] == "m + n = m + n", gl
+            # And the whole edited proof now checks clean (Qed accepted).
+            r = c.check_file(fp, str(tmp_path), 0.0)
+            assert r["success"] is True, r
         finally:
             c.stop()
