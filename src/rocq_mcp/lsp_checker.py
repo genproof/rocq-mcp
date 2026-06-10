@@ -53,6 +53,11 @@ _DEFAULT_REQUEST_TIMEOUT: float = 60.0
 # Handshake (initialize) response timeout.
 _HANDSHAKE_TIMEOUT: float = 30.0
 
+# Timeout (seconds) for a ``coq/saveVof`` request.  Marshaling a large
+# document's full state to disk is slow (a heavy VST file is ~70s / ~2 GB),
+# so this is generous; configurable via ROCQ_VOF_SAVE_TIMEOUT.
+_VOF_SAVE_TIMEOUT: float = float(os.environ.get("ROCQ_VOF_SAVE_TIMEOUT", "300"))
+
 # Grace period (seconds) to keep collecting trailing diagnostics after the
 # Busy→Idle completion signal fires, catching a final publishDiagnostics
 # that races just behind the status transition.
@@ -302,7 +307,9 @@ class LspChecker:
         self._last_content[uri] = content
         return version
 
-    def _ensure_open(self, uri: str, content: str) -> int:
+    def _ensure_open(
+        self, uri: str, content: str, file_path: str | None = None
+    ) -> int:
         """Ensure *uri* is open with *content*; didChange if it differs.
 
         Returns the current document version (after any change).  Caller
@@ -310,8 +317,15 @@ class LspChecker:
         documentSymbol) that need the document present and current but do
         not themselves wait on diagnostics — coq-lsp postpones the
         request until the document is checked.
+
+        When the document is not yet open and *file_path* has a valid
+        ``.vof`` snapshot, reload it via ``coq/loadVof`` instead of a cold
+        ``didOpen`` — the warm state serves the request without
+        re-elaboration (see :meth:`_try_load_vof`).
         """
         if uri in self._open_docs and self._last_content.get(uri) == content:
+            return self._open_docs[uri]
+        if uri not in self._open_docs and self._try_load_vof(uri, file_path, content):
             return self._open_docs[uri]
         return self._sync_document(uri, content)
 
@@ -334,6 +348,66 @@ class LspChecker:
             self._last_diags.pop(uri, None)
             with self._cv:
                 self._doc_state.pop(uri, None)
+
+    # ------------------------------------------------------------------
+    # .vof warm-start cache (coq/saveVof / coq/loadVof)
+    # ------------------------------------------------------------------
+
+    def save_vof(self, file_path: str) -> bool:
+        """Persist the open, completed document as ``<file>.vof``.
+
+        Sends ``coq/saveVof`` (a request) and records the cache sidecar so
+        a later session can validate and reload the snapshot.  Returns
+        ``True`` on success.  No-op (``False``) when the cache is disabled,
+        the document is not open, or coq-lsp rejects the save (e.g. the
+        document did not check to completion).
+        """
+        from rocq_mcp import vof_cache
+
+        if not vof_cache.enabled():
+            return False
+        with self._lock:
+            if not self._is_alive():
+                return False
+            uri = Path(file_path).resolve().as_uri()
+            if uri not in self._open_docs:
+                return False
+            resp = self._request(
+                "coq/saveVof", {"textDocument": {"uri": uri}}, timeout=_VOF_SAVE_TIMEOUT
+            )
+            if isinstance(resp, dict) and "_lsp_error" in resp:
+                return False
+        # Record the fingerprint outside the lock (pure filesystem work).
+        vof_cache.record(str(Path(file_path).resolve()), self._workspace)
+        return True
+
+    def _try_load_vof(
+        self, uri: str, file_path: str | None, content: str
+    ) -> bool:
+        """Reload ``<file>.vof`` for a fresh doc when the cache is valid.
+
+        Sends the ``coq/loadVof`` notification and marks the document open
+        (so subsequent requests reuse the warm state and a later edit
+        ``didChange``-s incrementally).  Returns ``True`` if it loaded.
+        Caller holds ``self._lock`` and has verified the doc is not open.
+
+        Only fires when *content* matches the on-disk file the snapshot was
+        taken from (``vof_cache.is_valid`` hashes that file), so the warm
+        state and the document text agree exactly.
+        """
+        if file_path is None:
+            return False
+        from rocq_mcp import vof_cache
+
+        resolved = str(Path(file_path).resolve())
+        if not vof_cache.is_valid(resolved, self._workspace):
+            return False
+        with self._cv:
+            self._saw_busy = False
+        self._notify("coq/loadVof", {"textDocument": {"uri": uri}})
+        self._open_docs[uri] = 1
+        self._last_content[uri] = content
+        return True
 
     # ------------------------------------------------------------------
     # File checking (diagnostics)
@@ -381,7 +455,20 @@ class LspChecker:
                     "info": [],
                     "check_time_ms": 0,
                 }
-            return self._check_content_locked(resolved, content, timeout, wait_full)
+            result = self._check_content_locked(
+                resolved, content, timeout, wait_full
+            )
+        # After a completed full-file check, persist the warm document as a
+        # .vof so a future fresh session can reload it instead of
+        # re-elaborating.  Best-effort and outside the timing path; skipped
+        # when the check timed out (the document is not complete, so
+        # coq/saveVof would reject it anyway).
+        if not result.get("timed_out"):
+            try:
+                self.save_vof(resolved)
+            except Exception:
+                pass
+        return result
 
     def check_content(
         self,
@@ -578,7 +665,7 @@ class LspChecker:
                 b_char = character
 
             start_time = time.monotonic()
-            self._ensure_open(uri, content)
+            self._ensure_open(uri, content, file_path=resolved)
             resp = self._request(
                 "proof/goals",
                 {
@@ -671,7 +758,7 @@ class LspChecker:
                 except (OSError, PermissionError) as e:
                     return {"_lsp_error": str(e)}
             uri = Path(resolved).as_uri()
-            self._ensure_open(uri, content)
+            self._ensure_open(uri, content, file_path=resolved)
             params: dict[str, Any] = {
                 "textDocument": {"uri": uri},
                 "position": {"line": line, "character": character},
@@ -712,7 +799,7 @@ class LspChecker:
                 except (OSError, PermissionError) as e:
                     return {"_lsp_error": str(e)}
             uri = Path(resolved).as_uri()
-            self._ensure_open(uri, content)
+            self._ensure_open(uri, content, file_path=resolved)
             return self._request(
                 "textDocument/documentSymbol",
                 {"textDocument": {"uri": uri}},
