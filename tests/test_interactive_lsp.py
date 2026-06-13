@@ -246,6 +246,19 @@ class TestStep:
         assert r["success"] is False
         assert r["reason"] == "tactic_failed"
         assert r["error"]
+        # elapsed_s is reported even when the tactic is rejected.
+        assert isinstance(r["elapsed_s"], (int, float))
+        assert r["elapsed_s"] >= 0.0
+
+    @pytest.mark.asyncio
+    async def test_step_reports_elapsed_s(self, proof_ws, lstate):
+        r = await run_step(
+            file="t.v", line=2, character=0, tactics="intros n m.",
+            workspace=str(proof_ws), lifespan_state=lstate,
+        )
+        assert r["success"] is True
+        assert isinstance(r["elapsed_s"], (int, float))
+        assert r["elapsed_s"] >= 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +283,10 @@ class TestStepMulti:
         assert by_tac["induction n."]["success"] is True
         assert by_tac["reflexivity."]["success"] is False
         assert by_tac["reflexivity."]["reason"] == "tactic_failed"
+        # Every block carries its own wall-clock, even the failed one.
+        for entry in r["results"]:
+            assert isinstance(entry["elapsed_s"], (int, float))
+            assert entry["elapsed_s"] >= 0.0
 
 
 # ---------------------------------------------------------------------------

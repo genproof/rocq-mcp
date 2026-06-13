@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -1448,10 +1449,14 @@ async def run_step(
 
     Speculative: the block is applied to the proof state at *position* via
     coq-lsp's ``proof/goals`` pretac and the new goals are returned -- the
-    file on disk is NOT modified.  On success returns ``goals`` (empty
-    when no foreground goals remain); if Coq rejects the block, returns
+    file on disk is NOT modified.  On success returns ``goals`` (empty when
+    no foreground goals remain); if Coq rejects the block, returns
     ``{success: False, reason: "tactic_failed", error: <coq message>}``.
-    The block may contain multiple sentences / bullets.
+    Every outcome (success or failure) carries ``elapsed_s`` -- the
+    wall-clock (in seconds) of the ``proof/goals`` round-trip running the
+    block against the warm live document, LSP transport included -- so a
+    slow *failing* tactic is as measurable as a slow succeeding one.  The
+    block may contain multiple sentences / bullets.
     """
     err = _validate_position(line, character, lifespan_state, "rocq_step")
     if err:
@@ -1469,26 +1474,39 @@ async def run_step(
     _t = _position_timeout(lifespan_state, timeout)
 
     def _do(checker: Any) -> dict[str, Any]:
+        _start = time.monotonic()
         answer = checker.goals(
             resolved, line, character, command=tactics,
             mode=_goals_mode(before), timeout=_t,
         )
+        elapsed_s = round(time.monotonic() - _start, 3)
         kind, payload = _classify_goals_answer(answer)
+        # Every outcome carries the block's wall-clock, so a slow *failing*
+        # tactic is as measurable as a slow succeeding one.
         if kind == "timeout":
-            return _server._fail(
-                lifespan_state,
-                "rocq_step",
-                f"Tactic block timed out after {_t:.0f}s.",
-                "timeout",
-            )
+            return {
+                **_server._fail(
+                    lifespan_state,
+                    "rocq_step",
+                    f"Tactic block timed out after {_t:.0f}s.",
+                    "timeout",
+                ),
+                "elapsed_s": elapsed_s,
+            }
         if kind == "transport":
-            return _server._fail(
-                lifespan_state, "rocq_step", f"coq-lsp error: {payload}", "crashed"
-            )
+            return {
+                **_server._fail(
+                    lifespan_state, "rocq_step", f"coq-lsp error: {payload}", "crashed"
+                ),
+                "elapsed_s": elapsed_s,
+            }
         if kind == "tactic":
-            return _server._fail(
-                lifespan_state, "rocq_step", payload, "tactic_failed"
-            )
+            return {
+                **_server._fail(
+                    lifespan_state, "rocq_step", payload, "tactic_failed"
+                ),
+                "elapsed_s": elapsed_s,
+            }
         rendered = _render_goals_answer(payload, include_warnings=include_warnings)
         # Surface any block output (Print/Search/...) under "feedback".
         messages = rendered.pop("messages", None)
@@ -1497,6 +1515,10 @@ async def run_step(
             "file": file,
             "line": line,
             "character": character,
+            # Wall-clock (seconds) for the proof/goals round-trip running
+            # this block against the (warm) live document -- LSP transport
+            # included.
+            "elapsed_s": elapsed_s,
             **rendered,
         }
         if messages:
@@ -1528,10 +1550,12 @@ async def run_step_multi(
 
     Each block in *tactics* is run speculatively from *position* (the file
     is never modified) and its outcome recorded in ``results`` (order
-    preserved).  Per-block: success -> ``{tactics, success, goals}``;
-    Coq rejection -> ``{tactics, success: False,
-    reason: "tactic_failed", error}``.  Useful for trying an automation
-    battery without committing any of it.
+    preserved).  Per-block: success -> ``{tactics, success, elapsed_s,
+    goals}``; Coq rejection -> ``{tactics, success: False, elapsed_s,
+    reason: "tactic_failed", error}``.  ``elapsed_s`` is the wall-clock (in
+    seconds) of that block's ``proof/goals`` round-trip (present even on
+    failure / timeout), so an automation battery can be compared
+    block-by-block without committing any of it.
     """
     err = _validate_position(line, character, lifespan_state, "rocq_step_multi")
     if err:
@@ -1561,10 +1585,12 @@ async def run_step_multi(
         results: list[dict[str, Any]] = []
         for tac in tactics:
             entry: dict[str, Any] = {"tactics": tac}
+            _start = time.monotonic()
             answer = checker.goals(
                 resolved, line, character, command=tac,
                 mode=_goals_mode(before), timeout=_t,
             )
+            entry["elapsed_s"] = round(time.monotonic() - _start, 3)
             kind, payload = _classify_goals_answer(answer)
             if kind == "transport":
                 # coq-lsp died -- abort the whole batch with a hard failure.
