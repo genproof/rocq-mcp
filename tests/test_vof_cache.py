@@ -198,6 +198,52 @@ class TestLspCheckerVof:
         finally:
             c.stop()
 
+    def test_check_content_does_not_save_vof(self, tmp_path):
+        """``check_content`` (an in-memory/scratch check) must NOT snapshot.
+
+        Only ``check_file`` — a real, on-disk, full-file check — persists a
+        ``.vof``.  ``check_content`` is used for the append-a-query scratch
+        path, where there is no stable on-disk ``.v`` to key a snapshot
+        against (and ``vof_cache.record`` hashes the on-disk file).  Pins
+        the asymmetry so a refactor that folds full checks onto a shared
+        routine does not start snapshotting scratch buffers.
+        """
+        from rocq_mcp.lsp_checker import LspChecker
+
+        f = _project(tmp_path)
+        c = LspChecker(workspace=str(tmp_path))
+        try:
+            r = c.check_content(f, _PROOF, str(tmp_path), 0.0)
+            assert r["success"] is True
+            assert not (tmp_path / "Foo.vof").exists()
+        finally:
+            c.stop()
+
+    def test_timed_out_check_skips_save(self, tmp_path):
+        """A timed-out ``check_file`` must NOT save a ``.vof``.
+
+        The document never finished checking, so the snapshot would be
+        partial (and ``coq/saveVof`` would reject an incomplete doc anyway).
+        Pins the ``if not result.get("timed_out")`` guard around
+        ``save_vof`` — a refactor of the completion path must preserve it.
+        """
+        from rocq_mcp.lsp_checker import LspChecker
+
+        # A proof dominated by a huge tactic; a tiny timeout guarantees the
+        # client gives up long before coq-lsp completes.
+        (tmp_path / "_CoqProject").write_text("-R . Top\n")
+        f = tmp_path / "Slow.v"
+        f.write_text(
+            "Theorem slow : True.\nProof.\ndo 100000000 idtac.\nexact I.\nQed.\n"
+        )
+        c = LspChecker(workspace=str(tmp_path))
+        try:
+            r = c.check_file(str(f), str(tmp_path), 0.05)
+            assert r["timed_out"] is True
+            assert not (tmp_path / "Slow.vof").exists()
+        finally:
+            c.stop()
+
 
 # ---------------------------------------------------------------------------
 # Warm reload is fast, and the reloaded doc is fully usable (edits + new

@@ -147,9 +147,6 @@ class LspChecker:
         # Track last content sent per uri (to skip no-op didChange and to
         # know whether a buffer needs a didChange before a goals request)
         self._last_content: dict[str, str] = {}
-        # Cached diagnostics from the last completed check, keyed by uri
-        # (used by check_file's no-op fast path)
-        self._last_diags: dict[str, list[dict[str, Any]]] = {}
 
         # --- background reader + message routing ---------------------
         self._reader: threading.Thread | None = None
@@ -195,7 +192,6 @@ class LspChecker:
         self._initialized = False
         self._open_docs.clear()
         self._last_content.clear()
-        self._last_diags.clear()
         with self._cv:
             self._responses.clear()
             self._doc_state.clear()
@@ -309,7 +305,6 @@ class LspChecker:
             self._initialized = False
             self._open_docs.clear()
             self._last_content.clear()
-            self._last_diags.clear()
         reader = self._reader
         if reader is not None and reader.is_alive():
             reader.join(timeout=2)
@@ -407,7 +402,6 @@ class LspChecker:
                 pass
             self._open_docs.pop(uri, None)
             self._last_content.pop(uri, None)
-            self._last_diags.pop(uri, None)
             with self._cv:
                 self._doc_state.pop(uri, None)
 
@@ -567,46 +561,65 @@ class LspChecker:
             resolved = str(Path(file_path).resolve())
             return self._check_content_locked(resolved, content, timeout, wait_full)
 
+    @staticmethod
+    def _result_from_diags(
+        diags: list[dict[str, Any]],
+        *,
+        check_time_ms: int,
+        timed_out: bool,
+        ok: bool = True,
+    ) -> dict[str, Any]:
+        """Build the standard check result dict from a diagnostic list.
+
+        Shared by every check path (full file, in-memory content, and the
+        positional ``check_up_to`` barrier) so they agree on shape and on
+        how ``success`` is derived.  *ok* lets the barrier route fold in a
+        transport failure (``success`` is False even with no error diags
+        when the barrier never reached its point).
+        """
+        errors, warnings, info = _split_by_severity(diags)
+        return {
+            "success": ok and len(errors) == 0,
+            "errors": errors,
+            "warnings": warnings,
+            "info": info,
+            "check_time_ms": check_time_ms,
+            "timed_out": timed_out,
+        }
+
     def _check_content_locked(
         self, resolved: str, content: str, timeout: float, wait_full: bool = False
     ) -> dict[str, Any]:
-        """Core check path; caller holds ``self._lock`` and coq-lsp is alive."""
+        """Core whole-document check; caller holds ``self._lock`` and coq-lsp
+        is alive.
+
+        Always syncs the current content and waits for coq-lsp to finish
+        (a Busy→Idle transition, or a first error when *wait_full* is
+        False).  There is deliberately no client-side diagnostics memo:
+        ``_doc_state`` -- maintained live by the reader thread -- is the
+        single source of truth, and coq-lsp's own incremental cache makes a
+        re-check of unchanged content cheap (it reuses the unchanged prefix
+        rather than re-elaborating).  A separate memo keyed off
+        ``_last_content`` was removed because the positional paths advance
+        ``_last_content`` via ``_sync_document`` without recording
+        diagnostics, which let a stale "no errors" result survive an edit.
+        """
         uri = Path(resolved).as_uri()
-
-        # No-op fast path: identical content already checked.
-        if self._last_content.get(uri) == content and uri in self._last_diags:
-            errors, warnings, info = _split_by_severity(self._last_diags[uri])
-            return {
-                "success": len(errors) == 0,
-                "errors": errors,
-                "warnings": warnings,
-                "info": info,
-                "check_time_ms": 0,
-                "timed_out": False,
-            }
-
         start_time = time.monotonic()
         version = self._sync_document(uri, content)
         diagnostics, completed = self._wait_for_diagnostics(
             uri, version, timeout, wait_full
         )
-        self._last_diags[uri] = diagnostics
         elapsed = time.monotonic() - start_time
-
-        errors, warnings, info = _split_by_severity(diagnostics)
-        return {
-            "success": len(errors) == 0,
-            "errors": errors,
-            "warnings": warnings,
-            "info": info,
-            "check_time_ms": int(elapsed * 1000),
-            # False when coq-lsp signalled completion (Busy→Idle) or we
-            # short-circuited on an error; True when the deadline elapsed
-            # (or the process died) before processing finished -- the
-            # diagnostics may be partial.  Query callers turn this into a
-            # timeout envelope; the file-check fast path ignores it.
-            "timed_out": not completed,
-        }
+        # ``completed`` is False only when the deadline elapsed (or the
+        # process died) before processing finished -- the diagnostics may be
+        # partial.  Query callers turn ``timed_out`` into a timeout envelope;
+        # the file-check path ignores it.
+        return self._result_from_diags(
+            diagnostics,
+            check_time_ms=int(elapsed * 1000),
+            timed_out=not completed,
+        )
 
     def _wait_for_diagnostics(
         self, uri: str, version: int, timeout: float, wait_full: bool = False
@@ -751,15 +764,12 @@ class LspChecker:
             diags = self._collect_prefix_diags(uri, line)
             elapsed = time.monotonic() - start_time
 
-        errors, warnings, info = _split_by_severity(diags)
-        return {
-            "success": (not barrier_failed) and len(errors) == 0,
-            "errors": errors,
-            "warnings": warnings,
-            "info": info,
-            "check_time_ms": int(elapsed * 1000),
-            "timed_out": barrier_failed,
-        }
+        return self._result_from_diags(
+            diags,
+            check_time_ms=int(elapsed * 1000),
+            timed_out=barrier_failed,
+            ok=not barrier_failed,
+        )
 
     def _collect_prefix_diags(self, uri: str, line: int) -> list[dict[str, Any]]:
         """Diagnostics for *uri* with start line ``<= line``.
