@@ -203,6 +203,120 @@ def _lsp_run_query(
     return {"success": True, "output": output or "(no output)"}
 
 
+# Message ``level`` is an LSP severity: 1=error, 2=warning, 3=information,
+# 4=hint (see ``Lang.Diagnostic.Severity`` in rocq-lsp).  A query's
+# Check/Print/Search output is ``information``; warnings it emits are
+# ``warning`` -- mirroring the info/warnings split of :func:`_lsp_run_query`.
+_LEVEL_INFORMATION = 3
+_LEVEL_WARNING = 2
+
+
+def _lsp_query_at_position(
+    checker: Any,
+    *,
+    lifespan_state: dict[str, Any],
+    tool: str,
+    resolved_file: str,
+    content: str,
+    line: int,
+    character: int,
+    command: str,
+    timeout: float,
+    include_warnings: bool = True,
+    max_results: int | None = None,
+) -> dict[str, Any]:
+    """Run a query *command* at *(line, character)* against the live document.
+
+    Sends ``proof/goals`` with a speculative ``command`` (pretac) on the
+    **real** file URI: coq-lsp runs the command against the node's
+    already-computed state and returns its ``Check`` / ``Print`` /
+    ``Search`` output in the response's ``pretac_messages`` field (this
+    relies on the rocq-lsp patch that surfaces pretac feedback there).
+
+    Unlike the append-to-scratch path (:func:`_lsp_run_query`), this does
+    **not** re-elaborate a truncated copy of the file: it reuses the
+    file's warm / incremental / ``.vof`` state and coq-lsp answers the
+    moment the check reaches the point.  A mid-proof query therefore costs
+    the same as :func:`rocq_get_state`, not a full re-check of the (slow)
+    proof prefix.
+
+    Runs on the LSP worker thread (called via ``_run_with_lsp``).
+    """
+    cmd = command.strip()
+    if not cmd.endswith("."):
+        cmd += "."
+
+    resp = checker.goals(
+        resolved_file,
+        line,
+        character,
+        content=content,
+        command=cmd,
+        pp_format="Str",
+        timeout=timeout,
+    )
+
+    if not isinstance(resp, dict):
+        return _server._fail(
+            lifespan_state, tool, "Unexpected goals response from coq-lsp.", "crashed"
+        )
+
+    err = resp.get("_lsp_error")
+    if err is not None:
+        if resp.get("_lsp_timeout"):
+            return _server._fail(
+                lifespan_state, tool, f"{tool} timed out after {timeout}s.", "timeout"
+            )
+        # A goals-request error is the query command failing (e.g. an unknown
+        # reference) or a sentence at/before the point being broken; both
+        # surface as ``crashed`` so callers' not-found enrichment kicks in,
+        # mirroring :func:`_lsp_run_query`.
+        msg = err.get("message") if isinstance(err, dict) else str(err)
+        return _server._fail(lifespan_state, tool, str(msg), "crashed")
+
+    # ``pretac_messages`` holds *only* the query's own output, kept separate
+    # from the node's stored ``messages`` -- so unrelated info at the point
+    # (a ``Compute`` etc.) never pollutes the result.
+    levels = {_LEVEL_INFORMATION}
+    if include_warnings:
+        levels.add(_LEVEL_WARNING)
+    messages = [
+        m["text"]
+        for m in (resp.get("pretac_messages") or [])
+        if isinstance(m, dict)
+        and m.get("level") in levels
+        and isinstance(m.get("text"), str)
+    ]
+
+    if not messages:
+        # No output and a broken context => the prefix prevented the query
+        # from running (vs. a legitimately empty result with a sound prefix).
+        node_error = resp.get("error")
+        if node_error:
+            emsg = node_error if isinstance(node_error, str) else str(node_error)
+            return _server._fail(
+                lifespan_state,
+                tool,
+                f"Context failed to load before the query could run: {emsg}",
+                "crashed",
+            )
+
+    total_results = len(messages)
+    if max_results is not None and max_results > 0 and total_results > max_results:
+        messages = messages[:max_results]
+    output = "\n".join(messages)
+    if max_results is not None and max_results > 0 and total_results > max_results:
+        output += (
+            f"\n... ({total_results - max_results} more results, "
+            f"{total_results} total)"
+        )
+    if len(output) > _MAX_QUERY_OUTPUT:
+        output = (
+            output[:_MAX_QUERY_OUTPUT] + f"\n... (truncated, {len(output)} total chars)"
+        )
+    return {"success": True, "output": output or "(no output)"}
+
+
 # ---------------------------------------------------------------------------
 # coq-lsp documentSymbol helpers (file outline + available-name enrichment)
 # ---------------------------------------------------------------------------
@@ -344,12 +458,16 @@ async def run_query(
       hypotheses, local definitions visible there.  Point at a sentence
       boundary (e.g. just after a tactic's ``.``).
 
-    Every mode runs the query the same way: the command is appended to an
-    error-free context document (the preamble, the whole file, or the
-    file truncated at the position) and the resulting ``info`` diagnostics
-    are returned.  When ``include_warnings=False``, severity-2 warnings
-    are dropped.  ``timeout`` falls back to ``lifespan_state["op_timeout"]``;
-    the MCP wrapper applies ``ROCQ_QUERY_TIMEOUT_CAP``.
+    Preamble and whole-file modes append the command to an error-free
+    context document, check it, and return the resulting ``info``
+    diagnostics.  **Position mode** instead runs the command as a
+    speculative ``proof/goals`` pretac against the *live* document at the
+    point: it reuses the file's warm / incremental / ``.vof`` state and
+    answers the instant the check reaches the point -- no truncated scratch
+    copy, no re-elaboration of the (possibly slow) proof prefix.  When
+    ``include_warnings=False``, severity-2 warnings are dropped.
+    ``timeout`` falls back to ``lifespan_state["op_timeout"]``; the MCP
+    wrapper applies ``ROCQ_QUERY_TIMEOUT_CAP``.
     """
     pos_mode = line is not None or character is not None
     if pos_mode and not file:
@@ -399,9 +517,23 @@ async def run_query(
                     lifespan_state, "rocq_query", f"File not accessible: {file}"
                 )
             if pos_mode:
-                context_text = content[: _offset_at_position(content, line, character)]
-            else:
-                context_text = content
+                # Position mode runs the query against the *live* document via
+                # proof/goals (no truncated scratch copy, no re-elaboration of
+                # the proof prefix) -- see _lsp_query_at_position.
+                return _lsp_query_at_position(
+                    checker,
+                    lifespan_state=lifespan_state,
+                    tool="rocq_query",
+                    resolved_file=resolved,
+                    content=content,
+                    line=line,
+                    character=character,
+                    command=command,
+                    timeout=_q_timeout,
+                    include_warnings=include_warnings,
+                    max_results=max_results,
+                )
+            context_text = content
         else:
             context_text = preamble
         return _lsp_run_query(

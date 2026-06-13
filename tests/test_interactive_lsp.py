@@ -288,3 +288,140 @@ class TestQueryPosition:
         )
         assert r["success"] is True
         assert "nat" in r["output"]
+
+    @pytest.mark.asyncio
+    async def test_search_returns_multiple_results(self, proof_ws, lstate):
+        # Search mid-proof should surface several matching lemmas.
+        r = await run_query(
+            command="Search (?a + ?b = ?b + ?a).", preamble="",
+            workspace=str(proof_ws), lifespan_state=lstate,
+            file="t.v", line=3, character=14,
+        )
+        assert r["success"] is True
+        assert "add_comm" in r["output"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_reference_is_crashed(self, proof_ws, lstate):
+        r = await run_query(
+            command="Check no_such_symbol_xyz.", preamble="",
+            workspace=str(proof_ws), lifespan_state=lstate,
+            file="t.v", line=3, character=14,
+        )
+        assert r["success"] is False
+        assert r["reason"] == "crashed"
+        assert "no_such_symbol_xyz" in r["error"]
+
+    @pytest.mark.asyncio
+    async def test_node_messages_do_not_pollute_query(self, tmp_path, lstate):
+        # A sentence at the queried point that itself emits info output
+        # (a ``Compute``) must not leak into the query result -- only the
+        # pretac's own output is returned (pretac_messages is separate).
+        src = (
+            "Definition bar := 42.\n"
+            "Compute 1 + 1.\n"
+            "Definition baz := 7.\n"
+        )
+        (tmp_path / "n.v").write_text(src)
+        r = await run_query(
+            command="Print bar.", preamble="", workspace=str(tmp_path),
+            lifespan_state=lstate, file="n.v", line=1, character=0,
+        )
+        assert r["success"] is True
+        assert "bar = 42" in r["output"]
+        # The neighbouring ``Compute 1 + 1`` result (``= 2``) must NOT leak in.
+        assert "= 2" not in r["output"]
+
+
+class TestQueryPositionRouting:
+    """Position-mode rocq_query must hit the *live* document via proof/goals.
+
+    The whole point of the position path is to avoid re-elaborating a
+    truncated scratch copy of the file: it runs the query as a speculative
+    ``proof/goals`` pretac on the real file URI.  These unit tests pin that
+    contract with a fake checker -- ``goals`` is used (with the query as
+    ``command``); ``check_content`` (the scratch-append path) is never
+    called.
+    """
+
+    class _FakeChecker:
+        _process = None
+
+        def __init__(self, pretac_messages):
+            self._pretac_messages = pretac_messages
+            self.goals_calls = []
+
+        def _is_alive(self):
+            return True
+
+        def goals(self, file_path, line, character, *, content=None,
+                  command=None, pp_format="Str", mode=None, timeout=0):
+            self.goals_calls.append(
+                {"file": file_path, "line": line, "character": character,
+                 "command": command}
+            )
+            return {
+                "goals": None,
+                "messages": [],
+                "error": None,
+                "pretac_messages": self._pretac_messages,
+            }
+
+        def check_content(self, *a, **k):  # pragma: no cover - must not run
+            raise AssertionError(
+                "position-mode query must not use the scratch check_content path"
+            )
+
+    @pytest.mark.asyncio
+    async def test_routes_to_goals_not_scratch(self, tmp_path):
+        from tests.conftest import inject_checker
+
+        (tmp_path / "f.v").write_text("Definition foo := 1.\n")
+        chk = self._FakeChecker(
+            [{"range": None, "level": 3, "text": "foo\n     : nat"}]
+        )
+        state = make_lifespan_state(op_timeout=30.0)
+        inject_checker(state, chk, workspace=str(tmp_path), file="f.v")
+
+        r = await run_query(
+            command="Check foo", preamble="", workspace=str(tmp_path),
+            lifespan_state=state, file="f.v", line=0, character=0,
+        )
+        assert r["success"] is True
+        assert r["output"] == "foo\n     : nat"
+        # goals() was used, and the query (with auto-appended dot) forwarded
+        # as the speculative command on the real file.
+        assert len(chk.goals_calls) == 1
+        assert chk.goals_calls[0]["command"] == "Check foo."
+        assert chk.goals_calls[0]["line"] == 0
+
+    @pytest.mark.asyncio
+    async def test_warnings_filtered_by_include_warnings(self, tmp_path):
+        from tests.conftest import inject_checker
+
+        (tmp_path / "f.v").write_text("Definition foo := 1.\n")
+        msgs = [
+            {"range": None, "level": 3, "text": "info-line"},
+            {"range": None, "level": 2, "text": "warning-line"},
+        ]
+        # include_warnings=True -> both; default keeps warnings.
+        state = make_lifespan_state(op_timeout=30.0)
+        chk = self._FakeChecker(msgs)
+        inject_checker(state, chk, workspace=str(tmp_path), file="f.v")
+        r = await run_query(
+            command="Check foo", preamble="", workspace=str(tmp_path),
+            lifespan_state=state, file="f.v", line=0, character=0,
+            include_warnings=True,
+        )
+        assert "info-line" in r["output"] and "warning-line" in r["output"]
+
+        # include_warnings=False -> drop the level-2 warning.
+        state2 = make_lifespan_state(op_timeout=30.0)
+        chk2 = self._FakeChecker(msgs)
+        inject_checker(state2, chk2, workspace=str(tmp_path), file="f.v")
+        r2 = await run_query(
+            command="Check foo", preamble="", workspace=str(tmp_path),
+            lifespan_state=state2, file="f.v", line=0, character=0,
+            include_warnings=False,
+        )
+        assert "info-line" in r2["output"]
+        assert "warning-line" not in r2["output"]
