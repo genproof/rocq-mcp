@@ -24,6 +24,8 @@ import psutil
 from fastmcp import FastMCP, Context
 from fastmcp.server.lifespan import lifespan
 
+from rocq_mcp import debug_log as dlog
+
 # ---------------------------------------------------------------------------
 # Configuration (env vars with defaults)
 # ---------------------------------------------------------------------------
@@ -624,11 +626,18 @@ def _get_or_create_checker(
     pool = lifespan_state.setdefault("lsp_pool", {})
     checker = pool.get(key)
     if checker is None or not checker._is_alive():
+        respawn = checker is not None
         checker = LspChecker(workspace=workspace)
         pool[key] = checker
         # Stamp the (re)spawn time so stale-import detection can tell when a
         # dependency .vo was rebuilt after this session loaded it.
-        _meta_for(lifespan_state, key)["spawned_at"] = time.time()
+        meta = _meta_for(lifespan_state, key)
+        meta["spawned_at"] = time.time()
+        dlog.event(
+            "pool", "session.create", key=key, workspace=workspace,
+            respawn=respawn, generation=meta.get("generation", 0),
+            pool_size=len(pool),
+        )
     return checker
 
 
@@ -642,6 +651,9 @@ def _invalidate_lsp(lifespan_state: dict[str, Any], key: str) -> None:
     """
     pool = lifespan_state.setdefault("lsp_pool", {})
     checker = pool.pop(key, None)
+    dlog.event(
+        "pool", "session.invalidate", key=key, was_live=checker is not None
+    )
     if checker is not None:
         try:
             checker.stop()
@@ -762,6 +774,7 @@ def _fail(
     and pre-pet validation failures (set here).
     """
     _record_error(lifespan_state, tool=tool, message=message, reason=reason)
+    dlog.event("fail", reason, tool=tool, message=dlog.blob(message), **extra)
     return {"success": False, "error": message, "reason": reason, **extra}
 
 
@@ -829,6 +842,8 @@ def _attach_stale_warning(
         warning = stale_warning(file, workspace, session_started_at=started)
         if warning:
             result["stale_warning"] = warning
+            dlog.event("stale", "warning", file=file, workspace=workspace,
+                       warning=warning)
     except Exception:
         # Detection must never break a tool result.
         pass
@@ -903,7 +918,11 @@ async def _memory_watchdog(
             rss_mb = rss_bytes // (1024 * 1024)
             if on_rss is not None:
                 on_rss(rss_mb)
+            dlog.verbose_event("watchdog", "rss_sample", proc=pid, rss_mb=rss_mb,
+                               limit_mb=max_rss_mb)
             if rss_mb > max_rss_mb:
+                dlog.event("watchdog", "rss_breach", proc=pid, rss_mb=rss_mb,
+                           limit_mb=max_rss_mb)
                 event.set()
                 main_task.cancel()
                 return
@@ -949,6 +968,12 @@ async def _run_with_lsp(
         if rss_mb > meta.get("peak_rss_mb", 0.0):
             meta["peak_rss_mb"] = float(rss_mb)
 
+    proc = _checker_process(checker)
+    dlog.event(
+        "op", "lsp_op.start", tool=tool, key=key,
+        proc=proc.pid if proc else None,
+    )
+    _t0 = time.monotonic()
     main_task = asyncio.create_task(asyncio.to_thread(fn, checker))
     mem_event = asyncio.Event()
     monitor_task = asyncio.create_task(
@@ -976,8 +1001,23 @@ async def _run_with_lsp(
         # (which also restarts this session's coq-lsp).  An external cancel
         # (mem_event unset) must propagate.
         if mem_event.is_set():
+            dlog.event(
+                "op", "lsp_op.memory_exhausted", tool=tool, key=key,
+                duration_s=round(time.monotonic() - _t0, 6),
+                peak_rss_mb=meta.get("peak_rss_mb"),
+            )
             return _build_lsp_memory_abort_response(lifespan_state, tool, key)
+        dlog.event(
+            "op", "lsp_op.cancelled", tool=tool, key=key,
+            duration_s=round(time.monotonic() - _t0, 6),
+        )
         raise
+    dlog.event(
+        "op", "lsp_op.end", tool=tool, key=key,
+        duration_s=round(time.monotonic() - _t0, 6),
+        success=result.get("success") if isinstance(result, dict) else None,
+        peak_rss_mb=meta.get("peak_rss_mb"),
+    )
     _maybe_trim_lsp_caches(lifespan_state, checker, meta)
     return result
 
@@ -2025,6 +2065,11 @@ def _maybe_trim_lsp_caches(
     rss_mb = rss_bytes // (1024 * 1024)
     if rss_mb <= ROCQ_LSP_TRIM_RSS_MB:
         return
+    dlog.event(
+        "trim", "soft_trim", proc=process.pid, rss_mb=rss_mb,
+        threshold_mb=ROCQ_LSP_TRIM_RSS_MB,
+        trim_count=int(meta.get("trim_count", 0)) + 1,
+    )
     try:
         checker.trim_caches()
     except Exception:

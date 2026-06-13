@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from rocq_mcp import debug_log as dlog
 from rocq_mcp.verify import _check_forbidden_commands
 
 # server.py imports this module at the bottom of its own load, so the
@@ -420,6 +421,7 @@ def _symbol_names_cached(checker: Any, resolved_file: str) -> list[str]:
     return names
 
 
+@dlog.logged("tool", "rocq_query")
 async def run_query(
     command: str,
     preamble: str,
@@ -550,6 +552,7 @@ async def run_query(
 # ---------------------------------------------------------------------------
 
 
+@dlog.logged("tool", "rocq_assumptions")
 async def run_assumptions(
     name: str,
     file: str,
@@ -969,6 +972,7 @@ async def _fetch_available_in_file(
     return _AvailableInFile(capped, truncated, total)
 
 
+@dlog.logged("tool", "rocq_toc")
 async def run_toc(
     file: str,
     workspace: str,
@@ -1201,6 +1205,7 @@ def _goals_mode(before: bool) -> str:
     return "Prev" if before else "After"
 
 
+@dlog.logged("tool", "rocq_get_state")
 async def run_get_state(
     file: str,
     line: int,
@@ -1339,6 +1344,7 @@ def _annotate_extraction_source(
     return "inserted"
 
 
+@dlog.logged("tool", "rocq_extract")
 async def run_extract(
     file: str,
     line: int,
@@ -1433,6 +1439,7 @@ async def run_extract(
     )
 
 
+@dlog.logged("tool", "rocq_step")
 async def run_step(
     file: str,
     line: int,
@@ -1534,6 +1541,7 @@ async def run_step(
     )
 
 
+@dlog.logged("tool", "rocq_step_multi")
 async def run_step_multi(
     file: str,
     line: int,

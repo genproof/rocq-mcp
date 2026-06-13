@@ -40,6 +40,7 @@ from rocq_mcp.verify import (
 # etc.) in tests is visible here.  A bare ``from server import X``
 # would capture the value at import time, defeating monkeypatch.
 import rocq_mcp.server as _server
+from rocq_mcp import debug_log as dlog
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -443,6 +444,7 @@ def _build_compile_result(
 # ---------------------------------------------------------------------------
 
 
+@dlog.logged("tool", "rocq_compile")
 def run_compile(
     source: str,
     workspace: str,
@@ -478,6 +480,7 @@ def run_compile(
 # ---------------------------------------------------------------------------
 
 
+@dlog.logged("tool", "rocq_compile_file")
 def run_compile_file(
     file: str,
     workspace: str,
@@ -1148,6 +1151,7 @@ async def _run_phase2_shared_defs(
     return _build_assumptions_result(verdict2, details2, "shared_defs")
 
 
+@dlog.logged("tool", "rocq_verify")
 async def run_verify(
     proof: str,
     problem_name: str,

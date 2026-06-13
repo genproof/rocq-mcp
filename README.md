@@ -139,6 +139,43 @@ It is a latency win, not a memory one (the reload restores the full state). It h
 | `ROCQ_COQC_BINARY` | `coqc` | Path to the `coqc` binary |
 | `ROCQ_MAX_SOURCE_SIZE` | `1000000` | Maximum source size in bytes |
 | `ROCQ_MAX_GOAL_CHARS` | `8000` | Max characters per rendered term (each hypothesis type/def and each goal conclusion) in the structured goal output of `rocq_get_state` / `rocq_step` / `rocq_step_multi`; longer terms are truncated with a `... (truncated, N chars)` marker |
+| `ROCQ_DEBUG_LOG` | _(unset)_ | Enable [structured debug logging](#debug-logging). Unset / `0` / `off` disables it (a near-zero-cost no-op). `stderr` (or `-`) logs to stderr; any other value is a file path (opened append, line-buffered). |
+| `ROCQ_DEBUG_LOG_VERBOSE` | `0` | When truthy (and `ROCQ_DEBUG_LOG` is set), also emit high-frequency events (every memory-watchdog RSS sample, every `publishDiagnostics` / `serverStatus` notification) and the **full** bodies of large blobs (document text, payloads) instead of a `{len, sha1, head}` summary. |
+
+## Debug logging
+
+Set `ROCQ_DEBUG_LOG` to a file path (or `stderr`) to record a structured,
+timestamped trace of everything the server does. It is **off by default**
+and, when off, a near-zero-cost no-op — leave it unset in production.
+stdout is reserved for the MCP/JSON-RPC stream, so logs never go there.
+
+Each event is one JSON object per line (JSON Lines):
+
+```json
+{"ts":"2026-06-14T09:12:33.481204Z","mono":12.408,"pid":4711,"thread":"asyncio_0",
+ "cat":"lsp","event":"request.recv","method":"proof/goals","id":7,"duration_s":0.094,
+ "ok":true,"result":{"in_proof":true,"n_goals":2,"n_messages":0,"n_pretac_messages":1}}
+```
+
+`ts` is wall-clock UTC (microsecond precision); `mono` is monotonic seconds
+since startup (reliable relative timing across the per-file session pool,
+where `pid`/`thread` identify the source). Events are grouped by `cat`:
+
+| `cat` | Events | What it captures |
+|-------|--------|------------------|
+| `tool` | `<tool>.call` / `.return` / `.raise` | Every tool invocation with its (sanitized) arguments, result summary, and wall-clock duration. |
+| `op` | `lsp_op.start` / `.end` / `.memory_exhausted` / `.cancelled` | Each pooled coq-lsp operation: tool, session key, pid, duration, success, peak RSS. |
+| `lsp` | `request.send` / `request.recv` / `notify.send` / `request.timeout` / `request.dead` | Every coq-lsp request/notification, correlated by JSON-RPC `id`, with params, a result summary, and round-trip `duration_s`. (`publishDiagnostics` / `serverStatus` are verbose-only.) |
+| `process` | `spawn` / `ready` / `stop` | coq-lsp subprocess lifecycle (with handshake time). |
+| `pool` | `session.create` / `session.invalidate` | Per-file session pool spawns and restarts. |
+| `watchdog` | `rss_breach` (and verbose `rss_sample`) | Memory-watchdog samples and threshold breaches. |
+| `trim` | `soft_trim` / `trim_caches` | `coq/trimCaches` soft-trims with the RSS that triggered them. |
+| `vof` | `save.ok` / `save.rejected` / `load.hit` / `load.miss` | `.vof` warm-start cache activity. |
+| `stale` | `warning` | Stale-import warnings attached to results. |
+| `fail` | `<reason>` | Every failure envelope (`timeout`, `crashed`, `memory_exhausted`, `validation`, ...) with tool and message. |
+
+Large strings (document bodies, payloads) are summarized as `{len, sha1, head}`
+unless `ROCQ_DEBUG_LOG_VERBOSE=1`. Logging never raises into a tool call.
 
 ## Security Model
 

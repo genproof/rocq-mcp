@@ -37,6 +37,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from rocq_mcp import debug_log as dlog
+
 
 # LSP DiagnosticSeverity
 SEVERITY_ERROR = 1
@@ -62,6 +64,44 @@ _VOF_SAVE_TIMEOUT: float = float(os.environ.get("ROCQ_VOF_SAVE_TIMEOUT", "300"))
 # Busy→Idle completion signal fires, catching a final publishDiagnostics
 # that races just behind the status transition.
 _DIAG_TRAILING_GRACE: float = 0.2
+
+
+def _log_params(params: Any) -> Any:
+    """Summarise request params for the debug log (bound document bodies)."""
+    if not isinstance(params, dict):
+        return params
+    out: dict[str, Any] = {}
+    for k, v in params.items():
+        if k in ("text", "contentChanges") or (k == "content" and isinstance(v, str)):
+            out[k] = dlog.blob(v) if isinstance(v, str) else dlog.blob(json.dumps(v))
+        elif k == "textDocument" and isinstance(v, dict):
+            # Keep the uri/version; drop any inline full text.
+            out[k] = {kk: vv for kk, vv in v.items() if kk != "text"}
+            if isinstance(v.get("text"), str):
+                out[k]["text"] = dlog.blob(v["text"])
+        else:
+            out[k] = v
+    return out
+
+
+def _log_result(method: str, result: Any) -> Any:
+    """Summarise a request result -- goal/message counts rather than full bodies."""
+    if not isinstance(result, dict):
+        if isinstance(result, list):
+            return {"len": len(result)}
+        return result
+    if method == "proof/goals":
+        gfield = result.get("goals")
+        g = (gfield or {}).get("goals") if isinstance(gfield, dict) else None
+        return {
+            "in_proof": isinstance(gfield, dict),
+            "n_goals": len(g) if isinstance(g, list) else 0,
+            "n_messages": len(result.get("messages") or []),
+            "n_pretac_messages": len(result.get("pretac_messages") or []),
+            "error": result.get("error"),
+        }
+    # Generic: keep the top-level keys, summarise large string values.
+    return {k: (dlog.blob(v) if isinstance(v, str) else v) for k, v in result.items()}
 
 
 def _parse_diagnostic(d: dict[str, Any]) -> dict[str, Any]:
@@ -138,12 +178,19 @@ class LspChecker:
             self._process.kill()
             self._process.wait(timeout=3)
 
+        _t0 = time.monotonic()
         self._process = subprocess.Popen(
             ["coq-lsp"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=False,  # binary mode for LSP framing
+        )
+        dlog.event(
+            "process",
+            "spawn",
+            proc=self._process.pid,
+            workspace=self._workspace,
         )
         self._initialized = False
         self._open_docs.clear()
@@ -189,6 +236,13 @@ class LspChecker:
         )
         self._notify("initialized", {})
         self._initialized = True
+        dlog.event(
+            "process",
+            "ready",
+            proc=self._process.pid if self._process else None,
+            workspace=self._workspace,
+            handshake_s=round(time.monotonic() - _t0, 6),
+        )
 
     def _is_alive(self) -> bool:
         return (
@@ -215,6 +269,10 @@ class LspChecker:
         with self._lock:
             if not self._is_alive():
                 return
+            dlog.event(
+                "trim", "trim_caches",
+                proc=self._process.pid if self._process else None,
+            )
             try:
                 self._notify("coq/trimCaches", {})
             except Exception:
@@ -226,6 +284,10 @@ class LspChecker:
         """Shut down coq-lsp and join the reader thread."""
         with self._lock:
             proc = self._process
+            dlog.event(
+                "process", "stop", proc=proc.pid if proc else None,
+                alive=bool(proc and proc.poll() is None),
+            )
             if proc and proc.poll() is None:
                 try:
                     self._request("shutdown", None, timeout=5.0)
@@ -376,9 +438,14 @@ class LspChecker:
                 "coq/saveVof", {"textDocument": {"uri": uri}}, timeout=_VOF_SAVE_TIMEOUT
             )
             if isinstance(resp, dict) and "_lsp_error" in resp:
+                dlog.event(
+                    "vof", "save.rejected",
+                    file=str(Path(file_path).resolve()), error=resp["_lsp_error"],
+                )
                 return False
         # Record the fingerprint outside the lock (pure filesystem work).
         vof_cache.record(str(Path(file_path).resolve()), self._workspace)
+        dlog.event("vof", "save.ok", file=str(Path(file_path).resolve()))
         return True
 
     def _try_load_vof(
@@ -401,12 +468,14 @@ class LspChecker:
 
         resolved = str(Path(file_path).resolve())
         if not vof_cache.is_valid(resolved, self._workspace):
+            dlog.event("vof", "load.miss", file=resolved)
             return False
         with self._cv:
             self._saw_busy = False
         self._notify("coq/loadVof", {"textDocument": {"uri": uri}})
         self._open_docs[uri] = 1
         self._last_content[uri] = content
+        dlog.event("vof", "load.hit", file=resolved, uri=uri)
         return True
 
     # ------------------------------------------------------------------
@@ -934,6 +1003,11 @@ class LspChecker:
                     "diags": diags,
                 }
                 self._cv.notify_all()
+            errs, warns, info = _split_by_severity(diags)
+            dlog.verbose_event(
+                "lsp", "publishDiagnostics", uri=uri, version=params.get("version"),
+                n_errors=len(errs), n_warnings=len(warns), n_info=len(info),
+            )
         elif method == "$/coq/serverStatus":
             params = msg.get("params", {})
             status = params.get("status", "")
@@ -942,6 +1016,7 @@ class LspChecker:
                 if status == "Busy":
                     self._saw_busy = True
                 self._cv.notify_all()
+            dlog.verbose_event("lsp", "serverStatus", status=status)
         # Everything else ($/coq/fileProgress, window/logMessage, …) is
         # intentionally ignored.
 
@@ -1037,24 +1112,55 @@ class LspChecker:
         msg: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
         if params is not None:
             msg["params"] = params
+        _logging = dlog.enabled()
+        if _logging:
+            dlog.event(
+                "lsp",
+                "request.send",
+                method=method,
+                id=req_id,
+                proc=self._process.pid if self._process else None,
+                timeout=timeout,
+                params=_log_params(params),
+            )
+        _t0 = time.monotonic()
         try:
             self._send_message(msg)
         except (BrokenPipeError, OSError, ValueError) as e:
+            dlog.event("lsp", "request.send_failed", method=method, id=req_id, error=str(e))
             return {"_lsp_error": f"send failed: {e}"}
 
         resp = self._await_response(req_id, timeout)
+        _dur = round(time.monotonic() - _t0, 6)
         if resp is None:
             with self._cv:
                 died = self._dead
             if died:
+                dlog.event(
+                    "lsp", "request.dead", method=method, id=req_id, duration_s=_dur
+                )
                 return {"_lsp_error": f"{method}: coq-lsp died"}
             # Deadline elapsed while coq-lsp is still processing the
             # request.  Flag it so callers can report a timeout distinctly
             # from a transport failure / crash.  coq-lsp keeps computing
             # until the next request preempts it (set_current_token).
+            dlog.event(
+                "lsp", "request.timeout", method=method, id=req_id, duration_s=_dur
+            )
             return {"_lsp_error": f"{method} timed out", "_lsp_timeout": True}
         if "error" in resp:
+            if _logging:
+                dlog.event(
+                    "lsp", "request.recv", method=method, id=req_id,
+                    duration_s=_dur, ok=False, error=resp["error"],
+                )
             return {"_lsp_error": resp["error"]}
+        if _logging:
+            dlog.event(
+                "lsp", "request.recv", method=method, id=req_id,
+                duration_s=_dur, ok=True,
+                result=_log_result(method, resp.get("result")),
+            )
         return resp.get("result")
 
     def _notify(self, method: str, params: Any) -> None:
@@ -1062,4 +1168,12 @@ class LspChecker:
         msg: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             msg["params"] = params
+        if dlog.enabled():
+            dlog.event(
+                "lsp",
+                "notify.send",
+                method=method,
+                proc=self._process.pid if self._process else None,
+                params=_log_params(params),
+            )
         self._send_message(msg)
