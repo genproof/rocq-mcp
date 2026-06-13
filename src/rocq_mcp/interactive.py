@@ -419,21 +419,6 @@ def _symbol_names_cached(checker: Any, resolved_file: str) -> list[str]:
     return names
 
 
-def _offset_at_position(text: str, line: int, character: int) -> int:
-    """Return the character offset into *text* of 0-indexed (line, character).
-
-    Clamps past-the-end positions to ``len(text)`` so a slightly-too-far
-    cursor yields the whole prefix rather than raising.
-    """
-    offset = 0
-    lines = text.splitlines(keepends=True)
-    for i in range(min(line, len(lines))):
-        offset += len(lines[i])
-    if line < len(lines):
-        offset += min(character, len(lines[line]))
-    return min(offset, len(text))
-
-
 async def run_query(
     command: str,
     preamble: str,
