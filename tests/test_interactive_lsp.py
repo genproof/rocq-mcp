@@ -262,6 +262,76 @@ class TestStep:
 
 
 # ---------------------------------------------------------------------------
+# Characterization: rocq_step under an upstream tactic error
+# ---------------------------------------------------------------------------
+#
+#   0  Theorem t : True.
+#   1  Proof.
+#   2  exact nonexistent_ref.   <- tac1 FAILS (the variable is unbound)
+#   3  idtac.                   <- tac2
+#   4  <position X>             (queried at line 4)
+#   5  exact I.                 <- tac3
+#   6  Qed.
+#
+# The state "after tac1 succeeds, then tac2" is impossible to reach -- tac1
+# genuinely errors.  coq-lsp is error-resilient: it does NOT abort the proof,
+# it SKIPS the failed sentence and keeps the last good state, so the node at X
+# carries the pre-tac1 goal (`True`).  rocq_step therefore runs happily against
+# that recovered state and reports success, with NO signal that a sentence
+# before X errored.  (Contrast rocq_extract, which refuses with "N errors
+# before the extraction point".)  This test PINS that current behavior; it does
+# not endorse it.
+#
+# TODO: maybe we should change this behaviour -- e.g. surface the upstream
+# error (like rocq_extract does) instead of silently stepping against the
+# recovered state.
+_UPSTREAM_ERR_PROOF = (
+    "Theorem t : True.\n"
+    "Proof.\n"
+    "exact nonexistent_ref.\n"
+    "idtac.\n"
+    "idtac.\n"
+    "exact I.\n"
+    "Qed.\n"
+)
+
+
+@_lsp_only
+class TestStepUpstreamError:
+    @pytest.mark.asyncio
+    async def test_step_runs_against_recovered_state_ignoring_upstream_error(
+        self, tmp_path, lstate
+    ):
+        from rocq_mcp.lsp_checker import LspChecker
+
+        (tmp_path / "_CoqProject").write_text("-R . Top\n")
+        f = tmp_path / "u.v"
+        f.write_text(_UPSTREAM_ERR_PROOF)
+
+        # Sanity: there really is an error before X, at line 2.
+        checker = LspChecker(workspace=str(tmp_path))
+        try:
+            chk = checker.check_file(str(f), workspace=str(tmp_path))
+            assert chk["success"] is False
+            assert any(e["line"] == 2 for e in chk["errors"])
+        finally:
+            checker.stop()
+
+        # A step at X (line 4, after the failed tac1 + tac2) succeeds against
+        # coq-lsp's recovered state and surfaces no upstream-error signal.
+        r = await run_step(
+            file="u.v", line=4, character=0, tactics="idtac.",
+            workspace=str(tmp_path), lifespan_state=lstate,
+        )
+        assert r["success"] is True
+        assert r.get("reason") is None and r.get("error") is None
+        assert r["in_proof"] is True
+        # The recovered goal is the ORIGINAL `True` -- proof that the failed
+        # `exact nonexistent_ref.` was silently skipped, not applied.
+        assert [g["conclusion"] for g in r["goals"]] == ["True"]
+
+
+# ---------------------------------------------------------------------------
 # rocq_step_multi (coq-lsp, speculative fan-out)
 # ---------------------------------------------------------------------------
 
