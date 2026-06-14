@@ -169,6 +169,42 @@ class TestCompileLspPosition:
 
 
 # ---------------------------------------------------------------------------
+# rocq_compile_lsp cache_on_error (the .vof-on-error opt-in)
+# ---------------------------------------------------------------------------
+
+
+@_lsp_only
+class TestCompileLspCacheOnError:
+    _BAD = "Theorem bad : 1 = 2.\nProof. reflexivity. Qed.\n"
+
+    @pytest.mark.asyncio
+    async def test_default_skips_vof_for_errored_file(self, lstate, tmp_path):
+        # A full check (no line) of an erroring file completes, but by
+        # default we do NOT snapshot a broken document.
+        (tmp_path / "_CoqProject").write_text("-R . Top\n")
+        (tmp_path / "Bad.v").write_text(self._BAD)
+        result = await _server.rocq_compile_lsp(
+            file="Bad.v", workspace=str(tmp_path), ctx=_Ctx(lstate)
+        )
+        assert result["success"] is False
+        assert not (tmp_path / "Bad.vof").exists()
+
+    @pytest.mark.asyncio
+    async def test_cache_on_error_saves_vof(self, lstate, tmp_path):
+        # cache_on_error=True snapshots the completed-but-erroring document.
+        (tmp_path / "_CoqProject").write_text("-R . Top\n")
+        (tmp_path / "Bad.v").write_text(self._BAD)
+        result = await _server.rocq_compile_lsp(
+            file="Bad.v",
+            workspace=str(tmp_path),
+            cache_on_error=True,
+            ctx=_Ctx(lstate),
+        )
+        assert result["success"] is False
+        assert (tmp_path / "Bad.vof").is_file()
+
+
+# ---------------------------------------------------------------------------
 # LspChecker.check_up_to directly (coq-lsp)
 # ---------------------------------------------------------------------------
 

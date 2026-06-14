@@ -482,12 +482,22 @@ class LspChecker:
         workspace: str = "",
         timeout: float = 0,
         wait_full: bool = False,
+        *,
+        save_vof_on_error: bool = False,
     ) -> dict[str, Any]:
         """Check a file on disk and return diagnostics.
 
         On first call for a file, opens it via didOpen.  On subsequent
         calls, sends didChange with the new content.  coq-lsp
         incrementally rechecks only from the edit point.
+
+        *save_vof_on_error* controls the warm-start snapshot when the file
+        has error diagnostics: by default we only persist a ``.vof`` for a
+        clean check (a broken document's snapshot is low value and would
+        warm-start a future session into the same errors).  Set it to
+        ``True`` to snapshot any *completed* check regardless of errors
+        (coq-lsp's ``coq/saveVof`` still requires the document to have
+        reached EOF).  A timed-out check is never snapshotted.
 
         Returns:
             {
@@ -523,10 +533,15 @@ class LspChecker:
             )
         # After a completed full-file check, persist the warm document as a
         # .vof so a future fresh session can reload it instead of
-        # re-elaborating.  Best-effort and outside the timing path; skipped
+        # re-elaborating.  Best-effort and outside the timing path.  Skipped
         # when the check timed out (the document is not complete, so
-        # coq/saveVof would reject it anyway).
-        if not result.get("timed_out"):
+        # coq/saveVof would reject it anyway) and -- unless
+        # *save_vof_on_error* -- when the document has error diagnostics (we
+        # would otherwise cache a broken state and warm-start straight back
+        # into it).
+        if not result.get("timed_out") and (
+            save_vof_on_error or not result.get("errors")
+        ):
             try:
                 self.save_vof(resolved)
             except Exception:

@@ -244,6 +244,45 @@ class TestLspCheckerVof:
         finally:
             c.stop()
 
+    def test_errored_file_skips_vof_by_default(self, tmp_path):
+        """A completed-but-erroring file is NOT snapshotted by default.
+
+        coq-lsp recovers from ordinary errors and checks to EOF, so the
+        document *completes* (coq/saveVof would accept it) -- but caching a
+        broken state would warm-start a future session straight back into
+        the same errors, so by default we only snapshot a clean check.
+        """
+        from rocq_mcp.lsp_checker import LspChecker
+
+        (tmp_path / "_CoqProject").write_text("-R . Top\n")
+        f = tmp_path / "Bad.v"
+        f.write_text("Theorem bad : 1 = 2.\nProof. reflexivity. Qed.\n")
+        c = LspChecker(workspace=str(tmp_path))
+        try:
+            r = c.check_file(str(f), str(tmp_path), 0.0)
+            assert r["success"] is False and r["errors"]
+            assert not (tmp_path / "Bad.vof").exists()
+        finally:
+            c.stop()
+
+    def test_errored_file_saves_vof_when_opted_in(self, tmp_path):
+        """``save_vof_on_error=True`` snapshots a completed check despite
+        errors (coq/saveVof still requires the document to have reached
+        EOF, which an error-recovered check does)."""
+        from rocq_mcp.lsp_checker import LspChecker
+
+        (tmp_path / "_CoqProject").write_text("-R . Top\n")
+        f = tmp_path / "Bad.v"
+        f.write_text("Theorem bad : 1 = 2.\nProof. reflexivity. Qed.\n")
+        c = LspChecker(workspace=str(tmp_path))
+        try:
+            r = c.check_file(str(f), str(tmp_path), 0.0, save_vof_on_error=True)
+            assert r["success"] is False and r["errors"]
+            assert (tmp_path / "Bad.vof").is_file()
+            assert (tmp_path / "Bad.vof.meta").is_file()
+        finally:
+            c.stop()
+
 
 # ---------------------------------------------------------------------------
 # Warm reload is fast, and the reloaded doc is fully usable (edits + new

@@ -1920,6 +1920,7 @@ async def rocq_compile_lsp(
     include_info: bool = False,
     line: int | None = None,
     character: int | None = None,
+    cache_on_error: bool = False,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Incrementally check a .v file using coq-lsp diagnostics.
@@ -1970,6 +1971,13 @@ async def rocq_compile_lsp(
         character: 0-based character within *line* for an exact point
             (default: None = the end of *line*).  Ignored when *line* is
             None.
+        cache_on_error: Persist the ``.vof`` warm-start snapshot even when
+            the file has errors (default: False).  By default a snapshot is
+            saved only for a clean full check; set this to cache a
+            completed-but-erroring document anyway (e.g. to warm-start a
+            large file whose tail you are still fixing).  Only applies to a
+            full check (``line`` omitted) -- position-limited checks never
+            snapshot.
     """
     # Same workspace handling as the other file tools: auto-detect the
     # project root from *file* when no explicit workspace is given.
@@ -2007,7 +2015,12 @@ async def rocq_compile_lsp(
 
     def _check(checker: Any) -> dict[str, Any]:
         if line is None:
-            return checker.check_file(resolved, workspace, float(timeout))
+            return checker.check_file(
+                resolved,
+                workspace,
+                float(timeout),
+                save_vof_on_error=cache_on_error,
+            )
         return checker.check_up_to(
             resolved, line, character, workspace=workspace, timeout=float(timeout)
         )
