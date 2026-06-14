@@ -259,7 +259,9 @@ class TestLspCheckerVof:
         f.write_text("Theorem bad : 1 = 2.\nProof. reflexivity. Qed.\n")
         c = LspChecker(workspace=str(tmp_path))
         try:
-            r = c.check_file(str(f), str(tmp_path), 0.0)
+            # stop_at_first_error=False so the file checks to EOF (completes);
+            # we are testing the save *policy* (skip on error), not the stop.
+            r = c.check_file(str(f), str(tmp_path), 0.0, stop_at_first_error=False)
             assert r["success"] is False and r["errors"]
             assert not (tmp_path / "Bad.vof").exists()
         finally:
@@ -268,7 +270,7 @@ class TestLspCheckerVof:
     def test_errored_file_saves_vof_when_opted_in(self, tmp_path):
         """``save_vof_on_error=True`` snapshots a completed check despite
         errors (coq/saveVof still requires the document to have reached
-        EOF, which an error-recovered check does)."""
+        EOF, which an error-recovered full check does)."""
         from rocq_mcp.lsp_checker import LspChecker
 
         (tmp_path / "_CoqProject").write_text("-R . Top\n")
@@ -276,7 +278,11 @@ class TestLspCheckerVof:
         f.write_text("Theorem bad : 1 = 2.\nProof. reflexivity. Qed.\n")
         c = LspChecker(workspace=str(tmp_path))
         try:
-            r = c.check_file(str(f), str(tmp_path), 0.0, save_vof_on_error=True)
+            # A full check (reaches EOF) is required to snapshot a broken file.
+            r = c.check_file(
+                str(f), str(tmp_path), 0.0,
+                stop_at_first_error=False, save_vof_on_error=True,
+            )
             assert r["success"] is False and r["errors"]
             assert (tmp_path / "Bad.vof").is_file()
             assert (tmp_path / "Bad.vof.meta").is_file()

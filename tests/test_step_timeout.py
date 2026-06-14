@@ -159,3 +159,180 @@ class TestRealTimeout:
             assert r["reason"] == "timeout"
         finally:
             stop_all_checkers(state)
+
+
+@_lsp_only
+class TestStopAtFirstError:
+    """rocq_compile_lsp ``stop_at_first_error``: return at the first error
+    without elaborating anything below it, and keep the session responsive."""
+
+    def _make(self, tmp_path, src, name="S.v"):
+        from rocq_mcp.lsp_checker import LspChecker
+
+        (tmp_path / "_CoqProject").write_text("-R . Top\n")
+        (tmp_path / name).write_text(src)
+        return LspChecker(workspace=str(tmp_path)), str(tmp_path / name)
+
+    def test_full_reports_all_errors_stop_reports_first(self, tmp_path):
+        # Two independent broken theorems (error on line 1 and line 3).  Use
+        # distinct files so each is a fresh elaboration -- stop-at-first-error
+        # only stops early when coq-lsp actually checks (a re-check of
+        # unchanged, already-checked content reuses cached diagnostics).
+        src = (
+            "Theorem a : 1 = 2.\nProof. reflexivity. Qed.\n"
+            "Theorem b : 2 = 3.\nProof. reflexivity. Qed.\n"
+        )
+        cf, ff = self._make(tmp_path, src, "full.v")
+        try:
+            full = cf.check_file(ff, workspace=str(tmp_path), stop_at_first_error=False)
+            assert {1, 3} <= {e["line"] for e in full["errors"]}
+        finally:
+            cf.stop()
+
+        cs, fs = self._make(tmp_path, src, "stop.v")
+        try:
+            stop = cs.check_file(fs, workspace=str(tmp_path), stop_at_first_error=True)
+            err_lines = {e["line"] for e in stop["errors"]}
+            assert 1 in err_lines and 3 not in err_lines
+            # the max_errors sentinel never leaks into reported diagnostics
+            assert all(
+                "Maximum number of errors" not in e["message"]
+                for e in stop["errors"]
+            )
+        finally:
+            cs.stop()
+
+    @pytest.mark.slow
+    def test_stop_skips_slow_tail_and_stays_responsive(self, tmp_path):
+        # error on line 1; a ~minutes-long tactic on line 4 that must NOT run.
+        src = (
+            "Theorem bad : 1 = 2.\n"            # 0
+            "Proof. reflexivity. Qed.\n"        # 1  <- first error
+            "Theorem slow : True.\n"            # 2
+            "Proof.\n"                          # 3
+            "do 100000000000 idtac.\n"          # 4  <- must not be elaborated
+            "exact I.\n"
+            "Qed.\n"
+        )
+        checker, f = self._make(tmp_path, src)
+        try:
+            # A generous timeout: it would trip only if the tail were run.
+            r = checker.check_file(f, workspace=str(tmp_path), timeout=15.0)
+            assert r["timed_out"] is False
+            assert r["success"] is False
+            assert any(e["line"] == 1 for e in r["errors"])
+            # Session is not wedged by a runaway tail.
+            g = checker.goals(f, line=1, character=0, mode="Prev", timeout=4.0)
+            assert not (isinstance(g, dict) and "_lsp_error" in g)
+        finally:
+            checker.stop()
+
+
+# ---------------------------------------------------------------------------
+# A timeout is a Python-side give-up, NOT a coq-lsp cancel
+# ---------------------------------------------------------------------------
+
+
+@_lsp_only
+@pytest.mark.slow
+class TestStateBeforeSlowTactic:
+    """Reading the state of the sentence *before* a very slow tactic must
+    work -- that is how you debug why the tactic is slow.
+
+    The proof prefix is cheap; only the later tactic is expensive.  A query
+    whose barrier sits in the sentence before the slow tactic never needs
+    to run it, so it must return promptly.
+    """
+
+    # line 3 is a ~minutes-long tactic (1e11 idtac iterations); the `pose`
+    # before it (line 2) is instant.
+    _SRC = (
+        "Theorem t : True.\n"        # 0
+        "Proof.\n"                    # 1
+        "pose (marker := 41).\n"      # 2
+        "do 100000000000 idtac.\n"    # 3  <- slow
+        "exact I.\n"                  # 4
+        "Qed.\n"
+    )
+
+    def _make(self, tmp_path):
+        from rocq_mcp.lsp_checker import LspChecker
+
+        (tmp_path / "_CoqProject").write_text("-R . Top\n")
+        (tmp_path / "S.v").write_text(self._SRC)
+        return LspChecker(workspace=str(tmp_path)), str(tmp_path / "S.v")
+
+    @staticmethod
+    def _assert_marker_state(g):
+        """Assert *g* is a real goals answer holding `marker` (not a block)."""
+        assert not (isinstance(g, dict) and "_lsp_error" in g), (
+            f"session blocked / query not served: {g}"
+        )
+        goals = ((g or {}).get("goals") or {}).get("goals") or []
+        assert goals, g
+        names = [n for h in goals[0]["hyps"] for n in h["names"]]
+        assert "marker" in names
+
+    _PRE_SLOW_CHAR = len("pose (marker := 41).")  # end of line 2
+
+    def test_state_before_slow_tactic_is_reachable(self, tmp_path):
+        checker, f = self._make(tmp_path)
+        try:
+            # The state at the end of the sentence BEFORE the slow tactic.
+            # Reaching it checks only lines 0-2 and never runs the slow
+            # tactic, so it must return at once with `marker` in context.
+            g = checker.goals(
+                f, line=2, character=self._PRE_SLOW_CHAR, mode="After", timeout=10.0,
+            )
+            self._assert_marker_state(g)
+        finally:
+            checker.stop()
+
+    def test_positioned_check_does_not_block_followup_query(self, tmp_path):
+        """rocq_compile_lsp(line=X) before the slow tactic must not wedge the
+        session for the next query.
+
+        Today it does: after serving the barrier at X, coq-lsp continues
+        checking to EOF in the background (default mode) and runs the slow
+        tactic, so the follow-up query blocks.  The fix
+        (check_only_on_request) makes the positioned check stop at X.  This
+        test asserts the DESIRED behavior; it fails until the fix lands.
+        """
+        checker, f = self._make(tmp_path)
+        try:
+            # Positioned check up to the sentence before the slow tactic.
+            r = checker.check_up_to(f, 2, workspace=str(tmp_path), timeout=10.0)
+            assert r["success"] is True
+            # A follow-up state query before the slow tactic must NOT block.
+            g = checker.goals(
+                f, line=2, character=self._PRE_SLOW_CHAR, mode="After", timeout=8.0,
+            )
+            self._assert_marker_state(g)
+        finally:
+            checker.stop()
+
+    @pytest.mark.xfail(
+        reason="coq-lsp is single-threaded on OCaml 4.x: once a full check "
+        "starts the slow tactic it cannot be interrupted (rocq-lsp "
+        "lsp_core.ml) and the Python timeout cannot cancel it, so the session "
+        "stays blocked until the process is restarted. Fundamentally hard to "
+        "fix without OCaml 5.x.",
+        strict=False,
+    )
+    def test_whole_file_timeout_does_not_block_followup_query(self, tmp_path):
+        """We WANT a query before the slow tactic to work even after a
+        whole-file rocq_compile_lsp timed out on it -- but it can't, hence
+        xfail (documents the desired behavior + the known limitation)."""
+        checker, f = self._make(tmp_path)
+        try:
+            # Whole-file check times out on the slow tactic (Python-side).
+            r = checker.check_file(f, workspace=str(tmp_path), timeout=2.0)
+            assert r["timed_out"] is True
+            # Desired: a query before the slow tactic still works.  Reality:
+            # coq-lsp is mid-tactic and single-threaded, so this blocks.
+            g = checker.goals(
+                f, line=2, character=self._PRE_SLOW_CHAR, mode="After", timeout=3.0,
+            )
+            self._assert_marker_state(g)
+        finally:
+            checker.stop()

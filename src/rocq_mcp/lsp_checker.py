@@ -60,10 +60,38 @@ _HANDSHAKE_TIMEOUT: float = 30.0
 # so this is generous; configurable via ROCQ_VOF_SAVE_TIMEOUT.
 _VOF_SAVE_TIMEOUT: float = float(os.environ.get("ROCQ_VOF_SAVE_TIMEOUT", "300"))
 
-# Grace period (seconds) to keep collecting trailing diagnostics after the
-# Busy→Idle completion signal fires, catching a final publishDiagnostics
-# that races just behind the status transition.
+# Grace period (seconds) to keep collecting trailing diagnostics after a
+# barrier response, catching a final publishDiagnostics that races just
+# behind it.
 _DIAG_TRAILING_GRACE: float = 0.2
+
+# coq-lsp ``max_errors``: how many errors before it stops checking a document.
+# ``_MAX_ERRORS_FULL`` (its default) lets a check recover from errors and run
+# the whole document -- needed for the append-a-query path and "report all
+# errors".  ``0`` makes coq-lsp halt at the *first* error (it stops before
+# executing the next sentence, so an expensive tail below the error is never
+# run) -- the "stop at first error" fast path.
+_MAX_ERRORS_FULL: int = 150
+_MAX_ERRORS_FIRST: int = 0
+
+# Sentinel diagnostic coq-lsp emits when it stops at the max_errors limit
+# (fleche/doc.ml ``max_errors_node``).  It is an artifact of the limit, not a
+# real proof error, so we drop it from reported diagnostics.
+_MAX_ERRORS_SENTINEL: str = "Maximum number of errors reached"
+
+# Base coq-lsp settings.  ``do_settings`` (init + didChangeConfiguration)
+# REPLACES the whole config from this object, so every send must include these.
+#  - show_coq_info_messages: surface ``msg_info`` diagnostics (Time Qed.
+#    timings, Check/Print output) -- see ``of_messages`` in fleche/doc.ml.
+#  - check_only_on_request: lazy checking -- coq-lsp checks only up to what a
+#    request asks for and then deschedules, instead of barrelling on to EOF.
+#    Keeps the session responsive (a positional check/query stops at its point
+#    and never runs an expensive tail), and lets us drive a full check
+#    explicitly via an EOF barrier (see _check_content_locked).
+_BASE_SETTINGS: dict[str, Any] = {
+    "show_coq_info_messages": True,
+    "check_only_on_request": True,
+}
 
 
 def _log_params(params: Any) -> Any:
@@ -142,6 +170,9 @@ class LspChecker:
         self._lock = threading.RLock()
         self._request_id = 0
         self._initialized = False
+        # Current coq-lsp ``max_errors`` (None until initialized).  Toggled
+        # per-check via didChangeConfiguration; tracked to skip redundant sends.
+        self._max_errors: int | None = None
         # Track open documents: uri -> version
         self._open_docs: dict[str, int] = {}
         # Track last content sent per uri (to skip no-op didChange and to
@@ -207,15 +238,12 @@ class LspChecker:
         )
         self._reader.start()
 
-        # LSP initialize.  We pass our custom settings via
-        # ``initializationOptions`` -- coq-lsp's ``do_initialize`` routes
-        # them through ``Rq_init.do_settings`` synchronously, so the
-        # config is in effect by the time the initialize response
-        # arrives.  ``show_coq_info_messages`` enables ``msg_info``
-        # diagnostics (e.g. ``Time Qed.`` timings, ``Check`` output) --
-        # see ``of_messages`` in ``fleche/doc.ml`` and
-        # ``show_coq_info_messages`` in ``fleche/config.ml``.  The tool
-        # layer decides whether to surface them.
+        # LSP initialize.  We pass our settings via ``initializationOptions``
+        # -- coq-lsp's ``do_initialize`` routes them through
+        # ``Rq_init.do_settings`` synchronously, so the config is in effect by
+        # the time the initialize response arrives.  ``_BASE_SETTINGS`` omits
+        # ``max_errors`` so it takes coq-lsp's default (_MAX_ERRORS_FULL); the
+        # check paths toggle it per-call via :meth:`_set_max_errors_locked`.
         root_uri = Path(self._workspace).as_uri() if self._workspace else None
         self._request(
             "initialize",
@@ -226,12 +254,13 @@ class LspChecker:
                 "workspaceFolders": (
                     [{"uri": root_uri, "name": "workspace"}] if root_uri else None
                 ),
-                "initializationOptions": {"show_coq_info_messages": True},
+                "initializationOptions": dict(_BASE_SETTINGS),
             },
             timeout=_HANDSHAKE_TIMEOUT,
         )
         self._notify("initialized", {})
         self._initialized = True
+        self._max_errors = _MAX_ERRORS_FULL  # coq-lsp default after base init
         dlog.event(
             "process",
             "ready",
@@ -332,11 +361,13 @@ class LspChecker:
         """Send didOpen (first time) or didChange (subsequent) for *uri*.
 
         Returns the new document version.  Caller must hold ``self._lock``.
-        Resets the per-wait Busy tracking so a following completion wait
-        only counts Busy/Idle transitions caused by this edit.
+        Drops any cached ``_doc_state`` for *uri* so a stop-at-first-error
+        drive cannot mistake the previous version's diagnostics for the new
+        content's (coq-lsp republishes as it re-checks).
         """
         with self._cv:
             self._saw_busy = False
+            self._doc_state.pop(uri, None)
         if uri in self._open_docs:
             version = self._open_docs[uri] + 1
             self._open_docs[uri] = version
@@ -481,7 +512,7 @@ class LspChecker:
         file_path: str,
         workspace: str = "",
         timeout: float = 0,
-        wait_full: bool = False,
+        stop_at_first_error: bool = True,
         *,
         save_vof_on_error: bool = False,
     ) -> dict[str, Any]:
@@ -490,6 +521,11 @@ class LspChecker:
         On first call for a file, opens it via didOpen.  On subsequent
         calls, sends didChange with the new content.  coq-lsp
         incrementally rechecks only from the edit point.
+
+        *stop_at_first_error* (default): return as soon as coq-lsp hits the
+        first error -- it halts there without running anything below, so a
+        broken file does not pay for an expensive tail.  Set it ``False`` to
+        check the whole document and report every error.
 
         *save_vof_on_error* controls the warm-start snapshot when the file
         has error diagnostics: by default we only persist a ``.vof`` for a
@@ -529,7 +565,7 @@ class LspChecker:
                     "check_time_ms": 0,
                 }
             result = self._check_content_locked(
-                resolved, content, timeout, wait_full
+                resolved, content, timeout, stop_at_first_error=stop_at_first_error
             )
         # After a completed full-file check, persist the warm document as a
         # .vof so a future fresh session can reload it instead of
@@ -564,17 +600,18 @@ class LspChecker:
         to it); it need not exist on disk, though higher layers usually
         materialise a scratch file there for robustness.
 
-        *wait_full* (see :meth:`_wait_for_diagnostics`) must be ``True``
-        for the append-a-query pattern: coq-lsp recovers from errors
-        (``max_errors`` default 150) and keeps processing, so a query
-        sentence appended after an earlier error still runs — but only if
-        we wait for full completion instead of short-circuiting on the
-        first error diagnostic.
+        *wait_full* is retained for signature compatibility but no longer
+        has an effect: this path always checks the whole document
+        (``stop_at_first_error=False``), so the append-a-query pattern works
+        -- coq-lsp recovers from earlier errors (``max_errors`` default) and
+        still runs a query sentence appended after one.
         """
         with self._lock:
             self._ensure_started(workspace)
             resolved = str(Path(file_path).resolve())
-            return self._check_content_locked(resolved, content, timeout, wait_full)
+            return self._check_content_locked(
+                resolved, content, timeout, stop_at_first_error=False
+            )
 
     @staticmethod
     def _result_from_diags(
@@ -603,87 +640,139 @@ class LspChecker:
         }
 
     def _check_content_locked(
-        self, resolved: str, content: str, timeout: float, wait_full: bool = False
+        self,
+        resolved: str,
+        content: str,
+        timeout: float,
+        stop_at_first_error: bool = False,
     ) -> dict[str, Any]:
         """Core whole-document check; caller holds ``self._lock`` and coq-lsp
         is alive.
 
-        Always syncs the current content and waits for coq-lsp to finish
-        (a Busy→Idle transition, or a first error when *wait_full* is
-        False).  There is deliberately no client-side diagnostics memo:
-        ``_doc_state`` -- maintained live by the reader thread -- is the
-        single source of truth, and coq-lsp's own incremental cache makes a
-        re-check of unchanged content cheap (it reuses the unchanged prefix
-        rather than re-elaborating).  A separate memo keyed off
-        ``_last_content`` was removed because the positional paths advance
-        ``_last_content`` via ``_sync_document`` without recording
-        diagnostics, which let a stale "no errors" result survive an edit.
+        coq-lsp runs in ``check_only_on_request`` mode (see :meth:`_start`),
+        so a plain ``didChange`` does not start checking; we drive it
+        explicitly with a ``proof/goals`` barrier just past EOF (see
+        :meth:`_drive_barrier_locked`), then collect the published
+        diagnostics.  When *stop_at_first_error*, coq-lsp halts at the first
+        error and we return it immediately (the fast path -- a broken file
+        does not pay for an expensive tail below the error); otherwise it
+        runs the whole document and reports every error (needed for the
+        append-a-query path).
+
+        There is no client-side diagnostics memo: ``_doc_state`` --
+        maintained live by the reader thread -- is the single source of
+        truth, and coq-lsp's own incremental cache keeps a re-check of
+        unchanged content cheap (it reuses the unchanged prefix).
         """
         uri = Path(resolved).as_uri()
         start_time = time.monotonic()
-        version = self._sync_document(uri, content)
-        diagnostics, completed = self._wait_for_diagnostics(
-            uri, version, timeout, wait_full
+        self._sync_document(uri, content)
+        settled = self._drive_barrier_locked(
+            uri,
+            len(content.splitlines()),
+            0,
+            timeout,
+            stop_at_first_error=stop_at_first_error,
         )
+        diags = self._diags_after_grace(uri)
         elapsed = time.monotonic() - start_time
-        # ``completed`` is False only when the deadline elapsed (or the
-        # process died) before processing finished -- the diagnostics may be
-        # partial.  Query callers turn ``timed_out`` into a timeout envelope;
-        # the file-check path ignores it.
+        # Query callers turn ``timed_out`` into a timeout envelope; the
+        # file-check path ignores it (and skips the .vof save).
         return self._result_from_diags(
-            diagnostics,
+            diags,
             check_time_ms=int(elapsed * 1000),
-            timed_out=not completed,
+            timed_out=not settled,
         )
 
-    def _wait_for_diagnostics(
-        self, uri: str, version: int, timeout: float, wait_full: bool = False
-    ) -> tuple[list[dict[str, Any]], bool]:
-        """Block until coq-lsp finishes processing *uri* at *version*.
+    def _drive_full_check_locked(
+        self, uri: str, content: str, timeout: float
+    ) -> bool:
+        """Drive a check of the WHOLE document (report all errors).
 
-        Completion is signalled by a Busy→Idle ``$/coq/serverStatus``
-        transition (a Busy seen since this edit, followed by Idle or
-        Stopped).  A brief trailing grace catches a final
-        ``publishDiagnostics`` that races just behind the status
-        transition.  The background reader populates the shared state; we
-        only wait on the condition variable here.
-
-        When *wait_full* is ``False`` (the file-checking default), we
-        short-circuit as soon as an error diagnostic for the matching
-        version arrives — a latency win for the edit-check loop where the
-        first error is what matters.  When ``True`` (the append-a-query
-        path), we must NOT short-circuit: coq-lsp recovers from the error
-        (``max_errors`` default 150, ``admit_on_bad_qed``) and keeps
-        processing, so the appended query sentence's ``info`` diagnostic
-        only appears once the whole document is checked.
+        For callers that need every sentence processed -- ``documentSymbol``
+        (the file outline) and the append-a-query path.  Thin wrapper over
+        :meth:`_drive_barrier_locked` with the EOF target and no early stop.
         """
+        return self._drive_barrier_locked(
+            uri, len(content.splitlines()), 0, timeout, stop_at_first_error=False
+        )
+
+    def _set_max_errors_locked(self, n: int) -> None:
+        """Set coq-lsp's ``max_errors`` (idempotent; skips a redundant send).
+
+        ``do_settings`` REPLACES the whole config, so we resend
+        ``_BASE_SETTINGS`` alongside.  Caller holds ``self._lock``.
+        """
+        if self._max_errors == n:
+            return
+        self._notify(
+            "workspace/didChangeConfiguration",
+            {"settings": {**_BASE_SETTINGS, "max_errors": n}},
+        )
+        self._max_errors = n
+
+    def _drive_barrier_locked(
+        self,
+        uri: str,
+        line: int,
+        character: int,
+        timeout: float,
+        *,
+        stop_at_first_error: bool,
+    ) -> bool:
+        """Drive checking toward ``(line, character)``; report whether it settled.
+
+        Issues a ``proof/goals`` barrier at the target -- in
+        ``check_only_on_request`` mode this is what makes coq-lsp check up to
+        that point.  ``max_errors`` is set to ``0`` (halt at the first error)
+        or the default (run through, report all) per *stop_at_first_error*.
+
+        Returns ``True`` when checking settled -- the target was reached
+        (barrier answered), or, when *stop_at_first_error*, coq-lsp halted at
+        the first error (which it publishes but then stops, so an expensive
+        tail below it is never run).  Returns ``False`` on timeout / dead
+        process -- the document is then only partially checked.  Caller holds
+        ``self._lock`` and the document is already synced/open.
+        """
+        self._set_max_errors_locked(
+            _MAX_ERRORS_FIRST if stop_at_first_error else _MAX_ERRORS_FULL
+        )
+        # Send the barrier WITHOUT blocking on its response: when coq-lsp stops
+        # early (max_errors=0 at the first error) it never reaches the target,
+        # so the response never comes -- we detect that via the published
+        # error instead.
+        self._request_id += 1
+        req_id = self._request_id
+        msg = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "proof/goals",
+            "params": {
+                "textDocument": {"uri": uri},
+                "position": {"line": line, "character": character},
+                "pp_format": "Str",
+            },
+        }
+        try:
+            self._send_message(msg)
+        except (BrokenPipeError, OSError, ValueError):
+            return False
         deadline = time.monotonic() + timeout if timeout > 0 else None
-
-        def _matching_diags() -> list[dict[str, Any]] | None:
-            st = self._doc_state.get(uri)
-            if st is None:
-                return None
-            if st["version"] is not None and st["version"] != version:
-                return None
-            return st["diags"]
-
+        settled = False
         with self._cv:
             while True:
+                if req_id in self._responses:
+                    settled = True  # target reached
+                    break
                 if self._dead:
                     break
-                diags = _matching_diags()
-                # Short-circuit on first error (file-check fast path only).
-                if (
-                    not wait_full
-                    and diags is not None
-                    and any(d["severity"] == SEVERITY_ERROR for d in diags)
-                ):
-                    return diags, True
-                if self._saw_busy and self._status in ("Idle", "Stopped"):
-                    # Processing complete; grab a final trailing update.
-                    self._cv.wait(_DIAG_TRAILING_GRACE)
-                    final = _matching_diags()
-                    return (final if final is not None else (diags or [])), True
+                if stop_at_first_error:
+                    st = self._doc_state.get(uri)
+                    if st and any(
+                        d["severity"] == SEVERITY_ERROR for d in st["diags"]
+                    ):
+                        settled = True  # coq-lsp halted at the first error
+                        break
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -691,16 +780,9 @@ class LspChecker:
                     self._cv.wait(min(remaining, 0.5))
                 else:
                     self._cv.wait(0.5)
-
-        # Deadline elapsed or process died: return whatever we have, but
-        # flag the result as not-completed so query callers can report a
-        # timeout instead of silently treating partial output as final.
-        final = self._doc_state.get(uri)
-        if final is not None and (
-            final["version"] is None or final["version"] == version
-        ):
-            return final["diags"], False
-        return [], False
+            # Drop the response (present or late) so it cannot orphan.
+            self._responses.pop(req_id, None)
+        return settled
 
     def check_up_to(
         self,
@@ -711,28 +793,27 @@ class LspChecker:
         content: str | None = None,
         workspace: str = "",
         timeout: float = _DEFAULT_REQUEST_TIMEOUT,
+        stop_at_first_error: bool = True,
     ) -> dict[str, Any]:
         """Check only as far as a point and return that prefix's diagnostics.
 
         Low-latency counterpart to :meth:`check_file`: opens the real,
-        full document, then issues a *postponed* ``proof/goals`` request
-        at the point as a barrier.  coq-lsp drives checking toward the
-        point and answers the request the moment the check *reaches* it
-        (``Doc.Target.reached`` in ``fleche/theory.ml``) — it does NOT
-        wait for the rest of the document, which keeps checking in the
-        background.  The goals payload is ignored; the request is purely a
-        "checked up to here" signal.  We then return the diagnostics
-        published for the prefix (start line ``<= line``) in the same
-        shape as :meth:`check_file`.
+        full document, then issues a ``proof/goals`` request at the point
+        as a barrier.  coq-lsp drives checking toward the point and answers
+        the request the moment the check *reaches* it (``Doc.Target.reached``
+        in ``fleche/theory.ml``).  Because coq-lsp runs in
+        ``check_only_on_request`` mode (see :meth:`_start`), it then STOPS
+        -- it does not run the rest of the document -- so the session stays
+        responsive and an expensive tail (e.g. a slow/diverging tactic
+        further down) is never started by a query before it.  The goals
+        payload is ignored; the request is purely a "checked up to here"
+        signal.  We then return the diagnostics published for the prefix
+        (start line ``<= line``) in the same shape as :meth:`check_file`.
 
         *character* ``None`` means "through the end of *line*": the point
         is placed just after that line's last character, so the line's
         final sentence (typically a ``Qed.``) is included but the next
         line's is not.  Give *character* for an exact point.
-
-        Note: the tail keeps elaborating in the background after this
-        returns, with no memory watchdog then watching it.  Prefer the
-        full :meth:`check_file` on files whose *unchecked* tail is huge.
         """
         with self._lock:
             self._ensure_started(workspace)
@@ -763,45 +844,46 @@ class LspChecker:
 
             start_time = time.monotonic()
             self._ensure_open(uri, content, file_path=resolved)
-            resp = self._request(
-                "proof/goals",
-                {
-                    "textDocument": {"uri": uri},
-                    "position": {"line": line, "character": b_char},
-                    "pp_format": "Str",
-                },
-                timeout=timeout,
+            # Drive checking toward the point.  *settled* is False only on
+            # timeout / dead process (the check never reached the point and
+            # found no error on the way); the prefix diagnostics are then
+            # best-effort.
+            settled = self._drive_barrier_locked(
+                uri, line, b_char, timeout,
+                stop_at_first_error=stop_at_first_error,
             )
-            # A transport error / timeout means the check never reached the
-            # point; report it as a timeout and hand back whatever prefix
-            # diagnostics we have (best effort).
-            barrier_failed = isinstance(resp, dict) and "_lsp_error" in resp
             diags = self._collect_prefix_diags(uri, line)
             elapsed = time.monotonic() - start_time
 
         return self._result_from_diags(
             diags,
             check_time_ms=int(elapsed * 1000),
-            timed_out=barrier_failed,
-            ok=not barrier_failed,
+            timed_out=not settled,
+            ok=settled,
         )
 
-    def _collect_prefix_diags(self, uri: str, line: int) -> list[dict[str, Any]]:
-        """Diagnostics for *uri* with start line ``<= line``.
+    def _diags_after_grace(self, uri: str) -> list[dict[str, Any]]:
+        """All published diagnostics for *uri*, after a brief settle grace.
 
-        Caller holds ``self._lock``.  Waits a brief grace for the
-        diagnostics batch that can race just behind the positional barrier
-        response (eager diagnostics for the sentence at the point may land
-        just after the goals reply), then filters to the prefix.  Tail
-        diagnostics that arrive while the background check runs past the
-        point are dropped by the ``<= line`` filter.
+        Caller holds ``self._lock``.  A barrier response can land just
+        ahead of the final ``publishDiagnostics`` batch for the sentence at
+        the point, so we wait ``_DIAG_TRAILING_GRACE`` before reading the
+        live ``_doc_state``.  Returns the full set (empty if unknown).
         """
         with self._cv:
             self._cv.wait(_DIAG_TRAILING_GRACE)
             st = self._doc_state.get(uri)
-        if st is None:
+        if not st:
             return []
-        return [d for d in st["diags"] if d["line"] <= line]
+        # Drop the max_errors sentinel -- it is an artifact of stopping at the
+        # limit, not a real diagnostic.
+        return [d for d in st["diags"] if d.get("message") != _MAX_ERRORS_SENTINEL]
+
+    def _collect_prefix_diags(self, uri: str, line: int) -> list[dict[str, Any]]:
+        """Diagnostics for *uri* with start line ``<= line`` (the barrier
+        prefix).  Tail diagnostics past the point are dropped by the filter.
+        """
+        return [d for d in self._diags_after_grace(uri) if d["line"] <= line]
 
     # ------------------------------------------------------------------
     # proof/goals (read-only goal inspection + speculative pretac)
@@ -853,6 +935,10 @@ class LspChecker:
                     return {"_lsp_error": str(e)}
             uri = Path(resolved).as_uri()
             self._ensure_open(uri, content, file_path=resolved)
+            # Inspect the state at a point: coq-lsp must recover from any
+            # upstream error to reach it, so keep max_errors at the default
+            # (a stop-at-first-error file check may have lowered it).
+            self._set_max_errors_locked(_MAX_ERRORS_FULL)
             params: dict[str, Any] = {
                 "textDocument": {"uri": uri},
                 "position": {"line": line, "character": character},
@@ -910,6 +996,10 @@ class LspChecker:
                     return {"_lsp_error": str(e)}
             uri = Path(resolved).as_uri()
             self._ensure_open(uri, content, file_path=resolved)
+            # The server must reach the point (recovering from upstream
+            # errors) to extract / report errors-before; keep max_errors at
+            # the default in case a stop-at-first-error check lowered it.
+            self._set_max_errors_locked(_MAX_ERRORS_FULL)
             return self._request(
                 "coq/extract",
                 {
@@ -937,8 +1027,10 @@ class LspChecker:
         The result is the raw hierarchical symbol list — each node has
         ``name``, ``kind``, ``detail``, ``range``, ``selectionRange`` and
         optional ``children`` — or a ``{"_lsp_error": ...}`` dict on
-        failure.  coq-lsp postpones the request until the full document
-        is processed.
+        failure.  The outline covers the whole file, so we drive a full
+        check first (in ``check_only_on_request`` mode the request would
+        otherwise be answered against the not-yet-checked document and come
+        back empty).
         """
         with self._lock:
             self._ensure_started(workspace)
@@ -950,6 +1042,7 @@ class LspChecker:
                     return {"_lsp_error": str(e)}
             uri = Path(resolved).as_uri()
             self._ensure_open(uri, content, file_path=resolved)
+            self._drive_full_check_locked(uri, content, timeout)
             return self._request(
                 "textDocument/documentSymbol",
                 {"textDocument": {"uri": uri}},

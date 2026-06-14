@@ -1920,6 +1920,7 @@ async def rocq_compile_lsp(
     include_info: bool = False,
     line: int | None = None,
     character: int | None = None,
+    stop_at_first_error: bool = True,
     cache_on_error: bool = False,
     ctx: Context = None,
 ) -> dict[str, Any]:
@@ -1937,18 +1938,20 @@ async def rocq_compile_lsp(
 
     **Check up to a position (low latency).**  Pass ``line`` (and
     optionally ``character``) to get the diagnostics for the file *up to
-    that point* as soon as coq-lsp's check reaches it — without waiting
-    for the rest of the file, which keeps checking in the background.
-    This is the fast way to verify a lemma near the top of a file with an
-    expensive proof further down: you get the top lemma's result
-    immediately.  Omit ``line`` (the default) to check the whole file and
-    wait for completion.  With ``character`` omitted the point is the end
-    of ``line`` (so passing a lemma's ``Qed.``/``Defined.`` line reports
-    through that lemma); give ``character`` for an exact point.  Only
-    diagnostics at or before the point are returned, and the result
-    carries ``checked_through: {line, character}``.  (Because the tail
-    then elaborates unsupervised — no watchdog runs once this returns —
-    prefer a full check on files whose *unchecked* tail is huge.)
+    that point* as soon as coq-lsp's check reaches it — without checking
+    the rest of the file.  coq-lsp then STOPS at that point (it does not
+    elaborate the tail), so the session stays responsive: an expensive or
+    even diverging tactic further down is never started, and you can keep
+    inspecting state before it (e.g. ``rocq_get_state``) without the
+    session wedging.  This is the fast way to verify a lemma near the top
+    of a file with an expensive proof further down: you get the top
+    lemma's result immediately.  Omit ``line`` (the default) to check the
+    whole file and wait for completion.  With ``character`` omitted the
+    point is the end of ``line`` (so passing a lemma's
+    ``Qed.``/``Defined.`` line reports through that lemma); give
+    ``character`` for an exact point.  Only diagnostics at or before the
+    point are returned, and the result carries
+    ``checked_through: {line, character}``.
 
     A memory watchdog monitors the coq-lsp subprocess against
     ``ROCQ_MAX_LSP_RSS_MB``; on breach the response is
@@ -1971,13 +1974,20 @@ async def rocq_compile_lsp(
         character: 0-based character within *line* for an exact point
             (default: None = the end of *line*).  Ignored when *line* is
             None.
+        stop_at_first_error: Return as soon as the check hits the first
+            error, without elaborating anything below it (default: True) --
+            fast feedback on a broken file, and an expensive/slow tactic
+            below the error is never run.  Set to False to check through to
+            the end (or *line*) and report every error.  Applies to both the
+            whole-file and position-limited checks.
         cache_on_error: Persist the ``.vof`` warm-start snapshot even when
             the file has errors (default: False).  By default a snapshot is
             saved only for a clean full check; set this to cache a
             completed-but-erroring document anyway (e.g. to warm-start a
             large file whose tail you are still fixing).  Only applies to a
             full check (``line`` omitted) -- position-limited checks never
-            snapshot.
+            snapshot.  Implies a full check (overrides *stop_at_first_error*),
+            since a snapshot needs the document checked through to EOF.
     """
     # Same workspace handling as the other file tools: auto-detect the
     # project root from *file* when no explicit workspace is given.
@@ -2013,16 +2023,26 @@ async def rocq_compile_lsp(
             f"line and character must be in range [0, {_MAX_LINE_CHAR_RANGE}].",
         )
 
+    # Snapshotting a broken file (cache_on_error) needs a completed, EOF-
+    # reaching check, so it implies a full check (overrides stop-at-first).
+    effective_stop = stop_at_first_error and not cache_on_error
+
     def _check(checker: Any) -> dict[str, Any]:
         if line is None:
             return checker.check_file(
                 resolved,
                 workspace,
                 float(timeout),
+                effective_stop,
                 save_vof_on_error=cache_on_error,
             )
         return checker.check_up_to(
-            resolved, line, character, workspace=workspace, timeout=float(timeout)
+            resolved,
+            line,
+            character,
+            workspace=workspace,
+            timeout=float(timeout),
+            stop_at_first_error=effective_stop,
         )
 
     # _run_with_lsp handles checker lifecycle, the RSS memory watchdog
