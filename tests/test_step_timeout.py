@@ -327,14 +327,19 @@ class TestStateBeforeSlowTactic:
     to run it, so it must return promptly.
     """
 
-    # line 3 is a ~minutes-long tactic (1e11 idtac iterations); the `pose`
-    # before it (line 2) is instant.
+    # The slow sentence (line 4) is an Ltac `match goal` self-recursion: an
+    # *engine-level* infinite loop that polls Coq's interrupt flag every
+    # iteration (tacinterp.ml), so the cooperative per-sentence watchdog can
+    # abort it.  (A single kernel computation -- `vm_compute` -- or `do N idtac`
+    # would NOT poll and is only interruptible by an async signal; real slow
+    # tactics poll like this one.)  The `pose` before it (line 3) is instant.
     _SRC = (
-        "Theorem t : True.\n"        # 0
-        "Proof.\n"                    # 1
-        "pose (marker := 41).\n"      # 2
-        "do 100000000000 idtac.\n"    # 3  <- slow
-        "exact I.\n"                  # 4
+        "Ltac spin := match goal with |- _ => spin end.\n"  # 0
+        "Theorem t : True.\n"                                # 1
+        "Proof.\n"                                           # 2
+        "pose (marker := 41).\n"                             # 3
+        "spin.\n"                                            # 4  <- diverges
+        "exact I.\n"                                         # 5
         "Qed.\n"
     )
 
@@ -356,16 +361,18 @@ class TestStateBeforeSlowTactic:
         names = [n for h in goals[0]["hyps"] for n in h["names"]]
         assert "marker" in names
 
-    _PRE_SLOW_CHAR = len("pose (marker := 41).")  # end of line 2
+    _MARKER_LINE = 3  # the `pose (marker := 41).` sentence
+    _PRE_SLOW_CHAR = len("pose (marker := 41).")  # end of the marker line
 
     def test_state_before_slow_tactic_is_reachable(self, tmp_path):
         checker, f = self._make(tmp_path)
         try:
             # The state at the end of the sentence BEFORE the slow tactic.
-            # Reaching it checks only lines 0-2 and never runs the slow
+            # Reaching it checks only the prefix and never runs the slow
             # tactic, so it must return at once with `marker` in context.
             g = checker.goals(
-                f, line=2, character=self._PRE_SLOW_CHAR, mode="After", timeout=10.0,
+                f, line=self._MARKER_LINE, character=self._PRE_SLOW_CHAR,
+                mode="After", timeout=10.0,
             )
             self._assert_marker_state(g)
         finally:
@@ -375,46 +382,60 @@ class TestStateBeforeSlowTactic:
         """rocq_compile_lsp(line=X) before the slow tactic must not wedge the
         session for the next query.
 
-        Today it does: after serving the barrier at X, coq-lsp continues
-        checking to EOF in the background (default mode) and runs the slow
-        tactic, so the follow-up query blocks.  The fix
-        (check_only_on_request) makes the positioned check stop at X.  This
-        test asserts the DESIRED behavior; it fails until the fix lands.
+        coq-lsp runs in ``check_only_on_request`` mode, so the positioned
+        check stops at X and never starts the slow tactic below it; the
+        follow-up query is then served promptly.
         """
         checker, f = self._make(tmp_path)
         try:
             # Positioned check up to the sentence before the slow tactic.
-            r = checker.check_up_to(f, 2, workspace=str(tmp_path), timeout=10.0)
+            r = checker.check_up_to(
+                f, self._MARKER_LINE, workspace=str(tmp_path), timeout=10.0
+            )
             assert r["success"] is True
             # A follow-up state query before the slow tactic must NOT block.
             g = checker.goals(
-                f, line=2, character=self._PRE_SLOW_CHAR, mode="After", timeout=8.0,
+                f, line=self._MARKER_LINE, character=self._PRE_SLOW_CHAR,
+                mode="After", timeout=8.0,
             )
             self._assert_marker_state(g)
         finally:
             checker.stop()
 
-    @pytest.mark.xfail(
-        reason="coq-lsp is single-threaded on OCaml 4.x: once a full check "
-        "starts the slow tactic it cannot be interrupted (rocq-lsp "
-        "lsp_core.ml) and the Python timeout cannot cancel it, so the session "
-        "stays blocked until the process is restarted. Fundamentally hard to "
-        "fix without OCaml 5.x.",
-        strict=False,
-    )
     def test_whole_file_timeout_does_not_block_followup_query(self, tmp_path):
-        """We WANT a query before the slow tactic to work even after a
-        whole-file rocq_compile_lsp timed out on it -- but it can't, hence
-        xfail (documents the desired behavior + the known limitation)."""
+        """A diverging sentence in a whole-file check no longer wedges the
+        session: with a coq-lsp-side per-sentence timeout the slow tactic is
+        aborted (reported as a "Timeout!" error), the check completes, and a
+        query before it is served promptly.
+
+        This was previously xfail -- "fundamentally hard without OCaml 5.x".
+        The coq-lsp-side fix is a watchdog thread that trips Coq's *polled*
+        interrupt flag (the same mechanism an incoming request uses to preempt
+        a running check), so the single-threaded checker is freed on a
+        wall-clock budget without needing OCaml 5.x.  See
+        ``Fleche.Sentence_timer`` and ``sentence_watchdog`` in rocq-lsp.
+        """
         checker, f = self._make(tmp_path)
         try:
-            # Whole-file check times out on the slow tactic (Python-side).
-            r = checker.check_file(f, workspace=str(tmp_path), timeout=2.0)
-            assert r["timed_out"] is True
-            # Desired: a query before the slow tactic still works.  Reality:
-            # coq-lsp is mid-tactic and single-threaded, so this blocks.
+            t0 = time.monotonic()
+            # Whole-file check with a 2s per-sentence budget.  The diverging
+            # tactic overruns and is aborted coq-lsp-side (reported as a
+            # "Timeout!" error); the check then settles instead of running for
+            # minutes.
+            r = checker.check_file(
+                f, workspace=str(tmp_path), timeout=20.0, sentence_timeout=2.0,
+            )
+            elapsed = time.monotonic() - t0
+            # Settled by interrupting the sentence -- not by running it to
+            # completion (minutes) and not via a Python-side give-up.
+            assert r["timed_out"] is False, r
+            assert elapsed < 15.0, f"check took {elapsed:.1f}s (sentence not bounded)"
+            # The diverging sentence is reported as a Timeout error.
+            assert any("Timeout" in e.get("message", "") for e in r["errors"]), r
+            # A query before the slow tactic now works promptly.
             g = checker.goals(
-                f, line=2, character=self._PRE_SLOW_CHAR, mode="After", timeout=3.0,
+                f, line=self._MARKER_LINE, character=self._PRE_SLOW_CHAR,
+                mode="After", timeout=8.0,
             )
             self._assert_marker_state(g)
         finally:

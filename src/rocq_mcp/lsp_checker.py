@@ -170,9 +170,10 @@ class LspChecker:
         self._lock = threading.RLock()
         self._request_id = 0
         self._initialized = False
-        # Current coq-lsp ``max_errors`` (None until initialized).  Toggled
-        # per-check via didChangeConfiguration; tracked to skip redundant sends.
-        self._max_errors: int | None = None
+        # Current coq-lsp check settings as ``(max_errors, sentence_timeout)``
+        # (None until initialized).  Toggled per-check via
+        # didChangeConfiguration; tracked to skip redundant sends.
+        self._check_settings: tuple[int, float] | None = None
         # Track open documents: uri -> version
         self._open_docs: dict[str, int] = {}
         # Track last content sent per uri (to skip no-op didChange and to
@@ -260,7 +261,8 @@ class LspChecker:
         )
         self._notify("initialized", {})
         self._initialized = True
-        self._max_errors = _MAX_ERRORS_FULL  # coq-lsp default after base init
+        # coq-lsp defaults after base init: max_errors=150, sentence_timeout=0.
+        self._check_settings = (_MAX_ERRORS_FULL, 0.0)
         dlog.event(
             "process",
             "ready",
@@ -515,6 +517,7 @@ class LspChecker:
         stop_at_first_error: bool = True,
         *,
         save_vof_on_error: bool = False,
+        sentence_timeout: float = 0.0,
     ) -> dict[str, Any]:
         """Check a file on disk and return diagnostics.
 
@@ -534,6 +537,13 @@ class LspChecker:
         ``True`` to snapshot any *completed* check regardless of errors
         (coq-lsp's ``coq/saveVof`` still requires the document to have
         reached EOF).  A timed-out check is never snapshotted.
+
+        *sentence_timeout* > 0 bounds each individual sentence of the check on
+        the coq-lsp side (seconds): a sentence that runs longer is aborted and
+        reported as a "Timeout!" error, then checking continues with the next
+        sentence.  This keeps a single diverging tactic from wedging the whole
+        check (and the session).  ``0.0`` (default) disables it -- some proofs
+        have legitimately minutes-long sentences.
 
         Returns:
             {
@@ -565,7 +575,11 @@ class LspChecker:
                     "check_time_ms": 0,
                 }
             result = self._check_content_locked(
-                resolved, content, timeout, stop_at_first_error=stop_at_first_error
+                resolved,
+                content,
+                timeout,
+                stop_at_first_error=stop_at_first_error,
+                sentence_timeout=sentence_timeout,
             )
         # After a completed full-file check, persist the warm document as a
         # .vof so a future fresh session can reload it instead of
@@ -645,6 +659,7 @@ class LspChecker:
         content: str,
         timeout: float,
         stop_at_first_error: bool = False,
+        sentence_timeout: float = 0.0,
     ) -> dict[str, Any]:
         """Core whole-document check; caller holds ``self._lock`` and coq-lsp
         is alive.
@@ -673,6 +688,7 @@ class LspChecker:
             0,
             timeout,
             stop_at_first_error=stop_at_first_error,
+            sentence_timeout=sentence_timeout,
         )
         diags = self._diags_after_grace(uri)
         elapsed = time.monotonic() - start_time
@@ -697,19 +713,35 @@ class LspChecker:
             uri, len(content.splitlines()), 0, timeout, stop_at_first_error=False
         )
 
-    def _set_max_errors_locked(self, n: int) -> None:
-        """Set coq-lsp's ``max_errors`` (idempotent; skips a redundant send).
+    def _set_max_errors_locked(
+        self, n: int, sentence_timeout: float = 0.0
+    ) -> None:
+        """Set coq-lsp's ``max_errors`` and ``sentence_timeout`` (idempotent;
+        skips a redundant send).
 
         ``do_settings`` REPLACES the whole config, so we resend
-        ``_BASE_SETTINGS`` alongside.  Caller holds ``self._lock``.
+        ``_BASE_SETTINGS`` alongside -- and because the replace re-applies
+        defaults, *sentence_timeout* must be sent every time we want it active
+        (omitting it resets coq-lsp to its ``0.0`` default).  We therefore track
+        both values as a pair and resend whenever either changes.  Caller holds
+        ``self._lock``.
+
+        *sentence_timeout* > 0 bounds each *sentence* of document checking on the
+        coq-lsp side: a sentence that runs longer is aborted (a watchdog raises
+        Coq's interrupt) and reported as a "Timeout!" error, after which
+        checking continues -- so a single diverging tactic cannot wedge the
+        whole-file check.  ``0.0`` (default) disables it.
         """
-        if self._max_errors == n:
+        desired = (n, sentence_timeout)
+        if self._check_settings == desired:
             return
+        settings: dict[str, Any] = {**_BASE_SETTINGS, "max_errors": n}
+        if sentence_timeout > 0:
+            settings["sentence_timeout"] = sentence_timeout
         self._notify(
-            "workspace/didChangeConfiguration",
-            {"settings": {**_BASE_SETTINGS, "max_errors": n}},
+            "workspace/didChangeConfiguration", {"settings": settings}
         )
-        self._max_errors = n
+        self._check_settings = desired
 
     def _drive_barrier_locked(
         self,
@@ -719,6 +751,7 @@ class LspChecker:
         timeout: float,
         *,
         stop_at_first_error: bool,
+        sentence_timeout: float = 0.0,
     ) -> bool:
         """Drive checking toward ``(line, character)``; report whether it settled.
 
@@ -735,7 +768,8 @@ class LspChecker:
         ``self._lock`` and the document is already synced/open.
         """
         self._set_max_errors_locked(
-            _MAX_ERRORS_FIRST if stop_at_first_error else _MAX_ERRORS_FULL
+            _MAX_ERRORS_FIRST if stop_at_first_error else _MAX_ERRORS_FULL,
+            sentence_timeout,
         )
         # Send the barrier WITHOUT blocking on its response: when coq-lsp stops
         # early (max_errors=0 at the first error) it never reaches the target,
@@ -794,6 +828,7 @@ class LspChecker:
         workspace: str = "",
         timeout: float = _DEFAULT_REQUEST_TIMEOUT,
         stop_at_first_error: bool = True,
+        sentence_timeout: float = 0.0,
     ) -> dict[str, Any]:
         """Check only as far as a point and return that prefix's diagnostics.
 
@@ -814,6 +849,11 @@ class LspChecker:
         is placed just after that line's last character, so the line's
         final sentence (typically a ``Qed.``) is included but the next
         line's is not.  Give *character* for an exact point.
+
+        *sentence_timeout* > 0 bounds each sentence on the way to the point
+        (seconds); a slow/diverging tactic *before* the point is aborted and
+        reported as "Timeout!" instead of blocking the barrier.  See
+        :meth:`check_file`.  ``0.0`` (default) disables it.
         """
         with self._lock:
             self._ensure_started(workspace)
@@ -851,6 +891,7 @@ class LspChecker:
             settled = self._drive_barrier_locked(
                 uri, line, b_char, timeout,
                 stop_at_first_error=stop_at_first_error,
+                sentence_timeout=sentence_timeout,
             )
             diags = self._collect_prefix_diags(uri, line)
             elapsed = time.monotonic() - start_time

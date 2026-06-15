@@ -286,6 +286,91 @@ class TestLspMemoryWatchdogBreach:
         ] >= 333.0
 
 
+class TestLspHardTimeout:
+    """ROCQ_HARD_TIMEOUT kills + restarts coq-lsp when one operation runs
+    past the wall-clock deadline -- the backstop for a non-cooperative
+    divergence (a tactic that ignores Coq's polled interrupt, so neither
+    sentence_timeout nor request preemption can free it).
+    """
+
+    @pytest.mark.asyncio
+    async def test_hard_timeout_kills_and_restarts(self, tmp_path, monkeypatch):
+        """An op exceeding ROCQ_HARD_TIMEOUT -> hard_timeout + lsp_restarted."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        # Hard RSS cap well above the sampled RSS so the MEMORY watchdog never
+        # fires -- only the wall-clock deadline should trigger.
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 100_000)
+        monkeypatch.setattr(_server, "ROCQ_HARD_TIMEOUT", 0.05)
+        _patch_psutil_rss(monkeypatch, 10)
+
+        vfile = tmp_path / "diverge.v"
+        vfile.write_text("Theorem t : True. Proof. exact I. Qed.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()
+        # check_file blocks well past the 0.05 s deadline -- stands in for a
+        # divergence that does not respond to interruption.
+        checker.check_file.side_effect = lambda *a, **kw: (
+            time.sleep(0.5)
+            or {"success": True, "errors": [], "warnings": [], "check_time_ms": 500}
+        )
+        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
+
+        ctx = _MockLspContext(ls)
+        t0 = time.monotonic()
+        result = await rocq_compile_lsp(
+            file=str(vfile), workspace=str(tmp_path), ctx=ctx
+        )
+        elapsed = time.monotonic() - t0
+
+        assert result["success"] is False
+        assert result["reason"] == "hard_timeout"
+        assert result["lsp_restarted"] is True
+        assert "hard timeout" in result["error"]
+        # Returned at the deadline, NOT after the 0.5 s block.
+        assert elapsed < 0.4, f"did not abort at the deadline (took {elapsed:.2f}s)"
+        # _invalidate_lsp killed + dropped the session so the next call respawns.
+        assert checker.stop.called
+        assert pool_checker(ls, workspace=str(tmp_path), file=str(vfile)) is None
+        assert session_meta(ls, workspace=str(tmp_path), file=str(vfile))[
+            "generation"
+        ] == 1
+        assert any(
+            e.get("reason") == "hard_timeout"
+            and e.get("tool") == "rocq_compile_lsp"
+            for e in ls["recent_errors"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_disabled_hard_timeout_does_not_abort(self, tmp_path, monkeypatch):
+        """ROCQ_HARD_TIMEOUT=0 (default) -> a normal check runs unaffected."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 100_000)
+        monkeypatch.setattr(_server, "ROCQ_HARD_TIMEOUT", 0.0)
+        _patch_psutil_rss(monkeypatch, 10)
+
+        vfile = tmp_path / "ok.v"
+        vfile.write_text("Theorem t : True. Proof. exact I. Qed.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()  # default check_file blocks ~0.2 s
+        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
+
+        ctx = _MockLspContext(ls)
+        result = await rocq_compile_lsp(
+            file=str(vfile), workspace=str(tmp_path), ctx=ctx
+        )
+        assert result.get("reason") != "hard_timeout"
+        assert "lsp_restarted" not in result
+        # Checker reused, not killed.
+        assert pool_checker(ls, workspace=str(tmp_path), file=str(vfile)) is checker
+        assert not checker.stop.called
+
+
 class TestLspSoftThresholdTrim:
     """coq-lsp memo caches grow unboundedly across calls (Memo.Interp /
     Admit / Init / Require / Intern, each an unbounded OCaml Hashtbl).

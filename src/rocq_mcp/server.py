@@ -40,6 +40,21 @@ ROCQ_OP_TIMEOUT: float = float(
     os.environ.get("ROCQ_OP_TIMEOUT", os.environ.get("ROCQ_PET_TIMEOUT", "30"))
 )
 ROCQ_QUERY_TIMEOUT_CAP: int = int(os.environ.get("ROCQ_QUERY_TIMEOUT_CAP", "300"))
+# Global default per-sentence wall-clock budget (seconds) for rocq_compile_lsp's
+# document checking.  0 (the default) disables it; when > 0 it becomes the
+# default for the tool's ``sentence_timeout`` parameter, so a single
+# slow/diverging tactic cannot wedge a check without opting in per call.  A
+# per-call ``sentence_timeout`` overrides this (pass 0 to force-disable).
+ROCQ_SENTENCE_TIMEOUT: float = float(os.environ.get("ROCQ_SENTENCE_TIMEOUT", "0"))
+# Hard wall-clock backstop (seconds) for any single coq-lsp operation.  0 (the
+# default) disables it.  When > 0, an operation that runs longer is aborted by
+# KILLING and restarting that session's coq-lsp subprocess -- the only lever
+# that frees a non-cooperative divergence (a tactic that ignores Coq's polled
+# interrupt, e.g. ``do N idtac`` or a monolithic ``vm_compute``), which the
+# in-process ``sentence_timeout`` cannot touch.  The response then carries
+# ``reason: "hard_timeout"`` and ``lsp_restarted: True``.  Last-resort safety
+# net -- prefer ``ROCQ_SENTENCE_TIMEOUT`` for graceful per-sentence bounds.
+ROCQ_HARD_TIMEOUT: float = float(os.environ.get("ROCQ_HARD_TIMEOUT", "0"))
 ROCQ_COQC_BINARY: str = os.environ.get("ROCQ_COQC_BINARY", "coqc")
 ROCQ_MAX_SOURCE_SIZE: int = int(os.environ.get("ROCQ_MAX_SOURCE_SIZE", "1000000"))
 # Max characters per rendered term in the structured goal output of the
@@ -687,6 +702,9 @@ _RECENT_ERROR_REASONS: frozenset[str] = frozenset(
         "timeout",
         "crashed",
         "memory_exhausted",
+        # rocq_compile_lsp hard wall-clock backstop (ROCQ_HARD_TIMEOUT) tripped
+        # -- coq-lsp was killed + restarted.
+        "hard_timeout",
         "lock_contended",
         "unavailable",
         "validation",
@@ -807,6 +825,38 @@ def _build_lsp_memory_abort_response(
     }
 
 
+def _build_lsp_hard_timeout_response(
+    lifespan_state: dict[str, Any],
+    tool: str,
+    key: str,
+) -> dict[str, Any]:
+    """Hard-timeout recovery for one coq-lsp session.
+
+    Kills the *key* session's coq-lsp subprocess (so the next call respawns
+    it -- reloading the ``.vof`` warm-start if present) and returns the
+    unified ``hard_timeout`` envelope.  Used when an operation exceeds
+    ``ROCQ_HARD_TIMEOUT``: the operation hit something that does not respond
+    to Coq's polled interrupt (a non-cooperative divergence), so killing the
+    process is the only way to free the session.  Other sessions in the pool
+    are untouched.
+    """
+    _invalidate_lsp(lifespan_state, key)
+    error = (
+        f"{tool} aborted: exceeded the hard timeout of {ROCQ_HARD_TIMEOUT}s "
+        "(ROCQ_HARD_TIMEOUT). coq-lsp has been restarted. The operation hit a "
+        "tactic that does not respond to interruption -- check for a diverging "
+        "or non-terminating tactic (e.g. an unbounded loop or a runaway "
+        "computation)."
+    )
+    _record_error(lifespan_state, tool, error, reason="hard_timeout")
+    return {
+        "success": False,
+        "error": error,
+        "reason": "hard_timeout",
+        "lsp_restarted": True,
+    }
+
+
 def _checker_process(checker: Any) -> Any:
     """Return *checker*'s coq-lsp subprocess (with ``.pid``) or None."""
     if checker is None:
@@ -875,22 +925,33 @@ async def _memory_watchdog(
     *,
     get_process: Callable[[], Any],
     on_rss: Callable[[int], None] | None = None,
+    deadline: float | None = None,
+    timeout_event: asyncio.Event | None = None,
 ) -> None:
-    """Sample one subprocess's RSS; on breach, set *event* + cancel *main_task*.
+    """Watch one coq-lsp op: on RSS breach *or* hard-timeout, cancel *main_task*.
 
     Runs concurrently with the main work thread, watching a *single*
-    coq-lsp process (one per session — see :func:`_run_with_lsp`).  When
-    that process's RSS exceeds ``max_rss_mb`` MB, it signals memory
-    exhaustion via *event* and cancels the main task so the caller's
-    recovery path can kill and respawn just that session's subprocess.
+    coq-lsp process (one per session — see :func:`_run_with_lsp`).  Two
+    independent triggers, each cancelling the main task so the caller's
+    recovery path can kill and respawn just that session's subprocess:
+
+    - **RSS:** when the process's RSS exceeds ``max_rss_mb`` MB, set
+      *event* (memory exhaustion).
+    - **Hard timeout:** when ``deadline`` (a ``time.monotonic()`` value) is
+      reached, set *timeout_event*.  This is the only backstop that frees a
+      *non-cooperative* divergence (one that ignores Coq's polled interrupt),
+      since cancelling the worker alone does not stop the blocked LSP read —
+      the caller kills the process, which unblocks it.
 
     ``get_process`` returns the subprocess-like object (with a ``.pid``)
     to watch, or ``None`` if it is not yet spawned.  ``on_rss`` (if
     given) is called with each live RSS sample (MB) -- used to track the
-    per-session peak.
+    per-session peak.  ``deadline`` / ``timeout_event`` are omitted (None)
+    when no hard timeout is configured.
 
     Tolerates:
-    - ``psutil`` not installed -- exits silently (no monitoring).
+    - ``psutil`` not installed -- RSS sampling is skipped, but the
+      hard-timeout deadline (which needs no psutil) is still enforced.
     - subprocess not yet spawned (``get_process`` returns None) --
       keeps polling.
     - subprocess exits between samples (``psutil.NoSuchProcess``) --
@@ -903,6 +964,13 @@ async def _memory_watchdog(
         while not main_task.done():
             await asyncio.sleep(interval)
             if main_task.done():
+                return
+            # Hard wall-clock deadline: kill+restart backstop for a divergence
+            # that does not respond to Coq's polled interrupt.
+            if deadline is not None and time.monotonic() >= deadline:
+                if timeout_event is not None:
+                    timeout_event.set()
+                main_task.cancel()
                 return
             process = get_process()
             if process is None:
@@ -976,6 +1044,10 @@ async def _run_with_lsp(
     _t0 = time.monotonic()
     main_task = asyncio.create_task(asyncio.to_thread(fn, checker))
     mem_event = asyncio.Event()
+    timeout_event = asyncio.Event()
+    deadline = (
+        time.monotonic() + ROCQ_HARD_TIMEOUT if ROCQ_HARD_TIMEOUT > 0 else None
+    )
     monitor_task = asyncio.create_task(
         _memory_watchdog(
             ROCQ_MAX_LSP_RSS_MB,
@@ -983,6 +1055,8 @@ async def _run_with_lsp(
             mem_event,
             get_process=lambda: _checker_process(checker),
             on_rss=_track_peak,
+            deadline=deadline,
+            timeout_event=timeout_event,
         )
     )
     try:
@@ -996,10 +1070,9 @@ async def _run_with_lsp(
                 except asyncio.CancelledError:
                     pass
     except asyncio.CancelledError:
-        # Watchdog cancelled the worker because this session's coq-lsp RSS
-        # breached the threshold; build the memory_exhausted envelope
-        # (which also restarts this session's coq-lsp).  An external cancel
-        # (mem_event unset) must propagate.
+        # Watchdog cancelled the worker.  Two recovery paths, both of which
+        # kill+restart this session's coq-lsp; an external cancel (neither
+        # event set) must propagate.
         if mem_event.is_set():
             dlog.event(
                 "op", "lsp_op.memory_exhausted", tool=tool, key=key,
@@ -1007,6 +1080,13 @@ async def _run_with_lsp(
                 peak_rss_mb=meta.get("peak_rss_mb"),
             )
             return _build_lsp_memory_abort_response(lifespan_state, tool, key)
+        if timeout_event.is_set():
+            dlog.event(
+                "op", "lsp_op.hard_timeout", tool=tool, key=key,
+                duration_s=round(time.monotonic() - _t0, 6),
+                limit_s=ROCQ_HARD_TIMEOUT,
+            )
+            return _build_lsp_hard_timeout_response(lifespan_state, tool, key)
         dlog.event(
             "op", "lsp_op.cancelled", tool=tool, key=key,
             duration_s=round(time.monotonic() - _t0, 6),
@@ -1822,7 +1902,8 @@ async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
       ``{tool, message, reason, ago_seconds}``.  ``reason`` is one of:
 
       - **coq-lsp transport**: ``"timeout"``, ``"crashed"``,
-        ``"memory_exhausted"``, ``"unavailable"``.
+        ``"memory_exhausted"``, ``"hard_timeout"`` (the ``ROCQ_HARD_TIMEOUT``
+        backstop tripped; coq-lsp was killed + restarted), ``"unavailable"``.
       - **Validation / lookup** (set by tools): ``"validation"``,
         ``"not_found"`` (e.g. rocq_assumptions on a typo).
       - **Tactic rejected** (rocq_step / rocq_step_multi): ``"tactic_failed"``.
@@ -1915,13 +1996,13 @@ async def rocq_restart(
 async def rocq_compile_lsp(
     file: str,
     workspace: str = "",
-    timeout: int = 0,
     include_warnings: bool = False,
     include_info: bool = False,
     line: int | None = None,
     character: int | None = None,
     stop_at_first_error: bool = True,
     cache_on_error: bool = False,
+    sentence_timeout: float | None = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Incrementally check a .v file using coq-lsp diagnostics.
@@ -1953,15 +2034,20 @@ async def rocq_compile_lsp(
     point are returned, and the result carries
     ``checked_through: {line, character}``.
 
-    A memory watchdog monitors the coq-lsp subprocess against
-    ``ROCQ_MAX_LSP_RSS_MB``; on breach the response is
-    ``{success: False, reason: "memory_exhausted", lsp_restarted: True}``
-    and coq-lsp is restarted automatically on the next call.
+    There is no client-side wait timeout: a check runs until coq-lsp
+    settles.  Bound the work coq-lsp-side instead — ``sentence_timeout`` for
+    a graceful per-sentence cap (see below), and two process-level watchdogs
+    as last-resort backstops: a memory watchdog (``ROCQ_MAX_LSP_RSS_MB``) and
+    a hard wall-clock timeout (``ROCQ_HARD_TIMEOUT``).  On either breach the
+    session's coq-lsp is killed and restarted and the response is
+    ``{success: False, reason: "memory_exhausted" | "hard_timeout",
+    lsp_restarted: True}`` (the hard timeout is the only thing that can free a
+    non-cooperative divergence — one that ignores Coq's interrupt — which
+    ``sentence_timeout`` cannot).
 
     Args:
         file: Path to the .v file (relative to workspace).
         workspace: Directory to use as workspace (default: ROCQ_WORKSPACE env var).
-        timeout: Timeout in seconds (default: ROCQ_COQC_TIMEOUT env var).
         include_warnings: Include warnings in the result (default: False).
         include_info: Include coq-lsp ``info`` diagnostics in the result
             (default: False).  Surfaces output from ``msg_info``-emitting
@@ -1988,11 +2074,21 @@ async def rocq_compile_lsp(
             full check (``line`` omitted) -- position-limited checks never
             snapshot.  Implies a full check (overrides *stop_at_first_error*),
             since a snapshot needs the document checked through to EOF.
+        sentence_timeout: Per-sentence wall-clock budget in seconds for the
+            check.  When > 0, any single sentence that runs longer is aborted
+            coq-lsp-side and reported as a ``Timeout!`` error; checking then
+            recovers and moves on, so one slow/diverging tactic cannot wedge
+            the check (or the session).  Bounds each sentence individually, not
+            the whole file.  Default ``None`` uses the ``ROCQ_SENTENCE_TIMEOUT``
+            env var (itself 0 = disabled); pass an explicit value to override
+            it for this call (``0`` force-disables).  Note this relies on the
+            tactic cooperatively polling Coq's interrupt (essentially all real
+            computation does); a trivial non-polling loop like ``do N idtac``
+            is not caught.
     """
     # Same workspace handling as the other file tools: auto-detect the
     # project root from *file* when no explicit workspace is given.
     workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
-    timeout = timeout if timeout is not None and timeout > 0 else 0  # 0 = no timeout
 
     if ctx is None:
         return _fail(None, "rocq_compile_lsp", "Internal error: no MCP context.")
@@ -2027,22 +2123,33 @@ async def rocq_compile_lsp(
     # reaching check, so it implies a full check (overrides stop-at-first).
     effective_stop = stop_at_first_error and not cache_on_error
 
+    # None (the default) means "use the global ROCQ_SENTENCE_TIMEOUT default";
+    # an explicit value (including 0 to force-disable) overrides it.
+    eff_sentence_timeout = (
+        sentence_timeout if sentence_timeout is not None else ROCQ_SENTENCE_TIMEOUT
+    )
+
+    # No client-side wait deadline (timeout=0): the check blocks until coq-lsp
+    # settles.  Divergences are bounded coq-lsp-side by sentence_timeout and,
+    # as a hard backstop, by ROCQ_HARD_TIMEOUT (kill+restart) in _run_with_lsp.
     def _check(checker: Any) -> dict[str, Any]:
         if line is None:
             return checker.check_file(
                 resolved,
                 workspace,
-                float(timeout),
+                0.0,
                 effective_stop,
                 save_vof_on_error=cache_on_error,
+                sentence_timeout=eff_sentence_timeout,
             )
         return checker.check_up_to(
             resolved,
             line,
             character,
             workspace=workspace,
-            timeout=float(timeout),
+            timeout=0.0,
             stop_at_first_error=effective_stop,
+            sentence_timeout=eff_sentence_timeout,
         )
 
     # _run_with_lsp handles checker lifecycle, the RSS memory watchdog

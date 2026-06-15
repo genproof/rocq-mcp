@@ -281,6 +281,7 @@ class TestExtraValidationRecording:
                 "timeout",
                 "crashed",
                 "memory_exhausted",
+                "hard_timeout",
                 "lock_contended",
                 "unavailable",
                 "validation",
