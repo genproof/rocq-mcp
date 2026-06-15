@@ -30,7 +30,8 @@ def _patch_run_with_lsp(monkeypatch):
             return True
 
         def check_content(
-            self, path, content, workspace="", timeout=0, wait_full=False
+            self, path, content, workspace="", timeout=0, wait_full=False,
+            sentence_timeout=0.0,
         ):
             return {
                 "success": True,

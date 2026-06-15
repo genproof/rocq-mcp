@@ -108,6 +108,7 @@ def _lsp_run_query(
     timeout: float,
     include_warnings: bool = True,
     max_results: int | None = None,
+    sentence_timeout: float = 0.0,
 ) -> dict[str, Any]:
     """Run a single query *command* in *context_text* via coq-lsp.
 
@@ -142,7 +143,15 @@ def _lsp_run_query(
     # whole document is processed -- a short-circuit on the first error
     # would miss it (and miss queries on symbols defined before that error).
     result = checker.check_content(
-        scratch, content, workspace=workspace, timeout=timeout, wait_full=True
+        scratch,
+        content,
+        workspace=workspace,
+        timeout=timeout,
+        wait_full=True,
+        # Bound each sentence coq-lsp-side (global ROCQ_SENTENCE_TIMEOUT, 0 =
+        # off) so a slow/diverging preamble or query sentence is aborted in Coq
+        # rather than only by the Python wait below.
+        sentence_timeout=sentence_timeout,
     )
 
     if result.get("timed_out"):
@@ -166,9 +175,11 @@ def _lsp_run_query(
     #   4. no output, no error              -> legitimately empty
     cmd_errors = [e for e in errors if e["line"] >= append_line]
     if cmd_errors:
-        return _server._fail(
-            lifespan_state, tool, cmd_errors[0]["message"], "crashed"
-        )
+        msg = cmd_errors[0]["message"]
+        # A sentence_timeout abort on the query command surfaces as a
+        # "rocq-lsp: sentence timeout" error -- report it as a timeout.
+        reason = "timeout" if _is_coq_timeout(msg) else "crashed"
+        return _server._fail(lifespan_state, tool, msg, reason)
 
     diags = list(result.get("info", []))
     if include_warnings:
@@ -257,6 +268,10 @@ def _lsp_query_at_position(
         command_timeout=timeout,
         pp_format="Str",
         timeout=timeout + _COMMAND_TIMEOUT_GRACE,
+        # Bound each sentence on the way to the point coq-lsp-side (the pretac
+        # itself is bounded by command_timeout above); global
+        # ROCQ_SENTENCE_TIMEOUT, 0 = off.
+        sentence_timeout=_server.ROCQ_SENTENCE_TIMEOUT,
     )
 
     if not isinstance(resp, dict):
@@ -541,6 +556,7 @@ async def run_query(
             timeout=_q_timeout,
             include_warnings=include_warnings,
             max_results=max_results,
+            sentence_timeout=_server.ROCQ_SENTENCE_TIMEOUT,
         )
 
     # File / position mode get a per-file session (parallel with other
@@ -1208,8 +1224,18 @@ _COMMAND_TIMEOUT_GRACE: float = 5.0
 
 
 def _is_coq_timeout(message: Any) -> bool:
-    """True if a pretac error is Coq's ``command_timeout`` abort ("Timeout!")."""
-    return isinstance(message, str) and "Timeout!" in message
+    """True if an error is one of our wall-clock timeouts (vs an ordinary
+    failure).
+
+    Matches: our self-identifying coq-lsp timeouts (``rocq-lsp: ... timeout``
+    -- the per-sentence ``sentence_timeout`` diagnostic and any command-timeout
+    fallback), and Coq's own ``Timeout!`` (the ``command_timeout`` pretac abort
+    reifies through Coq's ``Control.timeout``, same message as the ``Timeout``
+    vernac)."""
+    if not isinstance(message, str):
+        return False
+    m = message.lower()
+    return ("rocq-lsp" in m and "timeout" in m) or "timeout!" in m
 
 
 def _goals_mode(before: bool) -> str:
@@ -1258,7 +1284,15 @@ async def run_get_state(
 
     def _do(checker: Any) -> dict[str, Any]:
         answer = checker.goals(
-            resolved, line, character, mode=_goals_mode(before), timeout=_t
+            resolved,
+            line,
+            character,
+            mode=_goals_mode(before),
+            timeout=_t,
+            # Bound each sentence on the way to the point coq-lsp-side (global
+            # ROCQ_SENTENCE_TIMEOUT, 0 = off), so a slow/diverging sentence
+            # before it is aborted in Coq instead of only by the Python wait.
+            sentence_timeout=_server.ROCQ_SENTENCE_TIMEOUT,
         )
         kind, payload = _classify_goals_answer(answer)
         if kind == "timeout":
@@ -1273,7 +1307,16 @@ async def run_get_state(
                 lifespan_state, "rocq_get_state", f"coq-lsp error: {payload}", "crashed"
             )
         if kind == "tactic":
-            # An error at the sentence covering the position itself.
+            # An error at the sentence covering the position itself.  A
+            # sentence_timeout abort surfaces here as a "rocq-lsp: sentence
+            # timeout" error -- report it as a timeout, not a crash.
+            if _is_coq_timeout(payload):
+                return _server._fail(
+                    lifespan_state,
+                    "rocq_get_state",
+                    f"Sentence at the position timed out ({payload}).",
+                    "timeout",
+                )
             return _server._fail(lifespan_state, "rocq_get_state", payload, "crashed")
         rendered = _render_goals_answer(payload, include_warnings=include_warnings)
         return {
@@ -1508,6 +1551,7 @@ async def run_step(
             resolved, line, character, command=tactics,
             command_timeout=_t, mode=_goals_mode(before),
             timeout=_t + _COMMAND_TIMEOUT_GRACE,
+            sentence_timeout=_server.ROCQ_SENTENCE_TIMEOUT,
         )
         elapsed_s = round(time.monotonic() - _start, 3)
         kind, payload = _classify_goals_answer(answer)
@@ -1626,6 +1670,7 @@ async def run_step_multi(
                 resolved, line, character, command=tac,
                 command_timeout=_t, mode=_goals_mode(before),
                 timeout=_t + _COMMAND_TIMEOUT_GRACE,
+                sentence_timeout=_server.ROCQ_SENTENCE_TIMEOUT,
             )
             entry["elapsed_s"] = round(time.monotonic() - _start, 3)
             kind, payload = _classify_goals_answer(answer)

@@ -40,11 +40,13 @@ ROCQ_OP_TIMEOUT: float = float(
     os.environ.get("ROCQ_OP_TIMEOUT", os.environ.get("ROCQ_PET_TIMEOUT", "30"))
 )
 ROCQ_QUERY_TIMEOUT_CAP: int = int(os.environ.get("ROCQ_QUERY_TIMEOUT_CAP", "300"))
-# Global default per-sentence wall-clock budget (seconds) for rocq_compile_lsp's
-# document checking.  0 (the default) disables it; when > 0 it becomes the
-# default for the tool's ``sentence_timeout`` parameter, so a single
-# slow/diverging tactic cannot wedge a check without opting in per call.  A
-# per-call ``sentence_timeout`` overrides this (pass 0 to force-disable).
+# Global default per-sentence wall-clock budget (seconds) for coq-lsp document
+# checking, honored by every tool that drives a check: rocq_compile_lsp and the
+# goals-driven tools (rocq_get_state / rocq_step / rocq_step_multi /
+# rocq_query).  0 (the default) disables it; when > 0, a single slow/diverging
+# sentence is aborted coq-lsp-side ("rocq-lsp: sentence timeout") so it cannot
+# wedge the check.  rocq_compile_lsp's per-call ``sentence_timeout`` parameter
+# overrides this for that tool (pass 0 to force-disable).
 ROCQ_SENTENCE_TIMEOUT: float = float(os.environ.get("ROCQ_SENTENCE_TIMEOUT", "0"))
 # Hard wall-clock backstop (seconds) for any single coq-lsp operation.  0 (the
 # default) disables it.  When > 0, an operation that runs longer is aborted by
@@ -2168,6 +2170,11 @@ async def rocq_compile_lsp(
         result.pop("warnings", None)
     if not include_info:
         result.pop("info", None)
+    # ``timed_out`` is vestigial here: there is no client-side wait timeout, so
+    # a check always settles unless coq-lsp dies mid-check (which surfaces via
+    # the hard_timeout / memory_exhausted / crashed paths instead).  Drop it so
+    # it cannot be mistaken for a per-sentence ``Timeout!`` diagnostic.
+    result.pop("timed_out", None)
     # Self-describe a position-limited check so the caller knows the
     # result covers only diagnostics up to the point (the tail may still
     # be checking).  The memory-abort envelope has no diagnostics, so

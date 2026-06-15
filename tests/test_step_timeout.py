@@ -83,7 +83,8 @@ class _MockChecker:
         pass
 
     def goals(self, file_path, line, character, *, content=None, command=None,
-              command_timeout=None, pp_format="Str", mode=None, timeout=None):
+              command_timeout=None, pp_format="Str", mode=None, timeout=None,
+              sentence_timeout=0.0):
         if command in self._ok_for:
             return {"goals": {"goals": [], "shelf": [], "given_up": []}, "messages": []}
         return dict(_TIMEOUT_ENVELOPE)
@@ -405,8 +406,8 @@ class TestStateBeforeSlowTactic:
     def test_whole_file_timeout_does_not_block_followup_query(self, tmp_path):
         """A diverging sentence in a whole-file check no longer wedges the
         session: with a coq-lsp-side per-sentence timeout the slow tactic is
-        aborted (reported as a "Timeout!" error), the check completes, and a
-        query before it is served promptly.
+        aborted (reported as a self-identifying "rocq-lsp: sentence timeout"
+        error), the check completes, and a query before it is served promptly.
 
         This was previously xfail -- "fundamentally hard without OCaml 5.x".
         The coq-lsp-side fix is a watchdog thread that trips Coq's *polled*
@@ -420,8 +421,8 @@ class TestStateBeforeSlowTactic:
             t0 = time.monotonic()
             # Whole-file check with a 2s per-sentence budget.  The diverging
             # tactic overruns and is aborted coq-lsp-side (reported as a
-            # "Timeout!" error); the check then settles instead of running for
-            # minutes.
+            # "rocq-lsp: sentence timeout" error); the check then settles
+            # instead of running for minutes.
             r = checker.check_file(
                 f, workspace=str(tmp_path), timeout=20.0, sentence_timeout=2.0,
             )
@@ -430,8 +431,11 @@ class TestStateBeforeSlowTactic:
             # completion (minutes) and not via a Python-side give-up.
             assert r["timed_out"] is False, r
             assert elapsed < 15.0, f"check took {elapsed:.1f}s (sentence not bounded)"
-            # The diverging sentence is reported as a Timeout error.
-            assert any("Timeout" in e.get("message", "") for e in r["errors"]), r
+            # The diverging sentence is reported as a self-identifying
+            # rocq-lsp sentence-timeout error (not Coq's own "Timeout!").
+            assert any(
+                "sentence timeout" in e.get("message", "") for e in r["errors"]
+            ), r
             # A query before the slow tactic now works promptly.
             g = checker.goals(
                 f, line=self._MARKER_LINE, character=self._PRE_SLOW_CHAR,

@@ -605,6 +605,7 @@ class LspChecker:
         workspace: str = "",
         timeout: float = 0,
         wait_full: bool = False,
+        sentence_timeout: float = 0.0,
     ) -> dict[str, Any]:
         """Check an in-memory *content* buffer addressed by *file_path*.
 
@@ -624,7 +625,11 @@ class LspChecker:
             self._ensure_started(workspace)
             resolved = str(Path(file_path).resolve())
             return self._check_content_locked(
-                resolved, content, timeout, stop_at_first_error=False
+                resolved,
+                content,
+                timeout,
+                stop_at_first_error=False,
+                sentence_timeout=sentence_timeout,
             )
 
     @staticmethod
@@ -942,6 +947,7 @@ class LspChecker:
         pp_format: str = "Str",
         mode: str | None = None,
         timeout: float = _DEFAULT_REQUEST_TIMEOUT,
+        sentence_timeout: float = 0.0,
     ) -> dict[str, Any]:
         """Return ``proof/goals`` at a point, optionally running *command*.
 
@@ -988,7 +994,10 @@ class LspChecker:
             # Inspect the state at a point: coq-lsp must recover from any
             # upstream error to reach it, so keep max_errors at the default
             # (a stop-at-first-error file check may have lowered it).
-            self._set_max_errors_locked(_MAX_ERRORS_FULL)
+            # *sentence_timeout* (> 0) bounds each sentence on the way to the
+            # point coq-lsp-side, so a slow/diverging sentence before it is
+            # aborted in Coq instead of blocking the request.
+            self._set_max_errors_locked(_MAX_ERRORS_FULL, sentence_timeout)
             params: dict[str, Any] = {
                 "textDocument": {"uri": uri},
                 "position": {"line": line, "character": character},

@@ -526,7 +526,8 @@ class TestQueryTimeoutRunQuery:
                 return True
 
             def check_content(
-                self, path, content, workspace="", timeout=0, wait_full=False
+                self, path, content, workspace="", timeout=0, wait_full=False,
+                sentence_timeout=0.0,
             ):
                 captured["timeout"] = timeout
                 return {
