@@ -18,6 +18,7 @@ import pytest
 from rocq_mcp.interactive import (
     _classify_goals_answer,
     run_get_state,
+    run_query,
     run_step,
     run_step_multi,
 )
@@ -173,6 +174,72 @@ class TestRealTimeout:
                 workspace=str(tmp_path), lifespan_state=state, timeout=4.0,
             )
             assert g["success"] is True
+        finally:
+            stop_all_checkers(state)
+
+    # A proof open at line 2 (state = goal `True`); a minutes-long pretac that
+    # the Coq-side command_timeout must abort.
+    _PROOF = "Theorem t : True.\nProof.\nidtac.\nQed.\n"
+    _DIVERGE = "do 100000000000 idtac."
+
+    def _state(self, tmp_path):
+        (tmp_path / "_CoqProject").write_text("-R . Top\n")
+        (tmp_path / "t.v").write_text(self._PROOF)
+        state = make_lifespan_state(full=True)
+        state["workspace"] = str(tmp_path)
+        return state
+
+    @pytest.mark.asyncio
+    async def test_step_multi_diverging_block_times_out_and_next_block_runs(
+        self, tmp_path
+    ):
+        """rocq_step_multi: a diverging block is aborted at the budget, and the
+        NEXT block still runs -- proof the session is not blocked behind the
+        runaway computation (each block has its own coq-lsp-side budget)."""
+        state = self._state(tmp_path)
+        try:
+            t = time.monotonic()
+            r = await run_step_multi(
+                file="t.v", line=2, character=0,
+                tactics=[self._DIVERGE, "exact I."],
+                workspace=str(tmp_path), lifespan_state=state, timeout=2.0,
+            )
+            elapsed = time.monotonic() - t
+            assert r["success"] is True
+            res = r["results"]
+            # block 0 respected the budget...
+            assert res[0]["reason"] == "timeout"
+            # ...and block 1 still ran (coq-lsp was not wedged).
+            assert res[1]["success"] is True
+            # bounded by ~budget + grace, not a much-later kill.
+            assert elapsed < 2.0 + 4.0
+        finally:
+            stop_all_checkers(state)
+
+    @pytest.mark.asyncio
+    async def test_query_position_diverging_command_times_out_and_stays_responsive(
+        self, tmp_path
+    ):
+        """rocq_query (position mode): a diverging command pretac is aborted at
+        the budget -> reason "timeout", and a follow-up query at the same point
+        returns at once (session not blocked)."""
+        state = self._state(tmp_path)
+        try:
+            t = time.monotonic()
+            r = await run_query(
+                command=self._DIVERGE, preamble="", workspace=str(tmp_path),
+                lifespan_state=state, file="t.v", line=2, character=0, timeout=2,
+            )
+            elapsed = time.monotonic() - t
+            assert r["success"] is False and r["reason"] == "timeout"
+            assert elapsed < 2.0 + 4.0
+
+            # Session responsive: a normal query at the same point succeeds.
+            r2 = await run_query(
+                command="Check nat.", preamble="", workspace=str(tmp_path),
+                lifespan_state=state, file="t.v", line=2, character=0, timeout=10,
+            )
+            assert r2["success"] is True
         finally:
             stop_all_checkers(state)
 
