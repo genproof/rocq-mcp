@@ -897,6 +897,7 @@ class LspChecker:
         *,
         content: str | None = None,
         command: str | None = None,
+        command_timeout: float | None = None,
         pp_format: str = "Str",
         mode: str | None = None,
         timeout: float = _DEFAULT_REQUEST_TIMEOUT,
@@ -919,6 +920,14 @@ class LspChecker:
         coq-lsp postpones the request until the document is checked up to
         the point, so the response arrival is itself the completion
         signal.
+
+        *command_timeout* (seconds), when set with a *command*, bounds the
+        whole speculative run with a single coq-lsp/Coq-side wall-clock
+        budget (``proof/goals`` ``command_timeout`` -> ``Control.timeout``
+        around the pretac): a slow/diverging tactic is aborted by Coq itself
+        and returns a "Timeout!" error, so the session stays responsive
+        instead of wedging.  Requires the ``genproof/rocq-lsp`` fork; older
+        servers ignore the field.
 
         Returns the raw ``GoalsAnswer`` payload as a dict (keys:
         ``goals``, ``messages``, ``error``, ``program``, ``textDocument``,
@@ -946,6 +955,8 @@ class LspChecker:
             }
             if command is not None:
                 params["command"] = command
+                if command_timeout is not None:
+                    params["command_timeout"] = command_timeout
             if mode is not None:
                 params["mode"] = mode
             return self._request("proof/goals", params, timeout=timeout)

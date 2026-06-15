@@ -254,8 +254,9 @@ def _lsp_query_at_position(
         character,
         content=content,
         command=cmd,
+        command_timeout=timeout,
         pp_format="Str",
-        timeout=timeout,
+        timeout=timeout + _COMMAND_TIMEOUT_GRACE,
     )
 
     if not isinstance(resp, dict):
@@ -274,6 +275,12 @@ def _lsp_query_at_position(
         # surface as ``crashed`` so callers' not-found enrichment kicks in,
         # mirroring :func:`_lsp_run_query`.
         msg = err.get("message") if isinstance(err, dict) else str(err)
+        # A Coq-side command_timeout abort comes back as a "Timeout!" error;
+        # report it as a timeout (the session stays responsive).
+        if _is_coq_timeout(msg):
+            return _server._fail(
+                lifespan_state, tool, f"{tool} timed out after {timeout}s.", "timeout"
+            )
         return _server._fail(lifespan_state, tool, str(msg), "crashed")
 
     # ``pretac_messages`` holds *only* the query's own output, kept separate
@@ -1194,6 +1201,17 @@ def _position_timeout(lifespan_state: dict[str, Any], timeout: float | None) -> 
     return float(lifespan_state.get("op_timeout", 30.0))
 
 
+# Extra seconds given to the LSP round-trip over the Coq-side command budget,
+# so Coq's own timeout fires first and replies before our deadline (keeping
+# the session responsive) rather than us giving up while it keeps computing.
+_COMMAND_TIMEOUT_GRACE: float = 5.0
+
+
+def _is_coq_timeout(message: Any) -> bool:
+    """True if a pretac error is Coq's ``command_timeout`` abort ("Timeout!")."""
+    return isinstance(message, str) and "Timeout!" in message
+
+
 def _goals_mode(before: bool) -> str:
     """Map the position tools' ``before`` flag to a proof/goals ``mode``.
 
@@ -1482,15 +1500,22 @@ async def run_step(
 
     def _do(checker: Any) -> dict[str, Any]:
         _start = time.monotonic()
+        # coq-lsp/Coq bounds the speculative block with a single wall-clock
+        # budget (*_t*) and aborts a slow/diverging tactic itself -- so the
+        # session stays responsive.  Give the LSP round-trip a little extra
+        # so Coq's timeout fires first and replies before our own deadline.
         answer = checker.goals(
             resolved, line, character, command=tactics,
-            mode=_goals_mode(before), timeout=_t,
+            command_timeout=_t, mode=_goals_mode(before),
+            timeout=_t + _COMMAND_TIMEOUT_GRACE,
         )
         elapsed_s = round(time.monotonic() - _start, 3)
         kind, payload = _classify_goals_answer(answer)
         # Every outcome carries the block's wall-clock, so a slow *failing*
         # tactic is as measurable as a slow succeeding one.
-        if kind == "timeout":
+        # A Coq-side abort comes back as a tactic error "Timeout!"; report it
+        # as a timeout (the session is fine -- Coq stopped the tactic).
+        if kind == "timeout" or (kind == "tactic" and _is_coq_timeout(payload)):
             return {
                 **_server._fail(
                     lifespan_state,
@@ -1594,9 +1619,13 @@ async def run_step_multi(
         for tac in tactics:
             entry: dict[str, Any] = {"tactics": tac}
             _start = time.monotonic()
+            # Coq bounds each block with its own wall-clock budget and aborts
+            # a slow/diverging one itself, so the next block is never blocked
+            # behind a runaway computation.
             answer = checker.goals(
                 resolved, line, character, command=tac,
-                mode=_goals_mode(before), timeout=_t,
+                command_timeout=_t, mode=_goals_mode(before),
+                timeout=_t + _COMMAND_TIMEOUT_GRACE,
             )
             entry["elapsed_s"] = round(time.monotonic() - _start, 3)
             kind, payload = _classify_goals_answer(answer)
@@ -1608,10 +1637,9 @@ async def run_step_multi(
                     f"coq-lsp error: {payload}",
                     "crashed",
                 )
-            if kind == "timeout":
-                # This block exceeded the budget, but coq-lsp is still
-                # alive (the next block's request preempts the leftover
-                # computation), so record it and carry on with the rest.
+            if kind == "timeout" or (kind == "tactic" and _is_coq_timeout(payload)):
+                # This block exceeded the budget; Coq aborted it, so the
+                # session is fine -- record it and carry on with the rest.
                 entry["success"] = False
                 entry["reason"] = "timeout"
                 entry["error"] = f"Timed out after {_t:.0f}s."

@@ -11,6 +11,7 @@ end-to-end test drives a real timeout.
 from __future__ import annotations
 
 import shutil
+import time
 
 import pytest
 
@@ -81,7 +82,7 @@ class _MockChecker:
         pass
 
     def goals(self, file_path, line, character, *, content=None, command=None,
-              pp_format="Str", mode=None, timeout=None):
+              command_timeout=None, pp_format="Str", mode=None, timeout=None):
         if command in self._ok_for:
             return {"goals": {"goals": [], "shelf": [], "given_up": []}, "messages": []}
         return dict(_TIMEOUT_ENVELOPE)
@@ -144,19 +145,34 @@ class TestReasonMapping:
 @_lsp_only
 class TestRealTimeout:
     @pytest.mark.asyncio
-    async def test_slow_tactic_times_out(self, tmp_path):
+    async def test_diverging_tactic_times_out_and_stays_responsive(self, tmp_path):
+        """A diverging step pretac is aborted by Coq itself (command_timeout)
+        at the budget -> reason "timeout" -- and crucially the session is NOT
+        wedged: a follow-up query returns immediately.  Before the coq-lsp
+        command_timeout, the Python timeout gave up but coq-lsp kept running
+        the tactic, blocking the next command."""
+        (tmp_path / "_CoqProject").write_text("-R . Top\n")
         (tmp_path / "t.v").write_text("Theorem t : True.\nProof.\nidtac.\nQed.\n")
         state = make_lifespan_state(full=True)
+        state["workspace"] = str(tmp_path)
         try:
-            # A genuinely slow tactic block with a tiny timeout: the client
-            # gives up well before coq-lsp finishes -> reason "timeout".
+            t = time.monotonic()
             r = await run_step(
                 file="t.v", line=2, character=0,
-                tactics="do 100000000 idtac.",
-                workspace=str(tmp_path), lifespan_state=state, timeout=0.05,
+                tactics="do 100000000000 idtac.",
+                workspace=str(tmp_path), lifespan_state=state, timeout=2.0,
             )
-            assert r["success"] is False
-            assert r["reason"] == "timeout"
+            elapsed = time.monotonic() - t
+            assert r["success"] is False and r["reason"] == "timeout"
+            # Coq aborted at the budget, not at some much-later process kill.
+            assert elapsed < 2.0 + 4.0
+
+            # The session is responsive: a state query returns at once.
+            g = await run_get_state(
+                file="t.v", line=2, character=0,
+                workspace=str(tmp_path), lifespan_state=state, timeout=4.0,
+            )
+            assert g["success"] is True
         finally:
             stop_all_checkers(state)
 

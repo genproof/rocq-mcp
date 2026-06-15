@@ -441,7 +441,8 @@ class TestQueryPositionRouting:
             return True
 
         def goals(self, file_path, line, character, *, content=None,
-                  command=None, pp_format="Str", mode=None, timeout=0):
+                  command=None, command_timeout=None, pp_format="Str",
+                  mode=None, timeout=0):
             self.goals_calls.append(
                 {"file": file_path, "line": line, "character": character,
                  "command": command}
