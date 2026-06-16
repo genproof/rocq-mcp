@@ -154,6 +154,29 @@ def _split_by_severity(
     return errors, warnings, info
 
 
+# coq-lsp fileProgress "kind": 1 = Processing (being checked), 2 = FatalError.
+_PROGRESS_PROCESSING = 1
+
+
+def _progress_frontier(params: dict[str, Any]) -> tuple[int, int] | None:
+    """Leading edge of the still-processing region from a ``$/coq/fileProgress``
+    payload: the earliest ``range.start`` over entries with ``kind ==
+    Processing``.  ``None`` when nothing is being processed (the check is idle /
+    complete), so a stale frontier is not mistaken for live work.
+    """
+    best: tuple[int, int] | None = None
+    for info in params.get("processing", []) or []:
+        if info.get("kind") != _PROGRESS_PROCESSING:
+            continue
+        start = (info.get("range") or {}).get("start") or {}
+        line, char = start.get("line"), start.get("character")
+        if line is None or char is None:
+            continue
+        if best is None or (line, char) < best:
+            best = (line, char)
+    return best
+
+
 class LspChecker:
     """Persistent coq-lsp process driving every Rocq operation.
 
@@ -183,7 +206,8 @@ class LspChecker:
         # --- background reader + message routing ---------------------
         self._reader: threading.Thread | None = None
         self._reader_stop = threading.Event()
-        # Guards: _responses, _doc_state, _status, _saw_busy, _dead.
+        # Guards: _responses, _doc_state, _status, _last_progress, _saw_busy,
+        # _dead.
         self._cv = threading.Condition()
         # JSON-RPC id -> response message
         self._responses: dict[int, dict[str, Any]] = {}
@@ -191,6 +215,12 @@ class LspChecker:
         self._doc_state: dict[str, dict[str, Any]] = {}
         # Latest $/coq/serverStatus status string ("Busy"/"Idle"/"Stopped").
         self._status: str = "Idle"
+        # Latest $/coq/fileProgress frontier: (monotonic_time, line, char) or
+        # None.  The frontier is the start of the span coq-lsp is currently
+        # processing; rocq-lsp advances it once per sentence, *before* that
+        # sentence is elaborated (and flushes it), so a stalled frontier
+        # pinpoints a diverging sentence.  Read by the server's stall watchdog.
+        self._last_progress: tuple[float, int, int] | None = None
         # Whether a Busy status was observed since the current wait began.
         self._saw_busy: bool = False
         # Set by the reader when the pipe hits EOF / the process dies so
@@ -228,6 +258,7 @@ class LspChecker:
             self._responses.clear()
             self._doc_state.clear()
             self._status = "Idle"
+            self._last_progress = None
             self._saw_busy = False
             self._dead = False
 
@@ -278,6 +309,24 @@ class LspChecker:
             and self._initialized
         )
 
+    def last_progress(self) -> tuple[float, int, int] | None:
+        """The latest ``$/coq/fileProgress`` frontier as
+        ``(monotonic_time, line, char)``, or ``None`` if none has been reported
+        since the process (re)started.  Thread-safe; read by the server's stall
+        watchdog to detect a diverging sentence (frontier stops advancing).
+        """
+        with self._cv:
+            return self._last_progress
+
+    def reset_progress(self) -> None:
+        """Clear the fileProgress frontier so the next op's stall attribution
+        starts fresh (not a stale frontier carried over from a prior call on
+        this warm session).  coq-lsp re-announces the frontier (from line 0)
+        before its first sentence, so a fresh check repopulates it immediately.
+        """
+        with self._cv:
+            self._last_progress = None
+
     def trim_caches(self) -> None:
         """Tell coq-lsp to free its global memoization tables.
 
@@ -306,6 +355,34 @@ class LspChecker:
                 # Best-effort: if the pipe is broken / coq-lsp is dying,
                 # let the next check or watchdog cycle handle it.
                 pass
+
+    def force_kill(self) -> None:
+        """SIGKILL coq-lsp immediately, WITHOUT taking ``self._lock``.
+
+        The abort/recovery paths (memory / stall / hard-timeout) call this
+        *before* :meth:`stop`.  A wedged worker thread — a diverging check —
+        holds ``self._lock`` and is blocked in ``_drive_barrier_locked``
+        waiting on coq-lsp, so :meth:`stop` (which takes the lock) would
+        deadlock the caller.  Killing the process makes that blocked read hit
+        EOF; we also set ``_dead`` and notify ``_cv`` directly so the waiter
+        wakes at once, returns, and releases the lock — letting the subsequent
+        :meth:`stop` acquire it and finish cleanup.
+
+        Lock-free by design and idempotent: safe to call from another thread
+        while the worker holds ``self._lock``.
+        """
+        proc = self._process
+        if proc is not None:
+            try:
+                proc.kill()
+            except (OSError, ValueError):
+                # Already dead / FDs gone -- the read still unblocks via EOF.
+                pass
+        # Wake the driving check (blocked in _cv.wait) even before the reader
+        # notices EOF, so it returns and releases self._lock promptly.
+        with self._cv:
+            self._dead = True
+            self._cv.notify_all()
 
     def stop(self) -> None:
         """Shut down coq-lsp and join the reader thread."""
@@ -1196,8 +1273,22 @@ class LspChecker:
                     self._saw_busy = True
                 self._cv.notify_all()
             dlog.verbose_event("lsp", "serverStatus", status=status)
-        # Everything else ($/coq/fileProgress, window/logMessage, …) is
-        # intentionally ignored.
+        elif method == "$/coq/fileProgress":
+            # The checking frontier: where coq-lsp is currently working.  It
+            # advances once per sentence, before that sentence is elaborated, so
+            # the server's stall watchdog uses "no advance for a while" to
+            # detect (and locate) a diverging sentence.
+            frontier = _progress_frontier(msg.get("params", {}))
+            if frontier is not None:
+                with self._cv:
+                    self._last_progress = (time.monotonic(), frontier[0], frontier[1])
+                    self._cv.notify_all()
+            dlog.verbose_event(
+                "lsp", "fileProgress",
+                line=frontier[0] if frontier else None,
+                character=frontier[1] if frontier else None,
+            )
+        # Everything else (window/logMessage, …) is intentionally ignored.
 
     def _await_response(
         self, req_id: int, timeout: float

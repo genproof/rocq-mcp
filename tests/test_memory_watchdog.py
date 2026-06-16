@@ -179,6 +179,56 @@ class TestWatchdogCoroutine:
         assert any(s["cpu_pct"] == 87.0 for s in samples)
         assert not event.is_set()
 
+    @pytest.mark.asyncio
+    async def test_watchdog_progress_stall_fires(self, monkeypatch):
+        """A frozen fileProgress frontier past stall_window -> stall_event."""
+        _patch_psutil_rss(monkeypatch, 10)  # RSS tiny: no memory breach
+
+        checker = _FakeLspChecker()
+        mem = asyncio.Event()
+        stall = asyncio.Event()
+
+        async def work():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                raise
+
+        main_task = asyncio.create_task(work())
+        t0 = time.monotonic()
+        await _server._memory_watchdog(
+            100_000, main_task, mem,
+            get_process=lambda: checker._process,
+            get_progress=lambda: (t0, 5, 0),  # frontier frozen at op start
+            stall_window=0.05, stall_event=stall, op_start=t0,
+        )
+        assert stall.is_set()
+        assert not mem.is_set()
+        assert main_task.cancelled() or main_task.cancelling() > 0
+        with pytest.raises(asyncio.CancelledError):
+            await main_task
+
+    @pytest.mark.asyncio
+    async def test_watchdog_progress_advance_no_stall(self, monkeypatch):
+        """A frontier that keeps advancing never trips the stall watchdog."""
+        _patch_psutil_rss(monkeypatch, 10)
+
+        checker = _FakeLspChecker()
+        stall = asyncio.Event()
+
+        async def work():
+            await asyncio.sleep(0.15)  # > stall_window, but progress stays fresh
+
+        main_task = asyncio.create_task(work())
+        await _server._memory_watchdog(
+            100_000, main_task, asyncio.Event(),
+            get_process=lambda: checker._process,
+            # fresh timestamp every poll -> never stale
+            get_progress=lambda: (time.monotonic(), 1, 0),
+            stall_window=0.05, stall_event=stall, op_start=time.monotonic(),
+        )
+        assert not stall.is_set()
+
 
 # ---------------------------------------------------------------------------
 # coq-lsp watchdog (ROCQ_MAX_LSP_RSS_MB)
@@ -407,6 +457,197 @@ class TestLspHardTimeout:
         # Checker reused, not killed.
         assert pool_checker(ls, workspace=str(tmp_path), file=str(vfile)) is checker
         assert not checker.stop.called
+
+
+class TestLspProgressStall:
+    """The progress-stall watchdog kills + restarts coq-lsp when it stops
+    emitting $/coq/fileProgress for sentence_timeout + ROCQ_PROGRESS_GRACE --
+    the per-sentence-aware, self-locating successor to the blunt hard timeout.
+    """
+
+    @pytest.mark.asyncio
+    async def test_progress_stall_aborts_and_names_sentence(self, tmp_path, monkeypatch):
+        """No progress for the stall window -> stall_timeout + diverging_sentence."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 100_000)
+        monkeypatch.setattr(_server, "ROCQ_HARD_TIMEOUT", 0.0)  # stall, not hard t/o
+        monkeypatch.setattr(_server, "ROCQ_SENTENCE_TIMEOUT", 0.02)  # eff>0 -> armed
+        monkeypatch.setattr(_server, "ROCQ_PROGRESS_GRACE", 0.03)  # window = 0.05
+        _patch_psutil_rss(monkeypatch, 10)
+
+        vfile = tmp_path / "diverge.v"
+        vfile.write_text("Definition a := 1.\ndiverge_forever_aaaa.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()
+        # Frozen frontier at line 1 (older than op start) -> stall fires; the
+        # recovery reads it back to name the diverging sentence.
+        frozen = (time.monotonic(), 1, 0)
+        checker.last_progress = lambda: frozen
+        # check_file blocks well past the 0.05 s stall window.
+        checker.check_file.side_effect = lambda *a, **kw: (
+            time.sleep(0.5)
+            or {"success": True, "errors": [], "warnings": [], "check_time_ms": 500}
+        )
+        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
+
+        ctx = _MockLspContext(ls)
+        t0 = time.monotonic()
+        result = await rocq_compile_lsp(
+            file=str(vfile), workspace=str(tmp_path), ctx=ctx
+        )
+        elapsed = time.monotonic() - t0
+
+        assert result["success"] is False
+        assert result["reason"] == "stall_timeout"
+        assert result["lsp_restarted"] is True
+        assert elapsed < 0.4, f"did not abort at the stall window (took {elapsed:.2f}s)"
+        # The frontier is reported and the sentence text extracted from the file.
+        ds = result["diverging_sentence"]
+        assert ds["line"] == 1 and ds["character"] == 0
+        assert ds["text"] == "diverge_forever_aaaa."
+        assert "diverge_forever_aaaa." in result["error"]
+        # Session killed + dropped so the next call respawns it.
+        assert checker.stop.called
+        assert pool_checker(ls, workspace=str(tmp_path), file=str(vfile)) is None
+        assert any(
+            e.get("reason") == "stall_timeout"
+            and e.get("tool") == "rocq_compile_lsp"
+            for e in ls["recent_errors"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_stall_watchdog_when_sentence_timeout_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        """sentence_timeout=0 -> stall watchdog off; a normal check is unaffected."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 100_000)
+        monkeypatch.setattr(_server, "ROCQ_HARD_TIMEOUT", 0.0)
+        monkeypatch.setattr(_server, "ROCQ_SENTENCE_TIMEOUT", 0.0)  # disabled
+        monkeypatch.setattr(_server, "ROCQ_PROGRESS_GRACE", 0.01)
+        _patch_psutil_rss(monkeypatch, 10)
+
+        vfile = tmp_path / "ok.v"
+        vfile.write_text("Theorem t : True. Proof. exact I. Qed.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()  # default check_file blocks ~0.2 s
+        # Even with a frozen frontier, no stall watchdog is armed.
+        checker.last_progress = lambda: (0.0, 0, 0)
+        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
+
+        ctx = _MockLspContext(ls)
+        result = await rocq_compile_lsp(
+            file=str(vfile), workspace=str(tmp_path), ctx=ctx
+        )
+        assert result.get("reason") != "stall_timeout"
+        assert "lsp_restarted" not in result
+        assert pool_checker(ls, workspace=str(tmp_path), file=str(vfile)) is checker
+        assert not checker.stop.called
+
+
+def test_progress_frontier_parsing():
+    """_progress_frontier: earliest Processing start, else None."""
+    from rocq_mcp.lsp_checker import _progress_frontier
+
+    p = {"processing": [{"range": {"start": {"line": 3, "character": 5}}, "kind": 1}]}
+    assert _progress_frontier(p) == (3, 5)
+    # kind != Processing (1) is ignored
+    assert _progress_frontier(
+        {"processing": [{"range": {"start": {"line": 1, "character": 0}}, "kind": 2}]}
+    ) is None
+    assert _progress_frontier({}) is None
+    assert _progress_frontier({"processing": []}) is None
+    # multiple processing ranges -> earliest start
+    p2 = {"processing": [
+        {"range": {"start": {"line": 9, "character": 0}}, "kind": 1},
+        {"range": {"start": {"line": 4, "character": 2}}, "kind": 1},
+    ]}
+    assert _progress_frontier(p2) == (4, 2)
+
+
+def test_extract_sentence(tmp_path):
+    """_extract_sentence: text from the point to the next sentence terminator."""
+    from rocq_mcp.server import _extract_sentence
+
+    f = tmp_path / "x.v"
+    f.write_text("Definition a := 1.\n   destruct foo eqn:E.  more text here.\n")
+    # line 1, char 3 = the 'd' of destruct (after leading spaces)
+    assert _extract_sentence(str(f), 1, 3) == "destruct foo eqn:E."
+    # leading whitespace from the point is skipped
+    assert _extract_sentence(str(f), 1, 0) == "destruct foo eqn:E."
+    # out-of-range line -> None
+    assert _extract_sentence(str(f), 99, 0) is None
+
+
+def test_force_kill_kills_process_and_wakes_waiters():
+    """force_kill SIGKILLs the subprocess and flips _dead (waking _cv waiters)
+    without taking self._lock."""
+    from rocq_mcp.lsp_checker import LspChecker
+
+    c = LspChecker(workspace="/tmp")
+    proc = MagicMock()
+    c._process = proc
+    c.force_kill()
+    assert proc.kill.called
+    assert c._dead is True
+
+
+def test_invalidate_lsp_force_kills_before_stop_no_deadlock():
+    """Regression: an aborted op leaves the worker wedged holding the checker
+    lock; _invalidate_lsp must force_kill (unblock it) BEFORE stop(), else
+    stop()'s ``with self._lock`` deadlocks the event-loop thread.
+
+    A background thread holds a real lock (standing in for the diverging
+    check_file); ``stop()`` blocks on it and ``force_kill()`` releases it.  With
+    the fix, _invalidate_lsp completes promptly; a regression would block until
+    the worker's bounded wait expires (so the test fails on time, not hangs CI).
+    """
+    import threading
+
+    lock = threading.RLock()
+    held = threading.Event()
+    release = threading.Event()
+
+    def wedged_worker():
+        with lock:
+            held.set()
+            release.wait(5)  # bounded: a regression fails fast instead of hanging
+
+    threading.Thread(target=wedged_worker, daemon=True).start()
+    assert held.wait(2)
+
+    class _Checker:
+        def __init__(self):
+            self._process = MagicMock()
+            self._process.poll.return_value = None
+            self.events: list[str] = []
+
+        def force_kill(self):
+            self.events.append("force_kill")
+            release.set()  # unblock the wedged worker -> it releases `lock`
+
+        def stop(self):
+            self.events.append("stop")
+            with lock:  # would block until the worker releases the lock
+                pass
+
+    checker = _Checker()
+    ls = make_lifespan_state(full=True)
+    ls["lsp_pool"]["k"] = checker
+
+    done = threading.Event()
+    threading.Thread(
+        target=lambda: (_server._invalidate_lsp(ls, "k"), done.set()),
+        daemon=True,
+    ).start()
+    assert done.wait(2), "deadlock: _invalidate_lsp did not complete (force_kill before stop?)"
+    assert checker.events == ["force_kill", "stop"]
 
 
 class TestLspSoftThresholdTrim:

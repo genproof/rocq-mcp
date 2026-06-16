@@ -75,7 +75,9 @@ class _Ctx:
 def recorder(monkeypatch):
     chk = _RecordingChecker()
 
-    async def fake_run(fn, lifespan_state, label, *, workspace, key=None):
+    async def fake_run(
+        fn, lifespan_state, label, *, workspace, key=None, sentence_timeout=None
+    ):
         return fn(chk)
 
     monkeypatch.setattr(_server, "_run_with_lsp", fake_run)

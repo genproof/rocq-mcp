@@ -57,6 +57,17 @@ ROCQ_SENTENCE_TIMEOUT: float = float(os.environ.get("ROCQ_SENTENCE_TIMEOUT", "0"
 # ``reason: "hard_timeout"`` and ``lsp_restarted: True``.  Last-resort safety
 # net -- prefer ``ROCQ_SENTENCE_TIMEOUT`` for graceful per-sentence bounds.
 ROCQ_HARD_TIMEOUT: float = float(os.environ.get("ROCQ_HARD_TIMEOUT", "0"))
+# Grace (seconds) added to the effective per-sentence budget to form the
+# progress-stall window.  rocq-lsp emits ``$/coq/fileProgress`` before each
+# sentence (flushed even while its checker thread is wedged), so when the
+# frontier stops advancing for ``sentence_timeout + ROCQ_PROGRESS_GRACE`` the
+# current sentence is diverging non-cooperatively: the session's coq-lsp is
+# killed+restarted and the tool returns ``reason: "stall_timeout"`` naming the
+# diverging sentence.  Smarter than ``ROCQ_HARD_TIMEOUT`` -- it bounds
+# per-sentence wall-clock, not the whole op, so an honestly long check that
+# keeps progressing is never killed.  Only armed when the effective
+# sentence_timeout > 0.
+ROCQ_PROGRESS_GRACE: float = float(os.environ.get("ROCQ_PROGRESS_GRACE", "120"))
 ROCQ_COQC_BINARY: str = os.environ.get("ROCQ_COQC_BINARY", "coqc")
 ROCQ_MAX_SOURCE_SIZE: int = int(os.environ.get("ROCQ_MAX_SOURCE_SIZE", "1000000"))
 # Max characters per rendered term in the structured goal output of the
@@ -672,6 +683,18 @@ def _invalidate_lsp(lifespan_state: dict[str, Any], key: str) -> None:
         "pool", "session.invalidate", key=key, was_live=checker is not None
     )
     if checker is not None:
+        # Kill the subprocess FIRST, lock-free: this path runs when an op was
+        # aborted (memory / stall / hard timeout), so the worker thread may
+        # still be wedged in a diverging check holding the checker's lock.
+        # stop() takes that lock, so calling it first would deadlock; force_kill
+        # unblocks the worker (EOF) so stop() can then acquire the lock and
+        # finish cleanup.  Tolerates an older/mock checker without force_kill.
+        force_kill = getattr(checker, "force_kill", None)
+        if force_kill is not None:
+            try:
+                force_kill()
+            except Exception:
+                pass
         try:
             checker.stop()
         except Exception:
@@ -707,6 +730,9 @@ _RECENT_ERROR_REASONS: frozenset[str] = frozenset(
         # rocq_compile_lsp hard wall-clock backstop (ROCQ_HARD_TIMEOUT) tripped
         # -- coq-lsp was killed + restarted.
         "hard_timeout",
+        # Progress-stall backstop: no $/coq/fileProgress for sentence_timeout +
+        # ROCQ_PROGRESS_GRACE -- a diverging sentence; coq-lsp killed + restarted.
+        "stall_timeout",
         "lock_contended",
         "unavailable",
         "validation",
@@ -859,6 +885,83 @@ def _build_lsp_hard_timeout_response(
     }
 
 
+def _extract_sentence(
+    path: str, line: int, character: int, max_len: int = 300
+) -> str | None:
+    """Best-effort text of the sentence beginning at *(line, character)*.
+
+    For the stall-timeout diagnostic: skips leading whitespace from the point
+    and returns text up to the next sentence terminator (``.`` followed by
+    whitespace or EOF), whitespace collapsed and capped at *max_len*.  A
+    heuristic, not a full Coq lexer (it may run through a ``.`` inside a comment
+    or string), but enough to name the diverging sentence.  Returns ``None`` if
+    the file cannot be read or the point is out of range.
+    """
+    try:
+        text = Path(path).read_text()
+    except (OSError, ValueError):
+        return None
+    file_lines = text.splitlines(keepends=True)
+    if line < 0 or line >= len(file_lines):
+        return None
+    offset = sum(len(s) for s in file_lines[:line]) + character
+    rest = text[offset:].lstrip()
+    m = re.search(r"\.(?:\s|$)", rest)
+    end = m.end() if m else min(len(rest), max_len)
+    sentence = " ".join(rest[:end].split())
+    if len(sentence) > max_len:
+        sentence = sentence[:max_len] + " …"
+    return sentence or None
+
+
+def _build_lsp_stall_timeout_response(
+    lifespan_state: dict[str, Any],
+    tool: str,
+    key: str,
+    progress: tuple[float, int, int] | None,
+    stall_window: float | None,
+) -> dict[str, Any]:
+    """Progress-stall recovery for one coq-lsp session.
+
+    Kills the *key* session's coq-lsp subprocess (so the next call respawns it)
+    and returns a ``stall_timeout`` envelope that *names the diverging
+    sentence*.  Used when coq-lsp stops emitting ``$/coq/fileProgress`` for
+    ``stall_window`` seconds: the current sentence is diverging and ignores
+    Coq's polled interrupt, so the in-process ``sentence_timeout`` cannot free
+    it.  Unlike the blunt ``hard_timeout``, the stalled frontier pinpoints the
+    culprit (0-based ``line``/``character``, with the sentence text when the
+    session is keyed by a readable file).  Other sessions are untouched.
+    """
+    _invalidate_lsp(lifespan_state, key)
+    window = f"{stall_window:.0f}s" if stall_window is not None else "the budget"
+    diverging: dict[str, Any] | None = None
+    if progress is not None:
+        line, character = progress[1], progress[2]
+        sentence = _extract_sentence(key, line, character)
+        diverging = {"line": line, "character": character, "text": sentence}
+        loc = f" at line {line}, character {character} (0-based)"
+        if sentence:
+            loc += f": {sentence}"
+    else:
+        loc = ""
+    error = (
+        f"{tool} aborted: coq-lsp made no checking progress for {window} "
+        "(sentence_timeout + ROCQ_PROGRESS_GRACE). coq-lsp has been restarted. "
+        "The sentence being checked is diverging and ignores Coq's interrupt "
+        f"(a non-cooperative loop or runaway computation){loc}."
+    )
+    _record_error(lifespan_state, tool, error, reason="stall_timeout")
+    response: dict[str, Any] = {
+        "success": False,
+        "error": error,
+        "reason": "stall_timeout",
+        "lsp_restarted": True,
+    }
+    if diverging is not None:
+        response["diverging_sentence"] = diverging
+    return response
+
+
 def _checker_process(checker: Any) -> Any:
     """Return *checker*'s coq-lsp subprocess (with ``.pid``) or None."""
     if checker is None:
@@ -929,11 +1032,16 @@ async def _memory_watchdog(
     on_rss: Callable[[int], None] | None = None,
     deadline: float | None = None,
     timeout_event: asyncio.Event | None = None,
+    get_progress: Callable[[], tuple[float, int, int] | None] | None = None,
+    stall_window: float | None = None,
+    stall_event: asyncio.Event | None = None,
+    op_start: float | None = None,
 ) -> None:
-    """Watch one coq-lsp op: on RSS breach *or* hard-timeout, cancel *main_task*.
+    """Watch one coq-lsp op: on RSS breach, hard-timeout, *or* progress stall,
+    cancel *main_task*.
 
     Runs concurrently with the main work thread, watching a *single*
-    coq-lsp process (one per session — see :func:`_run_with_lsp`).  Two
+    coq-lsp process (one per session — see :func:`_run_with_lsp`).  Three
     independent triggers, each cancelling the main task so the caller's
     recovery path can kill and respawn just that session's subprocess:
 
@@ -944,6 +1052,16 @@ async def _memory_watchdog(
       *non-cooperative* divergence (one that ignores Coq's polled interrupt),
       since cancelling the worker alone does not stop the blocked LSP read —
       the caller kills the process, which unblocks it.
+    - **Progress stall:** when ``get_progress`` reports no new
+      ``$/coq/fileProgress`` frontier for ``stall_window`` seconds, set
+      *stall_event*.  rocq-lsp announces each sentence (frontier advance)
+      before elaborating it, so a stalled frontier means the current sentence
+      is diverging.  A smarter, self-locating variant of the hard timeout: it
+      bounds *per-sentence* wall-clock (not the whole op), so an honestly long
+      check that keeps making progress is never killed, while a wedged sentence
+      is — and the frontier pinpoints it.  ``op_start`` (the op's
+      ``time.monotonic()`` start) seeds the baseline so a divergence in the
+      first sentence, before any progress arrives, is still caught.
 
     ``get_process`` returns the subprocess-like object (with a ``.pid``)
     to watch, or ``None`` if it is not yet spawned.  ``on_rss`` (if
@@ -980,6 +1098,20 @@ async def _memory_watchdog(
                     timeout_event.set()
                 main_task.cancel()
                 return
+            # Progress-stall backstop: the per-sentence-aware counterpart to the
+            # hard deadline.  The frontier advances once per sentence (before it
+            # is elaborated), so no advance for stall_window seconds means the
+            # current sentence is diverging.  Seed from op_start so a first-
+            # sentence divergence (before any progress) still trips.
+            if stall_window is not None and get_progress is not None:
+                prog = get_progress()
+                base = op_start if op_start is not None else 0.0
+                last_activity = prog[0] if (prog and prog[0] >= base) else base
+                if time.monotonic() - last_activity > stall_window:
+                    if stall_event is not None:
+                        stall_event.set()
+                    main_task.cancel()
+                    return
             process = get_process()
             if process is None:
                 continue
@@ -1033,6 +1165,7 @@ async def _run_with_lsp(
     *,
     workspace: str,
     key: str | None = None,
+    sentence_timeout: float | None = None,
 ) -> Any:
     """Run *fn(checker)* against one coq-lsp session with a memory watchdog.
 
@@ -1054,6 +1187,14 @@ async def _run_with_lsp(
     task would not interrupt a blocking LSP read, and coq-lsp already
     serializes requests on its own per-instance lock, so the request
     drains via the checker's internal timeout instead.
+
+    *sentence_timeout* is the effective per-sentence budget for this op
+    (``None`` uses the global ``ROCQ_SENTENCE_TIMEOUT``).  When it is > 0 the
+    progress-stall watchdog is armed at ``sentence_timeout +
+    ROCQ_PROGRESS_GRACE``: if coq-lsp stops reporting ``$/coq/fileProgress``
+    for that long, the current sentence is diverging non-cooperatively and the
+    session is killed+restarted with a ``stall_timeout`` envelope naming the
+    sentence (see :func:`_build_lsp_stall_timeout_response`).
     """
     if key is None:
         key = _session_key(workspace)
@@ -1073,9 +1214,28 @@ async def _run_with_lsp(
     main_task = asyncio.create_task(asyncio.to_thread(fn, checker))
     mem_event = asyncio.Event()
     timeout_event = asyncio.Event()
+    stall_event = asyncio.Event()
     deadline = (
         time.monotonic() + ROCQ_HARD_TIMEOUT if ROCQ_HARD_TIMEOUT > 0 else None
     )
+    # Progress-stall window = per-sentence budget + grace.  Active only when
+    # the effective sentence_timeout > 0 (it is the per-sentence bound the
+    # grace extends); 0 leaves the blunt ROCQ_HARD_TIMEOUT as the only backstop.
+    eff_sentence_timeout = (
+        ROCQ_SENTENCE_TIMEOUT if sentence_timeout is None else sentence_timeout
+    )
+    stall_window = (
+        eff_sentence_timeout + ROCQ_PROGRESS_GRACE
+        if eff_sentence_timeout > 0
+        else None
+    )
+    # Fresh per-op progress baseline so a stall is attributed to THIS op's
+    # checking frontier, not one left over from a prior call on the warm
+    # session.  Guarded so it is a no-op when the stall watchdog is disabled.
+    if stall_window is not None:
+        reset = getattr(checker, "reset_progress", None)
+        if reset is not None:
+            reset()
     monitor_task = asyncio.create_task(
         _memory_watchdog(
             ROCQ_MAX_LSP_RSS_MB,
@@ -1085,6 +1245,10 @@ async def _run_with_lsp(
             on_rss=_track_peak,
             deadline=deadline,
             timeout_event=timeout_event,
+            get_progress=getattr(checker, "last_progress", None),
+            stall_window=stall_window,
+            stall_event=stall_event,
+            op_start=_t0,
         )
     )
     try:
@@ -1115,6 +1279,20 @@ async def _run_with_lsp(
                 limit_s=ROCQ_HARD_TIMEOUT,
             )
             return _build_lsp_hard_timeout_response(lifespan_state, tool, key)
+        if stall_event.is_set():
+            # Re-read the frontier *after* the cancel: coq-lsp is wedged (no new
+            # progress) and about to be killed, so this is the stalled sentence.
+            prog = checker.last_progress()
+            dlog.event(
+                "op", "lsp_op.stall_timeout", tool=tool, key=key,
+                duration_s=round(time.monotonic() - _t0, 6),
+                stall_window_s=stall_window,
+                line=prog[1] if prog else None,
+                character=prog[2] if prog else None,
+            )
+            return _build_lsp_stall_timeout_response(
+                lifespan_state, tool, key, prog, stall_window
+            )
         dlog.event(
             "op", "lsp_op.cancelled", tool=tool, key=key,
             duration_s=round(time.monotonic() - _t0, 6),
@@ -1931,7 +2109,9 @@ async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
 
       - **coq-lsp transport**: ``"timeout"``, ``"crashed"``,
         ``"memory_exhausted"``, ``"hard_timeout"`` (the ``ROCQ_HARD_TIMEOUT``
-        backstop tripped; coq-lsp was killed + restarted), ``"unavailable"``.
+        backstop tripped; coq-lsp was killed + restarted), ``"stall_timeout"``
+        (no checking progress for ``sentence_timeout + ROCQ_PROGRESS_GRACE`` --
+        a diverging sentence; coq-lsp killed + restarted), ``"unavailable"``.
       - **Validation / lookup** (set by tools): ``"validation"``,
         ``"not_found"`` (e.g. rocq_assumptions on a typo).
       - **Tactic rejected** (rocq_step / rocq_step_multi): ``"tactic_failed"``.
@@ -2064,14 +2244,20 @@ async def rocq_compile_lsp(
 
     There is no client-side wait timeout: a check runs until coq-lsp
     settles.  Bound the work coq-lsp-side instead — ``sentence_timeout`` for
-    a graceful per-sentence cap (see below), and two process-level watchdogs
-    as last-resort backstops: a memory watchdog (``ROCQ_MAX_LSP_RSS_MB``) and
-    a hard wall-clock timeout (``ROCQ_HARD_TIMEOUT``).  On either breach the
-    session's coq-lsp is killed and restarted and the response is
-    ``{success: False, reason: "memory_exhausted" | "hard_timeout",
-    lsp_restarted: True}`` (the hard timeout is the only thing that can free a
-    non-cooperative divergence — one that ignores Coq's interrupt — which
-    ``sentence_timeout`` cannot).
+    a graceful per-sentence cap (see below), and three process-level watchdogs
+    as last-resort backstops: a memory watchdog (``ROCQ_MAX_LSP_RSS_MB``), a
+    progress-stall watchdog (``ROCQ_PROGRESS_GRACE``), and a hard wall-clock
+    timeout (``ROCQ_HARD_TIMEOUT``).  On any breach the session's coq-lsp is
+    killed and restarted and the response is ``{success: False, reason:
+    "memory_exhausted" | "stall_timeout" | "hard_timeout", lsp_restarted:
+    True}``.  For a *non-cooperative* divergence — one that ignores Coq's
+    interrupt, which ``sentence_timeout`` cannot touch — prefer the stall
+    watchdog: when ``sentence_timeout > 0`` and the checking frontier
+    (``$/coq/fileProgress``) stops advancing for ``sentence_timeout +
+    ROCQ_PROGRESS_GRACE``, the check is aborted with ``reason:
+    "stall_timeout"`` and a ``diverging_sentence: {line, character, text}``
+    locating the culprit — and, unlike the hard timeout, an honestly long
+    check that keeps progressing is never killed.
 
     Args:
         file: Path to the .v file (relative to workspace).
@@ -2189,6 +2375,7 @@ async def rocq_compile_lsp(
         "rocq_compile_lsp",
         workspace=workspace,
         key=_session_key(workspace, file),
+        sentence_timeout=eff_sentence_timeout,
     )
 
     # On a memory abort the envelope carries no warnings/info keys to pop.
