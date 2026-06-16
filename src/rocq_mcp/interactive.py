@@ -583,10 +583,13 @@ async def run_assumptions(
 ) -> dict[str, Any]:
     """Core implementation of rocq_assumptions (testable without FastMCP Context).
 
-    Runs ``Print Assumptions <name>.`` via :func:`run_query` in file mode
-    and returns the parsed assumption list verbatim.  No classification —
-    the agent decides what's safe to trust.  (``rocq_verify`` keeps its
-    sandboxed classifier; this tool is pure introspection.)
+    Runs ``Print Assumptions <name>.`` via :func:`run_query` at end-of-file
+    against the *live* document — so a warm / incremental / ``.vof`` session
+    from a prior ``rocq_compile_lsp`` is reused, rather than re-checking a
+    scratch copy of the file — and returns the parsed assumption list
+    verbatim.  No classification — the agent decides what's safe to trust.
+    (``rocq_verify`` keeps its sandboxed classifier; this tool is pure
+    introspection.)
 
     The *file_path* parameter is required — it provides the ``.v`` file where the
     theorem is defined, so the query runs in a context where all definitions
@@ -625,12 +628,31 @@ async def run_assumptions(
             ),
         )
 
+    # Query at end-of-file against the LIVE document (position mode): Print
+    # Assumptions only needs the whole-file environment (every definition in
+    # scope), which EOF provides, and position mode reuses coq-lsp's warm /
+    # incremental / .vof state instead of re-checking a scratch copy.  Fall
+    # back to file mode (line/character None) when the file can't be measured
+    # or is larger than the position range.
+    lines: list[str] | None = None
+    try:
+        resolved = _server._resolve_file_in_workspace(file_path, workspace)
+        lines = Path(resolved).read_text().split("\n")
+    except (ValueError, FileNotFoundError, OSError, PermissionError):
+        lines = None
+    eof_line = eof_char = None
+    if lines is not None and len(lines) - 1 <= _MAX_LINE_CHAR_RANGE:
+        eof_line = len(lines) - 1
+        eof_char = min(len(lines[-1]), _MAX_LINE_CHAR_RANGE)
+
     query_result = await run_query(
         command=f"Print Assumptions {clean_name}.",
         preamble="",
         workspace=workspace,
         lifespan_state=lifespan_state,
         file_path=file_path,
+        line=eof_line,
+        character=eof_char,
     )
     if not query_result.get("success"):
         # Best-effort enrichment: attach the file's symbol list so the
