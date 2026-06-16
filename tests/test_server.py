@@ -1018,7 +1018,7 @@ class TestWrapperWorkspaceAutoDetect:
         ctx = _MockContext({"op_timeout": 30.0})
 
         tool = getattr(_server, tool_name)
-        await tool(file=str(f), ctx=ctx, **extra_kwargs)
+        await tool(file_path=str(f), ctx=ctx, **extra_kwargs)
 
         assert seen["workspace"] == str(Path(proj).absolute()), tool_name
 
@@ -1034,7 +1034,7 @@ class TestWrapperWorkspaceAutoDetect:
         ctx = _MockContext({"op_timeout": 30.0})
 
         explicit = "/some/other/dir"
-        await _server.rocq_toc(file=str(f), workspace=explicit, ctx=ctx)
+        await _server.rocq_toc(file_path=str(f), workspace=explicit, ctx=ctx)
 
         assert seen["workspace"] == explicit
 

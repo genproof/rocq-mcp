@@ -76,7 +76,7 @@ class TestUnifiedFailureEnvelope:
         ls["recent_errors"] = deque(maxlen=10)
         result = await run_assumptions(
             name="thm",
-            file="",
+            file_path="",
             workspace="/tmp",
             lifespan_state=ls,
         )
@@ -103,7 +103,7 @@ class TestUnifiedFailureEnvelope:
         ls = make_lifespan_state()
         ls["recent_errors"] = deque(maxlen=10)
         result = await run_step(
-            file="x.v",
+            file_path="x.v",
             line=0,
             character=0,
             tactics="Drop.",  # forbidden
@@ -118,7 +118,7 @@ class TestUnifiedFailureEnvelope:
         ls = make_lifespan_state()
         ls["recent_errors"] = deque(maxlen=10)
         result = await run_step_multi(
-            file="x.v",
+            file_path="x.v",
             line=0,
             character=0,
             tactics=[],
@@ -133,7 +133,7 @@ class TestUnifiedFailureEnvelope:
         ls = make_lifespan_state()
         ls["recent_errors"] = deque(maxlen=10)
         result = await run_get_state(
-            file="x.v",
+            file_path="x.v",
             line=-1,
             character=0,
             workspace="/tmp",
@@ -164,7 +164,7 @@ class TestWrapperNoContextEnvelope:
         from rocq_mcp.server import rocq_assumptions
 
         _assert_failure_envelope(
-            await rocq_assumptions(name="foo", file="x.v", ctx=None),
+            await rocq_assumptions(name="foo", file_path="x.v", ctx=None),
             expected_reason="validation",
         )
 
@@ -174,7 +174,7 @@ class TestWrapperNoContextEnvelope:
 
         _assert_failure_envelope(
             await rocq_step(
-                file="x.v", line=0, character=0, tactics="reflexivity.", ctx=None
+                file_path="x.v", line=0, character=0, tactics="reflexivity.", ctx=None
             ),
             expected_reason="validation",
         )
@@ -185,7 +185,7 @@ class TestWrapperNoContextEnvelope:
 
         _assert_failure_envelope(
             await rocq_step_multi(
-                file="x.v", line=0, character=0, tactics=["reflexivity."], ctx=None
+                file_path="x.v", line=0, character=0, tactics=["reflexivity."], ctx=None
             ),
             expected_reason="validation",
         )
@@ -195,7 +195,7 @@ class TestWrapperNoContextEnvelope:
         from rocq_mcp.server import rocq_get_state
 
         _assert_failure_envelope(
-            await rocq_get_state(file="x.v", line=0, character=0, ctx=None),
+            await rocq_get_state(file_path="x.v", line=0, character=0, ctx=None),
             expected_reason="validation",
         )
 
@@ -204,7 +204,7 @@ class TestWrapperNoContextEnvelope:
         from rocq_mcp.server import rocq_toc
 
         _assert_failure_envelope(
-            await rocq_toc(file="x.v", ctx=None),
+            await rocq_toc(file_path="x.v", ctx=None),
             expected_reason="validation",
         )
 
@@ -263,7 +263,7 @@ class TestCompileEnvelope:
         from rocq_mcp.compile import run_compile_file
 
         result = run_compile_file(
-            file="does_not_exist.v",
+            file_path="does_not_exist.v",
             workspace=str(tmp_path),
             timeout=5,
         )

@@ -119,7 +119,7 @@ class TestAnnotate:
 class TestExtractValidation:
     async def test_bad_line(self):
         r = await run_extract(
-            file="t.v", line=-1, character=0, name="tg", workspace="/tmp",
+            file_path="t.v", line=-1, character=0, name="tg", workspace="/tmp",
             lifespan_state=make_lifespan_state(),
         )
         assert r["success"] is False
@@ -127,7 +127,7 @@ class TestExtractValidation:
     async def test_bad_name(self, tmp_path):
         (tmp_path / "t.v").write_text("Lemma l : True. Proof. admit. Admitted.\n")
         r = await run_extract(
-            file="t.v", line=0, character=0, name="1bad-name",
+            file_path="t.v", line=0, character=0, name="1bad-name",
             workspace=str(tmp_path), lifespan_state=make_lifespan_state(),
         )
         assert r["success"] is False
@@ -135,7 +135,7 @@ class TestExtractValidation:
 
     async def test_file_not_found(self):
         r = await run_extract(
-            file="nope.v", line=0, character=0, name="tg", workspace="/tmp",
+            file_path="nope.v", line=0, character=0, name="tg", workspace="/tmp",
             lifespan_state=make_lifespan_state(),
         )
         assert r["success"] is False
@@ -169,7 +169,7 @@ class TestExtractEndToEnd:
         f.write_text(_SRC)
         # Point at the [admit.] (line 3, 0-indexed); extract its goal.
         r = await run_extract(
-            file="m.v", line=3, character=2, name="tg",
+            file_path="m.v", line=3, character=2, name="tg",
             workspace=str(tmp_path), lifespan_state=lstate, timeout=120,
         )
         if not r.get("success") and "extract" in (r.get("error") or "").lower() and (
@@ -189,7 +189,7 @@ class TestExtractEndToEnd:
         f = tmp_path / "m2.v"
         f.write_text(_SRC)
         r = await run_extract(
-            file="m2.v", line=3, character=2, name="ng",
+            file_path="m2.v", line=3, character=2, name="ng",
             workspace=str(tmp_path), lifespan_state=lstate, annotate=False,
             timeout=120,
         )

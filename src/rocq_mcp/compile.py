@@ -482,7 +482,7 @@ def run_compile(
 
 @dlog.logged("tool", "rocq_compile_file")
 def run_compile_file(
-    file: str,
+    file_path: str,
     workspace: str,
     timeout: int,
     include_warnings: bool = True,
@@ -493,7 +493,7 @@ def run_compile_file(
     the workspace, checks for forbidden commands, and returns structured errors.
     """
     try:
-        file_path = _server._resolve_file_in_workspace(file, workspace)
+        file_path = _server._resolve_file_in_workspace(file_path, workspace)
     except (ValueError, FileNotFoundError) as e:
         return {"success": False, "reason": "validation", "error": str(e)}
 
@@ -523,7 +523,7 @@ def run_compile_file(
         source,
         timeout,
         include_warnings,
-        file_label=file,
+        file_label=file_path,
         clean_tmp_paths=False,
     )
 

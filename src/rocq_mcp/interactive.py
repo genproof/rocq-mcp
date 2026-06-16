@@ -449,7 +449,7 @@ async def run_query(
     preamble: str,
     workspace: str,
     lifespan_state: dict[str, Any],
-    file: str = "",
+    file_path: str = "",
     max_results: int | None = None,
     *,
     include_warnings: bool = True,
@@ -463,7 +463,7 @@ async def run_query(
     - **preamble mode**: import commands set up the environment.
     - **file mode**: a ``.v`` file provides the full (end-of-file)
       environment — every definition in the file is in scope.
-    - **position mode**: ``file`` + ``line`` + ``character`` query the
+    - **position mode**: ``file_path`` + ``line`` + ``character`` query the
       proof context *at that point* (0-indexed) — opened scopes,
       hypotheses, local definitions visible there.  Point at a sentence
       boundary (e.g. just after a tactic's ``.``).
@@ -480,9 +480,9 @@ async def run_query(
     wrapper applies ``ROCQ_QUERY_TIMEOUT_CAP``.
     """
     pos_mode = line is not None or character is not None
-    if pos_mode and not file:
+    if pos_mode and not file_path:
         return _server._fail(
-            lifespan_state, "rocq_query", "position mode requires 'file'."
+            lifespan_state, "rocq_query", "position mode requires 'file_path'."
         )
     if pos_mode and preamble.strip():
         return _server._fail(
@@ -491,17 +491,17 @@ async def run_query(
             "preamble is not used in position mode; the file at the position "
             "provides the context.",
         )
-    if not pos_mode and file and preamble.strip():
+    if not pos_mode and file_path and preamble.strip():
         return _server._fail(
             lifespan_state,
             "rocq_query",
-            "Provide either 'file' or 'preamble', not both.",
+            "Provide either 'file_path' or 'preamble', not both.",
         )
 
     forbidden = _check_forbidden_commands(command)
     if forbidden:
         return _server._fail(lifespan_state, "rocq_query", forbidden)
-    if not file:
+    if not file_path:
         forbidden = _check_forbidden_commands(preamble)
         if forbidden:
             return _server._fail(lifespan_state, "rocq_query", forbidden)
@@ -516,15 +516,15 @@ async def run_query(
     )
 
     def _do_lsp(checker: Any) -> dict[str, Any]:
-        if file:
+        if file_path:
             try:
-                resolved = _server._resolve_file_in_workspace(file, workspace)
+                resolved = _server._resolve_file_in_workspace(file_path, workspace)
                 content = Path(resolved).read_text()
             except (ValueError, FileNotFoundError) as e:
                 return _server._fail(lifespan_state, "rocq_query", str(e))
             except (OSError, PermissionError):
                 return _server._fail(
-                    lifespan_state, "rocq_query", f"File not accessible: {file}"
+                    lifespan_state, "rocq_query", f"File not accessible: {file_path}"
                 )
             if pos_mode:
                 # Position mode runs the query against the *live* document via
@@ -566,7 +566,7 @@ async def run_query(
         lifespan_state,
         "rocq_query",
         workspace=workspace,
-        key=_server._session_key(workspace, file or None),
+        key=_server._session_key(workspace, file_path or None),
     )
 
 
@@ -578,7 +578,7 @@ async def run_query(
 @dlog.logged("tool", "rocq_assumptions")
 async def run_assumptions(
     name: str,
-    file: str,
+    file_path: str,
     workspace: str,
     lifespan_state: dict[str, Any],
 ) -> dict[str, Any]:
@@ -589,7 +589,7 @@ async def run_assumptions(
     the agent decides what's safe to trust.  (``rocq_verify`` keeps its
     sandboxed classifier; this tool is pure introspection.)
 
-    The *file* parameter is required — it provides the ``.v`` file where the
+    The *file_path* parameter is required — it provides the ``.v`` file where the
     theorem is defined, so the query runs in a context where all definitions
     from that file are in scope.  This eliminates shadowing ambiguity that
     plagued the old preamble-based approach.
@@ -604,10 +604,10 @@ async def run_assumptions(
     """
     from rocq_mcp.verify import _parse_assumptions_raw, is_rocq_qualified_name
 
-    # Validate file parameter
-    if not file or not file.strip():
+    # Validate file_path parameter
+    if not file_path or not file_path.strip():
         return _server._fail(
-            lifespan_state, "rocq_assumptions", "File parameter is required."
+            lifespan_state, "rocq_assumptions", "The file_path parameter is required."
         )
 
     # Validate: non-empty, valid Rocq identifier or qualified name.
@@ -631,7 +631,7 @@ async def run_assumptions(
         preamble="",
         workspace=workspace,
         lifespan_state=lifespan_state,
-        file=file,
+        file_path=file_path,
     )
     if not query_result.get("success"):
         # Best-effort enrichment: attach the file's symbol list so the
@@ -657,7 +657,7 @@ async def run_assumptions(
         ) or (reason == "crashed" and pet_restarted)
         if "available_in_file" not in query_result and not is_transport_failure:
             result = await _fetch_available_in_file(
-                file=file,
+                file_path=file_path,
                 workspace=workspace,
                 lifespan_state=lifespan_state,
                 tool="rocq_assumptions",
@@ -949,14 +949,14 @@ def _attach_available_in_file(resp: dict[str, Any], result: _AvailableInFile) ->
 
 async def _fetch_available_in_file(
     *,
-    file: str,
+    file_path: str,
     workspace: str,
     lifespan_state: dict[str, Any],
     tool: str,
 ) -> _AvailableInFile:
-    """Async wrapper that fetches the (capped) name list for *file*.
+    """Async wrapper that fetches the (capped) name list for *file_path*.
 
-    Resolves *file* against *workspace*, runs ``pet.toc`` (cached) under
+    Resolves *file_path* against *workspace*, runs ``pet.toc`` (cached) under
     the pet lock, and returns an :class:`_AvailableInFile` with
     ``names``, ``truncated``, and ``total``.  On any error returns an
     empty result (``names=[]``, ``truncated=False``, ``total=0``) —
@@ -970,7 +970,7 @@ async def _fetch_available_in_file(
     failure to ``rocq_assumptions`` would be a bug.
     """
     try:
-        resolved = _server._resolve_file_in_workspace(file, workspace)
+        resolved = _server._resolve_file_in_workspace(file_path, workspace)
     except (ValueError, FileNotFoundError, OSError):
         return _AvailableInFile([], False, 0)
 
@@ -983,7 +983,7 @@ async def _fetch_available_in_file(
             lifespan_state,
             tool,
             workspace=workspace,
-            key=_server._session_key(workspace, file),
+            key=_server._session_key(workspace, file_path),
         )
     except Exception:
         return _AvailableInFile([], False, 0)
@@ -997,7 +997,7 @@ async def _fetch_available_in_file(
 
 @dlog.logged("tool", "rocq_toc")
 async def run_toc(
-    file: str,
+    file_path: str,
     workspace: str,
     lifespan_state: dict[str, Any],
 ) -> dict[str, Any]:
@@ -1007,7 +1007,7 @@ async def run_toc(
     """
     # Path traversal + existence check (before entering thread)
     try:
-        file_path = _server._resolve_file_in_workspace(file, workspace)
+        file_path = _server._resolve_file_in_workspace(file_path, workspace)
     except (ValueError, FileNotFoundError) as e:
         return _server._fail(lifespan_state, "rocq_toc", str(e))
 
@@ -1022,7 +1022,7 @@ async def run_toc(
             )
 
         # Format the result as readable text
-        lines: list[str] = [f"File: {file}"]
+        lines: list[str] = [f"File: {file_path}"]
         lines.extend(_format_symbol_tree(symbols))
 
         output = "\n".join(lines)
@@ -1031,14 +1031,14 @@ async def run_toc(
                 output[:_MAX_QUERY_OUTPUT]
                 + f"\n... (truncated, {len(output)} total chars)"
             )
-        return {"success": True, "output": output or f"File: {file}\n  (empty)"}
+        return {"success": True, "output": output or f"File: {file_path}\n  (empty)"}
 
     return await _server._run_with_lsp(
         _do_toc,
         lifespan_state,
         "rocq_toc",
         workspace=workspace,
-        key=_server._session_key(workspace, file),
+        key=_server._session_key(workspace, file_path),
     )
 
 
@@ -1251,7 +1251,7 @@ def _goals_mode(before: bool) -> str:
 
 @dlog.logged("tool", "rocq_get_state")
 async def run_get_state(
-    file: str,
+    file_path: str,
     line: int,
     character: int,
     workspace: str,
@@ -1276,7 +1276,7 @@ async def run_get_state(
     if err:
         return err
     try:
-        resolved = _server._resolve_file_in_workspace(file, workspace)
+        resolved = _server._resolve_file_in_workspace(file_path, workspace)
     except (ValueError, FileNotFoundError) as e:
         return _server._fail(lifespan_state, "rocq_get_state", str(e))
 
@@ -1321,7 +1321,7 @@ async def run_get_state(
         rendered = _render_goals_answer(payload, include_warnings=include_warnings)
         return {
             "success": True,
-            "file": file,
+            "file_path": file_path,
             "line": line,
             "character": character,
             **rendered,
@@ -1332,7 +1332,7 @@ async def run_get_state(
         lifespan_state,
         "rocq_get_state",
         workspace=workspace,
-        key=_server._session_key(workspace, file),
+        key=_server._session_key(workspace, file_path),
     )
 
 
@@ -1407,7 +1407,7 @@ def _annotate_extraction_source(
 
 @dlog.logged("tool", "rocq_extract")
 async def run_extract(
-    file: str,
+    file_path: str,
     line: int,
     character: int,
     name: str,
@@ -1419,9 +1419,9 @@ async def run_extract(
 ) -> dict[str, Any]:
     """Extract the goal at a position into ``<name>_goal.v`` / ``<name>_proof.v``.
 
-    Drives ``coq/extract`` on the live session for *file* (0-indexed
+    Drives ``coq/extract`` on the live session for *file_path* (0-indexed
     *line*/*character* on the goal's tactic, the same address the other
-    position tools use).  The server writes both files next to *file*;
+    position tools use).  The server writes both files next to *file_path*;
     when *annotate* (default), the source is also edited to drop in the
     ``confirm_extraction "<hash>"`` tripwire (and the explanatory block on
     a fresh site, or just a hash refresh on re-extraction).  Refuses with
@@ -1439,7 +1439,7 @@ async def run_extract(
             "validation",
         )
     try:
-        resolved = _server._resolve_file_in_workspace(file, workspace)
+        resolved = _server._resolve_file_in_workspace(file_path, workspace)
     except (ValueError, FileNotFoundError) as e:
         return _server._fail(lifespan_state, "rocq_extract", str(e))
 
@@ -1467,7 +1467,7 @@ async def run_extract(
             )
         out: dict[str, Any] = {
             "success": True,
-            "file": file,
+            "file_path": file_path,
             "line": line,
             "character": character,
             **res,
@@ -1496,13 +1496,13 @@ async def run_extract(
         lifespan_state,
         "rocq_extract",
         workspace=workspace,
-        key=_server._session_key(workspace, file),
+        key=_server._session_key(workspace, file_path),
     )
 
 
 @dlog.logged("tool", "rocq_step")
 async def run_step(
-    file: str,
+    file_path: str,
     line: int,
     character: int,
     tactics: str,
@@ -1535,7 +1535,7 @@ async def run_step(
     if not tactics.strip():
         return _server._fail(lifespan_state, "rocq_step", "tactics must not be empty.")
     try:
-        resolved = _server._resolve_file_in_workspace(file, workspace)
+        resolved = _server._resolve_file_in_workspace(file_path, workspace)
     except (ValueError, FileNotFoundError) as e:
         return _server._fail(lifespan_state, "rocq_step", str(e))
 
@@ -1588,7 +1588,7 @@ async def run_step(
         messages = rendered.pop("messages", None)
         result = {
             "success": True,
-            "file": file,
+            "file_path": file_path,
             "line": line,
             "character": character,
             # Wall-clock (seconds) for the proof/goals round-trip running
@@ -1606,13 +1606,13 @@ async def run_step(
         lifespan_state,
         "rocq_step",
         workspace=workspace,
-        key=_server._session_key(workspace, file),
+        key=_server._session_key(workspace, file_path),
     )
 
 
 @dlog.logged("tool", "rocq_step_multi")
 async def run_step_multi(
-    file: str,
+    file_path: str,
     line: int,
     character: int,
     tactics: list[str],
@@ -1652,7 +1652,7 @@ async def run_step_multi(
         if forbidden:
             return _server._fail(lifespan_state, "rocq_step_multi", forbidden)
     try:
-        resolved = _server._resolve_file_in_workspace(file, workspace)
+        resolved = _server._resolve_file_in_workspace(file_path, workspace)
     except (ValueError, FileNotFoundError) as e:
         return _server._fail(lifespan_state, "rocq_step_multi", str(e))
 
@@ -1705,7 +1705,7 @@ async def run_step_multi(
             results.append(entry)
         return {
             "success": True,
-            "file": file,
+            "file_path": file_path,
             "line": line,
             "character": character,
             "results": results,
@@ -1716,7 +1716,7 @@ async def run_step_multi(
         lifespan_state,
         "rocq_step_multi",
         workspace=workspace,
-        key=_server._session_key(workspace, file),
+        key=_server._session_key(workspace, file_path),
     )
 
 

@@ -285,11 +285,11 @@ class TestLspMemoryWatchdogBreach:
         ls = make_lifespan_state(full=True)
         ls["workspace"] = str(tmp_path)
         checker = _mock_lsp_checker()
-        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
 
         ctx = _MockLspContext(ls)
         result = await rocq_compile_lsp(
-            file=str(vfile), workspace=str(tmp_path), ctx=ctx
+            file_path=str(vfile), workspace=str(tmp_path), ctx=ctx
         )
 
         assert result["success"] is False
@@ -300,8 +300,8 @@ class TestLspMemoryWatchdogBreach:
         # _invalidate_lsp was called -> checker.stop() fired and the
         # session was dropped from the pool so the next call respawns it.
         assert checker.stop.called
-        assert pool_checker(ls, workspace=str(tmp_path), file=str(vfile)) is None
-        assert session_meta(ls, workspace=str(tmp_path), file=str(vfile))[
+        assert pool_checker(ls, workspace=str(tmp_path), file_path=str(vfile)) is None
+        assert session_meta(ls, workspace=str(tmp_path), file_path=str(vfile))[
             "generation"
         ] == 1
         # Recent-errors deque records this under memory_exhausted.
@@ -329,19 +329,19 @@ class TestLspMemoryWatchdogBreach:
         checker.check_file.side_effect = lambda *a, **kw: {
             "success": True, "errors": [], "warnings": [], "check_time_ms": 1,
         }
-        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
 
         ctx = _MockLspContext(ls)
         result = await rocq_compile_lsp(
-            file=str(vfile), workspace=str(tmp_path), ctx=ctx
+            file_path=str(vfile), workspace=str(tmp_path), ctx=ctx
         )
 
         assert result["success"] is True
         assert "lsp_restarted" not in result
         assert "reason" not in result or result["reason"] != "memory_exhausted"
         # Checker was reused, not replaced.
-        assert pool_checker(ls, workspace=str(tmp_path), file=str(vfile)) is checker
-        assert session_meta(ls, workspace=str(tmp_path), file=str(vfile))[
+        assert pool_checker(ls, workspace=str(tmp_path), file_path=str(vfile)) is checker
+        assert session_meta(ls, workspace=str(tmp_path), file_path=str(vfile))[
             "generation"
         ] == 0
         assert not checker.stop.called
@@ -365,11 +365,11 @@ class TestLspMemoryWatchdogBreach:
             time.sleep(0.1)
             or {"success": True, "errors": [], "warnings": [], "check_time_ms": 100}
         )
-        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
 
         ctx = _MockLspContext(ls)
-        await rocq_compile_lsp(file=str(vfile), workspace=str(tmp_path), ctx=ctx)
-        assert session_meta(ls, workspace=str(tmp_path), file=str(vfile))[
+        await rocq_compile_lsp(file_path=str(vfile), workspace=str(tmp_path), ctx=ctx)
+        assert session_meta(ls, workspace=str(tmp_path), file_path=str(vfile))[
             "peak_rss_mb"
         ] >= 333.0
 
@@ -404,12 +404,12 @@ class TestLspHardTimeout:
             time.sleep(0.5)
             or {"success": True, "errors": [], "warnings": [], "check_time_ms": 500}
         )
-        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
 
         ctx = _MockLspContext(ls)
         t0 = time.monotonic()
         result = await rocq_compile_lsp(
-            file=str(vfile), workspace=str(tmp_path), ctx=ctx
+            file_path=str(vfile), workspace=str(tmp_path), ctx=ctx
         )
         elapsed = time.monotonic() - t0
 
@@ -421,8 +421,8 @@ class TestLspHardTimeout:
         assert elapsed < 0.4, f"did not abort at the deadline (took {elapsed:.2f}s)"
         # _invalidate_lsp killed + dropped the session so the next call respawns.
         assert checker.stop.called
-        assert pool_checker(ls, workspace=str(tmp_path), file=str(vfile)) is None
-        assert session_meta(ls, workspace=str(tmp_path), file=str(vfile))[
+        assert pool_checker(ls, workspace=str(tmp_path), file_path=str(vfile)) is None
+        assert session_meta(ls, workspace=str(tmp_path), file_path=str(vfile))[
             "generation"
         ] == 1
         assert any(
@@ -446,16 +446,16 @@ class TestLspHardTimeout:
         ls = make_lifespan_state(full=True)
         ls["workspace"] = str(tmp_path)
         checker = _mock_lsp_checker()  # default check_file blocks ~0.2 s
-        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
 
         ctx = _MockLspContext(ls)
         result = await rocq_compile_lsp(
-            file=str(vfile), workspace=str(tmp_path), ctx=ctx
+            file_path=str(vfile), workspace=str(tmp_path), ctx=ctx
         )
         assert result.get("reason") != "hard_timeout"
         assert "lsp_restarted" not in result
         # Checker reused, not killed.
-        assert pool_checker(ls, workspace=str(tmp_path), file=str(vfile)) is checker
+        assert pool_checker(ls, workspace=str(tmp_path), file_path=str(vfile)) is checker
         assert not checker.stop.called
 
 
@@ -491,12 +491,12 @@ class TestLspProgressStall:
             time.sleep(0.5)
             or {"success": True, "errors": [], "warnings": [], "check_time_ms": 500}
         )
-        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
 
         ctx = _MockLspContext(ls)
         t0 = time.monotonic()
         result = await rocq_compile_lsp(
-            file=str(vfile), workspace=str(tmp_path), ctx=ctx
+            file_path=str(vfile), workspace=str(tmp_path), ctx=ctx
         )
         elapsed = time.monotonic() - t0
 
@@ -511,7 +511,7 @@ class TestLspProgressStall:
         assert "diverge_forever_aaaa." in result["error"]
         # Session killed + dropped so the next call respawns it.
         assert checker.stop.called
-        assert pool_checker(ls, workspace=str(tmp_path), file=str(vfile)) is None
+        assert pool_checker(ls, workspace=str(tmp_path), file_path=str(vfile)) is None
         assert any(
             e.get("reason") == "stall_timeout"
             and e.get("tool") == "rocq_compile_lsp"
@@ -539,15 +539,15 @@ class TestLspProgressStall:
         checker = _mock_lsp_checker()  # default check_file blocks ~0.2 s
         # Even with a frozen frontier, no stall watchdog is armed.
         checker.last_progress = lambda: (0.0, 0, 0)
-        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
 
         ctx = _MockLspContext(ls)
         result = await rocq_compile_lsp(
-            file=str(vfile), workspace=str(tmp_path), ctx=ctx
+            file_path=str(vfile), workspace=str(tmp_path), ctx=ctx
         )
         assert result.get("reason") != "stall_timeout"
         assert "lsp_restarted" not in result
-        assert pool_checker(ls, workspace=str(tmp_path), file=str(vfile)) is checker
+        assert pool_checker(ls, workspace=str(tmp_path), file_path=str(vfile)) is checker
         assert not checker.stop.called
 
 
@@ -681,21 +681,21 @@ class TestLspSoftThresholdTrim:
         checker.check_file.side_effect = lambda *a, **kw: {
             "success": True, "errors": [], "warnings": [], "check_time_ms": 1,
         }
-        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
 
         ctx = _MockLspContext(ls)
         result = await rocq_compile_lsp(
-            file=str(vfile), workspace=str(tmp_path), ctx=ctx
+            file_path=str(vfile), workspace=str(tmp_path), ctx=ctx
         )
 
         assert result["success"] is True
         assert checker.trim_caches.call_count == 1
-        assert session_meta(ls, workspace=str(tmp_path), file=str(vfile))[
+        assert session_meta(ls, workspace=str(tmp_path), file_path=str(vfile))[
             "trim_count"
         ] == 1
         # Soft trim must NOT kill coq-lsp (that's the hard cap's job).
         assert not checker.stop.called
-        assert pool_checker(ls, workspace=str(tmp_path), file=str(vfile)) is checker
+        assert pool_checker(ls, workspace=str(tmp_path), file_path=str(vfile)) is checker
 
     @pytest.mark.asyncio
     async def test_low_rss_does_not_trigger_trim(self, tmp_path, monkeypatch):
@@ -715,13 +715,13 @@ class TestLspSoftThresholdTrim:
         checker.check_file.side_effect = lambda *a, **kw: {
             "success": True, "errors": [], "warnings": [], "check_time_ms": 1,
         }
-        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
 
         ctx = _MockLspContext(ls)
-        await rocq_compile_lsp(file=str(vfile), workspace=str(tmp_path), ctx=ctx)
+        await rocq_compile_lsp(file_path=str(vfile), workspace=str(tmp_path), ctx=ctx)
 
         assert not checker.trim_caches.called
-        assert session_meta(ls, workspace=str(tmp_path), file=str(vfile)).get(
+        assert session_meta(ls, workspace=str(tmp_path), file_path=str(vfile)).get(
             "trim_count", 0
         ) == 0
 
@@ -743,10 +743,10 @@ class TestLspSoftThresholdTrim:
         checker.check_file.side_effect = lambda *a, **kw: {
             "success": True, "errors": [], "warnings": [], "check_time_ms": 1,
         }
-        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
 
         ctx = _MockLspContext(ls)
-        await rocq_compile_lsp(file=str(vfile), workspace=str(tmp_path), ctx=ctx)
+        await rocq_compile_lsp(file_path=str(vfile), workspace=str(tmp_path), ctx=ctx)
 
         assert not checker.trim_caches.called
 
@@ -786,11 +786,11 @@ class TestRocqCompileLspInfoFilter:
             }],
             "check_time_ms": 1,
         }
-        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
 
         ctx = _MockLspContext(ls)
         result = await rocq_compile_lsp(
-            file=str(vfile), workspace=str(tmp_path), ctx=ctx,
+            file_path=str(vfile), workspace=str(tmp_path), ctx=ctx,
         )
 
         assert result["success"] is True
@@ -825,11 +825,11 @@ class TestRocqCompileLspInfoFilter:
             "info": list(expected_info),
             "check_time_ms": 1,
         }
-        inject_checker(ls, checker, workspace=str(tmp_path), file=str(vfile))
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
 
         ctx = _MockLspContext(ls)
         result = await rocq_compile_lsp(
-            file=str(vfile), workspace=str(tmp_path), ctx=ctx,
+            file_path=str(vfile), workspace=str(tmp_path), ctx=ctx,
             include_info=True,
         )
 

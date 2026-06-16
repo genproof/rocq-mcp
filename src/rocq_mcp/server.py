@@ -235,8 +235,8 @@ def _check_path_containment(ws: Path, dir_arg: str) -> str | None:
     return None
 
 
-def _resolve_file_in_workspace(file: str, workspace: str) -> str:
-    """Resolve *file* relative to *workspace* and verify containment.
+def _resolve_file_in_workspace(file_path: str, workspace: str) -> str:
+    """Resolve *file_path* relative to *workspace* and verify containment.
 
     Returns the resolved absolute path as a string.
 
@@ -245,19 +245,19 @@ def _resolve_file_in_workspace(file: str, workspace: str) -> str:
         FileNotFoundError: If the file does not exist on disk.
     """
     ws_resolved = Path(workspace).resolve()
-    resolved = (ws_resolved / file).resolve()
+    resolved = (ws_resolved / file_path).resolve()
     if not _path_within(resolved, ws_resolved):
         raise ValueError("File path must be within workspace.")
     if not resolved.is_file():
-        raise FileNotFoundError(f"File not found: {file}")
+        raise FileNotFoundError(f"File not found: {file_path}")
     return str(resolved)
 
 
 _PROJECT_MARKERS: tuple[str, ...] = ("_RocqProject", "_CoqProject", "dune-project")
 
 
-def _find_project_root_from_file(file: str | None) -> str | None:
-    """Walk up from *file* looking for a Rocq project marker.
+def _find_project_root_from_file(file_path: str | None) -> str | None:
+    """Walk up from *file_path* looking for a Rocq project marker.
 
     Returns the directory of the innermost ``_RocqProject``,
     ``_CoqProject``, or ``dune-project`` (in that priority order),
@@ -269,10 +269,10 @@ def _find_project_root_from_file(file: str | None) -> str | None:
     Relative paths are resolved against ``ROCQ_WORKSPACE``; symlinks
     are not followed.
     """
-    if not file:
+    if not file_path:
         return None
     try:
-        p = Path(file)
+        p = Path(file_path)
         if not p.is_absolute():
             p = Path(ROCQ_WORKSPACE) / p
         # Lexical absolute path -- avoids following symlinks so the walk
@@ -608,10 +608,10 @@ def _parse_project_flags(ws: Path) -> list[str]:
 _DEFAULT_SESSION_KEY = "<default>"
 
 
-def _session_key(workspace: str, file: str | None = None) -> str:
+def _session_key(workspace: str, file_path: str | None = None) -> str:
     """Pool key identifying one coq-lsp session.
 
-    With a *file*, the key is the resolved absolute file path, so each
+    With a *file_path*, the key is the resolved absolute file path, so each
     file gets its own coq-lsp subprocess (parallel agents in separate
     files never share a server, never serialize on one lock, and each
     file's memory is isolated and watchdog-managed independently).
@@ -623,12 +623,12 @@ def _session_key(workspace: str, file: str | None = None) -> str:
     the key is stable regardless of whether the file exists yet, and
     matches the path :func:`_resolve_file_in_workspace` produces.
     """
-    if file:
+    if file_path:
         base = Path(workspace) if workspace else Path.cwd()
         try:
-            return str((base / file).resolve())
+            return str((base / file_path).resolve())
         except (OSError, ValueError):
-            return f"{workspace}::{file}"
+            return f"{workspace}::{file_path}"
     if workspace:
         try:
             return str(Path(workspace).resolve())
@@ -971,33 +971,33 @@ def _checker_process(checker: Any) -> Any:
 
 def _attach_stale_warning(
     result: Any,
-    file: str,
+    file_path: str,
     workspace: str,
     lifespan_state: dict[str, Any] | None,
 ) -> Any:
-    """Add ``result["stale_warning"]`` when *file*'s compiled imports are stale.
+    """Add ``result["stale_warning"]`` when *file_path*'s compiled imports are stale.
 
     coq-lsp loads ``Require``d libraries from their ``.vo`` and never
     rebuilds or staleness-checks them; this surfaces that risk to the
-    agent.  Best-effort: only mutates *result* when it is a dict, *file*
+    agent.  Best-effort: only mutates *result* when it is a dict, *file_path*
     is set, and a warning is produced; never raises.  See
     :mod:`rocq_mcp.staleness`.
     """
-    if not isinstance(result, dict) or not file:
+    if not isinstance(result, dict) or not file_path:
         return result
     try:
         from rocq_mcp.staleness import stale_warning
 
         started = None
         if lifespan_state is not None:
-            key = _session_key(workspace, file)
+            key = _session_key(workspace, file_path)
             started = (
                 lifespan_state.get("lsp_meta", {}).get(key, {}).get("spawned_at")
             )
-        warning = stale_warning(file, workspace, session_started_at=started)
+        warning = stale_warning(file_path, workspace, session_started_at=started)
         if warning:
             result["stale_warning"] = warning
-            dlog.event("stale", "warning", file=file, workspace=workspace,
+            dlog.event("stale", "warning", file_path=file_path, workspace=workspace,
                        warning=warning)
     except Exception:
         # Detection must never break a tool result.
@@ -1395,7 +1395,7 @@ async def rocq_compile(
 
 @mcp.tool
 async def rocq_compile_file(
-    file: str,
+    file_path: str,
     workspace: str = "",
     timeout: int = 0,
     include_warnings: bool = True,
@@ -1413,9 +1413,9 @@ async def rocq_compile_file(
     position (compile no longer returns a reusable proof state itself).
 
     Args:
-        file: Path to the .v file (relative to workspace).
+        file_path: Path to the .v file (relative to workspace).
         workspace: Workspace directory.  If omitted, auto-detected by walking
-            up from *file* looking for ``_RocqProject`` / ``_CoqProject`` /
+            up from *file_path* looking for ``_RocqProject`` / ``_CoqProject`` /
             ``dune-project``; falls back to the ``ROCQ_WORKSPACE`` env var
             (default: cwd).
         timeout: Compilation timeout in seconds (default: ROCQ_COQC_TIMEOUT env var).
@@ -1424,7 +1424,7 @@ async def rocq_compile_file(
             error diagnostic, which keeps context compact.
     """
     # Workspace precedence: explicit arg > project marker walk-up > env default.
-    workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
+    workspace = workspace or _find_project_root_from_file(file_path) or ROCQ_WORKSPACE
     timeout = timeout if timeout is not None and timeout > 0 else ROCQ_COQC_TIMEOUT
 
     err = _validate_workspace(workspace)
@@ -1437,13 +1437,13 @@ async def rocq_compile_file(
         )
 
     result = run_compile_file(
-        file=file,
+        file_path=file_path,
         workspace=workspace,
         timeout=timeout,
         include_warnings=include_warnings,
     )
     return _attach_stale_warning(
-        result, file, workspace, ctx.lifespan_context if ctx else None
+        result, file_path, workspace, ctx.lifespan_context if ctx else None
     )
 
 
@@ -1551,7 +1551,7 @@ async def rocq_verify(
 async def rocq_query(
     command: str,
     preamble: str = "",
-    file: str = "",
+    file_path: str = "",
     workspace: str = "",
     line: int | None = None,
     character: int | None = None,
@@ -1575,7 +1575,7 @@ async def rocq_query(
       ``Local``, and ``Section`` belong here — NOT inside ``command=``.
     - **file mode**: pass a ``.v`` file path; the query runs with all
       definitions from that file in scope (end-of-file environment).
-    - **position mode**: pass ``file`` + ``line`` + ``character`` to run
+    - **position mode**: pass ``file_path`` + ``line`` + ``character`` to run
       the query *at that point* in the file — opened scopes, hypotheses,
       and local definitions visible there are in scope (e.g.
       ``command="Check H."`` where ``H`` is a hypothesis).  ``line`` /
@@ -1586,14 +1586,14 @@ async def rocq_query(
         command: The Rocq query command to execute.
         preamble: Optional import lines needed for the query context
                   (e.g., "Require Import Reals.\\nOpen Scope R_scope.").
-        file: Path to a .v file (relative to workspace) whose definitions
+        file_path: Path to a .v file (relative to workspace) whose definitions
             should be in scope. Mutually exclusive with preamble.
         workspace: Workspace directory.  If omitted, auto-detected by walking
-            up from *file* looking for ``_RocqProject`` / ``_CoqProject`` /
+            up from *file_path* looking for ``_RocqProject`` / ``_CoqProject`` /
             ``dune-project``; falls back to the ``ROCQ_WORKSPACE`` env var
             (default: cwd).
-        line: 0-based line for position mode (requires *file*).
-        character: 0-based character for position mode (requires *file*).
+        line: 0-based line for position mode (requires *file_path*).
+        character: 0-based character for position mode (requires *file_path*).
         max_results: Optional maximum number of results to return.
             Useful for broad Search patterns. If omitted, all results are
             returned (subject to character limit).
@@ -1613,7 +1613,7 @@ async def rocq_query(
         effective_timeout = None
     clamped = effective_timeout is not None and timeout > ROCQ_QUERY_TIMEOUT_CAP
 
-    workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
+    workspace = workspace or _find_project_root_from_file(file_path) or ROCQ_WORKSPACE
 
     err = _validate_workspace(workspace)
     if err:
@@ -1633,7 +1633,7 @@ async def rocq_query(
         preamble=preamble,
         workspace=workspace,
         lifespan_state=ctx.lifespan_context,
-        file=file,
+        file_path=file_path,
         max_results=max_results,
         include_warnings=include_warnings,
         timeout=effective_timeout,
@@ -1642,7 +1642,7 @@ async def rocq_query(
     )
     if clamped:
         result["clamped_timeout"] = ROCQ_QUERY_TIMEOUT_CAP
-    return _attach_stale_warning(result, file, workspace, ctx.lifespan_context)
+    return _attach_stale_warning(result, file_path, workspace, ctx.lifespan_context)
 
 
 # ---------------------------------------------------------------------------
@@ -1653,7 +1653,7 @@ async def rocq_query(
 @mcp.tool
 async def rocq_assumptions(
     name: str,
-    file: str,
+    file_path: str,
     workspace: str = "",
     ctx: Context = None,
 ) -> dict[str, Any]:
@@ -1672,9 +1672,9 @@ async def rocq_assumptions(
 
     Args:
         name: The theorem/lemma name to check (e.g., "add_comm").
-        file: Path to the .v file where the theorem is defined (relative to workspace).
+        file_path: Path to the .v file where the theorem is defined (relative to workspace).
         workspace: Workspace directory.  If omitted, auto-detected by walking
-            up from *file* looking for ``_RocqProject`` / ``_CoqProject`` /
+            up from *file_path* looking for ``_RocqProject`` / ``_CoqProject`` /
             ``dune-project``; falls back to the ``ROCQ_WORKSPACE`` env var
             (default: cwd).
 
@@ -1701,7 +1701,7 @@ async def rocq_assumptions(
     On ``pet_restarted: True``, call ``rocq_diag`` for memory headroom and
     recent error history.
     """
-    workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
+    workspace = workspace or _find_project_root_from_file(file_path) or ROCQ_WORKSPACE
 
     err = _validate_workspace(workspace)
     if err:
@@ -1721,11 +1721,11 @@ async def rocq_assumptions(
 
     result = await run_assumptions(
         name=name,
-        file=file,
+        file_path=file_path,
         workspace=workspace,
         lifespan_state=ctx.lifespan_context,
     )
-    return _attach_stale_warning(result, file, workspace, ctx.lifespan_context)
+    return _attach_stale_warning(result, file_path, workspace, ctx.lifespan_context)
 
 
 # ---------------------------------------------------------------------------
@@ -1735,7 +1735,7 @@ async def rocq_assumptions(
 
 @mcp.tool
 async def rocq_toc(
-    file: str,
+    file_path: str,
     workspace: str = "",
     ctx: Context = None,
 ) -> dict[str, Any]:
@@ -1748,16 +1748,16 @@ async def rocq_toc(
     Does NOT require a rocq_start session.
 
     Args:
-        file: Path to the .v file (relative to workspace).
+        file_path: Path to the .v file (relative to workspace).
         workspace: Workspace directory.  If omitted, auto-detected by walking
-            up from *file* looking for ``_RocqProject`` / ``_CoqProject`` /
+            up from *file_path* looking for ``_RocqProject`` / ``_CoqProject`` /
             ``dune-project``; falls back to the ``ROCQ_WORKSPACE`` env var
             (default: cwd).
 
     On ``pet_restarted: True``, call ``rocq_diag`` for memory headroom and
     recent error history.
     """
-    workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
+    workspace = workspace or _find_project_root_from_file(file_path) or ROCQ_WORKSPACE
 
     err = _validate_workspace(workspace)
     if err:
@@ -1773,11 +1773,11 @@ async def rocq_toc(
         }
 
     result = await run_toc(
-        file=file,
+        file_path=file_path,
         workspace=workspace,
         lifespan_state=ctx.lifespan_context,
     )
-    return _attach_stale_warning(result, file, workspace, ctx.lifespan_context)
+    return _attach_stale_warning(result, file_path, workspace, ctx.lifespan_context)
 
 
 # ---------------------------------------------------------------------------
@@ -1788,7 +1788,7 @@ async def rocq_toc(
 
 @mcp.tool
 async def rocq_get_state(
-    file: str,
+    file_path: str,
     line: int,
     character: int,
     workspace: str = "",
@@ -1812,17 +1812,17 @@ async def rocq_get_state(
     ``rocq_step`` / ``rocq_step_multi`` by passing the same position.
 
     Args:
-        file: Path to the .v file (relative to workspace).
+        file_path: Path to the .v file (relative to workspace).
         line: 0-based line number.
         character: 0-based character offset.
         workspace: Workspace directory.  If omitted, auto-detected from
-            project markers near *file*; falls back to ``ROCQ_WORKSPACE``.
+            project markers near *file_path*; falls back to ``ROCQ_WORKSPACE``.
         include_warnings: Include severity-2 warnings in any messages.
         before: Round the position backward (default True) -- report the
             state before the sentence at the point; False reports the
             state after it.
     """
-    workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
+    workspace = workspace or _find_project_root_from_file(file_path) or ROCQ_WORKSPACE
     err = _validate_workspace(workspace)
     if err:
         return _fail(
@@ -1835,7 +1835,7 @@ async def rocq_get_state(
             "error": "Internal error: no MCP context.",
         }
     result = await run_get_state(
-        file=file,
+        file_path=file_path,
         line=line,
         character=character,
         workspace=workspace,
@@ -1843,7 +1843,7 @@ async def rocq_get_state(
         include_warnings=include_warnings,
         before=before,
     )
-    return _attach_stale_warning(result, file, workspace, ctx.lifespan_context)
+    return _attach_stale_warning(result, file_path, workspace, ctx.lifespan_context)
 
 
 # ---------------------------------------------------------------------------
@@ -1853,7 +1853,7 @@ async def rocq_get_state(
 
 @mcp.tool
 async def rocq_extract(
-    file: str,
+    file_path: str,
     line: int,
     character: int,
     name: str,
@@ -1866,7 +1866,7 @@ async def rocq_extract(
 
     Splits the goal the sentence at ``(line, character)`` operates on
     (0-indexed, the same address ``rocq_get_state`` uses) into two files
-    written next to *file*:
+    written next to *file_path*:
 
     - ``<name>_goal.v`` -- the fully-closed goal as ``Definition
       <name>_Goal`` (autogenerated; always rewritten, may be long).
@@ -1876,7 +1876,7 @@ async def rocq_extract(
       binders (your proof body is preserved).
 
     This is the live-session equivalent of rocq-lsp's ``tools/extract.py``:
-    it drives ``coq/extract`` on the *already-running* coq-lsp for *file*,
+    it drives ``coq/extract`` on the *already-running* coq-lsp for *file_path*,
     so a warm session replies the moment the check reaches the point.  The
     extraction is refused (error) if any sentence *before* the point is
     broken -- the goal would be unsound.
@@ -1894,18 +1894,18 @@ async def rocq_extract(
     annotating) ``annotation`` = inserted/updated/unchanged/skipped.
 
     Args:
-        file: Path to the .v file (relative to workspace).
+        file_path: Path to the .v file (relative to workspace).
         line: 0-based line of the goal's tactic (the extraction point).
         character: 0-based character offset on that line.
         name: Base name for the generated modules ([A-Za-z][A-Za-z0-9_]*).
         workspace: Workspace directory.  If omitted, auto-detected from
-            project markers near *file*; falls back to ``ROCQ_WORKSPACE``.
+            project markers near *file_path*; falls back to ``ROCQ_WORKSPACE``.
         annotate: Wire the ``confirm_extraction`` tripwire into the source
             (default True); False leaves the source untouched.
         timeout: Seconds to wait for the extraction point to be checked
             (0 = a generous default; raise it for a cold, big file).
     """
-    workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
+    workspace = workspace or _find_project_root_from_file(file_path) or ROCQ_WORKSPACE
     err = _validate_workspace(workspace)
     if err:
         return _fail(
@@ -1918,7 +1918,7 @@ async def rocq_extract(
             "error": "Internal error: no MCP context.",
         }
     return await run_extract(
-        file=file,
+        file_path=file_path,
         line=line,
         character=character,
         name=name,
@@ -1936,7 +1936,7 @@ async def rocq_extract(
 
 @mcp.tool
 async def rocq_step(
-    file: str,
+    file_path: str,
     line: int,
     character: int,
     tactics: str,
@@ -1961,19 +1961,19 @@ async def rocq_step(
     the background until the next call preempts it).
 
     Args:
-        file: Path to the .v file (relative to workspace).
+        file_path: Path to the .v file (relative to workspace).
         line: 0-based line number to run from.
         character: 0-based character offset to run from.
         tactics: A tactic block to run speculatively (e.g. "intros n m.
             induction n.").
-        workspace: Workspace directory (auto-detected from *file* if omitted).
+        workspace: Workspace directory (auto-detected from *file_path* if omitted).
         timeout: Per-call timeout in seconds (0 = default op timeout).
         include_warnings: Include severity-2 warnings in any block output.
         before: Run from the state *before* the sentence at the point
             (default True) -- in place of it; False runs from the state
             after it.
     """
-    workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
+    workspace = workspace or _find_project_root_from_file(file_path) or ROCQ_WORKSPACE
     err = _validate_workspace(workspace)
     if err:
         return _fail(
@@ -1987,7 +1987,7 @@ async def rocq_step(
         }
     _t = float(timeout) if timeout and timeout > 0 else None
     result = await run_step(
-        file=file,
+        file_path=file_path,
         line=line,
         character=character,
         tactics=tactics,
@@ -1997,7 +1997,7 @@ async def rocq_step(
         before=before,
         timeout=_t,
     )
-    return _attach_stale_warning(result, file, workspace, ctx.lifespan_context)
+    return _attach_stale_warning(result, file_path, workspace, ctx.lifespan_context)
 
 
 # ---------------------------------------------------------------------------
@@ -2007,7 +2007,7 @@ async def rocq_step(
 
 @mcp.tool
 async def rocq_step_multi(
-    file: str,
+    file_path: str,
     line: int,
     character: int,
     tactics: list[str],
@@ -2032,18 +2032,18 @@ async def rocq_step_multi(
         tactics=["reflexivity.", "lia.", "ring.", "auto.", "firstorder."]
 
     Args:
-        file: Path to the .v file (relative to workspace).
+        file_path: Path to the .v file (relative to workspace).
         line: 0-based line number to run each block from.
         character: 0-based character offset to run each block from.
         tactics: List of tactic blocks to try (max 20).
-        workspace: Workspace directory (auto-detected from *file* if omitted).
+        workspace: Workspace directory (auto-detected from *file_path* if omitted).
         timeout: Per-call timeout in seconds (0 = default op timeout).
         include_warnings: Include severity-2 warnings in any block output.
         before: Run from the state *before* the sentence at the point
             (default True) -- in place of it; False runs from the state
             after it.
     """
-    workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
+    workspace = workspace or _find_project_root_from_file(file_path) or ROCQ_WORKSPACE
     err = _validate_workspace(workspace)
     if err:
         return _fail(
@@ -2060,7 +2060,7 @@ async def rocq_step_multi(
         }
     _t = float(timeout) if timeout and timeout > 0 else None
     result = await run_step_multi(
-        file=file,
+        file_path=file_path,
         line=line,
         character=character,
         tactics=tactics,
@@ -2070,7 +2070,7 @@ async def rocq_step_multi(
         before=before,
         timeout=_t,
     )
-    return _attach_stale_warning(result, file, workspace, ctx.lifespan_context)
+    return _attach_stale_warning(result, file_path, workspace, ctx.lifespan_context)
 @mcp.tool
 async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
     """Operational diagnostics: coq-lsp health, memory headroom, recent errors.
@@ -2136,7 +2136,7 @@ async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
 
 @mcp.tool
 async def rocq_restart(
-    file: str = "",
+    file_path: str = "",
     workspace: str = "",
     ctx: Context = None,
 ) -> dict[str, Any]:
@@ -2151,7 +2151,7 @@ async def rocq_restart(
     ``stale_warning`` asking you to reload.
 
     Scope:
-    - ``file`` set: restart only that file's session (recommended — does
+    - ``file_path`` set: restart only that file's session (recommended — does
       not disturb other agents working in other files).
     - ``workspace`` only: restart that workspace's shared scratch session
       (used by preamble ``rocq_query``).
@@ -2173,9 +2173,9 @@ async def rocq_restart(
     lifespan_state = ctx.lifespan_context
     pool = lifespan_state.get("lsp_pool", {})
 
-    if file:
-        ws = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
-        keys = [_session_key(ws, file)]
+    if file_path:
+        ws = workspace or _find_project_root_from_file(file_path) or ROCQ_WORKSPACE
+        keys = [_session_key(ws, file_path)]
     elif workspace:
         keys = [_session_key(workspace)]
     else:
@@ -2202,7 +2202,7 @@ async def rocq_restart(
 
 @mcp.tool
 async def rocq_compile_lsp(
-    file: str,
+    file_path: str,
     workspace: str = "",
     include_warnings: bool = False,
     include_info: bool = False,
@@ -2260,7 +2260,7 @@ async def rocq_compile_lsp(
     check that keeps progressing is never killed.
 
     Args:
-        file: Path to the .v file (relative to workspace).
+        file_path: Path to the .v file (relative to workspace).
         workspace: Directory to use as workspace (default: ROCQ_WORKSPACE env var).
         include_warnings: Include warnings in the result (default: False).
         include_info: Include coq-lsp ``info`` diagnostics in the result
@@ -2301,8 +2301,8 @@ async def rocq_compile_lsp(
             is not caught.
     """
     # Same workspace handling as the other file tools: auto-detect the
-    # project root from *file* when no explicit workspace is given.
-    workspace = workspace or _find_project_root_from_file(file) or ROCQ_WORKSPACE
+    # project root from *file_path* when no explicit workspace is given.
+    workspace = workspace or _find_project_root_from_file(file_path) or ROCQ_WORKSPACE
 
     if ctx is None:
         return _fail(None, "rocq_compile_lsp", "Internal error: no MCP context.")
@@ -2313,7 +2313,7 @@ async def rocq_compile_lsp(
         return _fail(lifespan_state, "rocq_compile_lsp", ws_err)
 
     try:
-        resolved = _resolve_file_in_workspace(file, workspace)
+        resolved = _resolve_file_in_workspace(file_path, workspace)
     except (ValueError, FileNotFoundError) as e:
         return _fail(lifespan_state, "rocq_compile_lsp", str(e))
 
@@ -2374,7 +2374,7 @@ async def rocq_compile_lsp(
         lifespan_state,
         "rocq_compile_lsp",
         workspace=workspace,
-        key=_session_key(workspace, file),
+        key=_session_key(workspace, file_path),
         sentence_timeout=eff_sentence_timeout,
     )
 
@@ -2395,7 +2395,7 @@ async def rocq_compile_lsp(
     if line is not None and result.get("reason") != "memory_exhausted":
         result["checked_through"] = {"line": line, "character": character}
 
-    return _attach_stale_warning(result, file, workspace, lifespan_state)
+    return _attach_stale_warning(result, file_path, workspace, lifespan_state)
 
 
 def _maybe_trim_lsp_caches(

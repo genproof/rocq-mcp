@@ -91,7 +91,7 @@ async def test_bad_line_rejected(bad_tail_file, tmp_path):
     state = make_lifespan_state(full=True)
     state["workspace"] = str(tmp_path)
     result = await _server.rocq_compile_lsp(
-        file=str(bad_tail_file), workspace=str(tmp_path), line=-1, ctx=_Ctx(state)
+        file_path=str(bad_tail_file), workspace=str(tmp_path), line=-1, ctx=_Ctx(state)
     )
     assert result["success"] is False
     assert result["reason"] == "validation"
@@ -108,7 +108,7 @@ class TestCompileLspPosition:
     async def test_whole_file_reports_bad_lemma(self, bad_tail_file, lstate, tmp_path):
         # Baseline: no position -> the whole file is checked, bad fails.
         result = await _server.rocq_compile_lsp(
-            file=str(bad_tail_file), workspace=str(tmp_path), ctx=_Ctx(lstate)
+            file_path=str(bad_tail_file), workspace=str(tmp_path), ctx=_Ctx(lstate)
         )
         assert result["success"] is False
         assert result["errors"]
@@ -121,7 +121,7 @@ class TestCompileLspPosition:
         # Through line 1 (good's Qed.) -> the check reaches the point and
         # answers before the bad lemma below is reported.
         result = await _server.rocq_compile_lsp(
-            file=str(bad_tail_file), workspace=str(tmp_path), line=1, ctx=_Ctx(lstate)
+            file_path=str(bad_tail_file), workspace=str(tmp_path), line=1, ctx=_Ctx(lstate)
         )
         assert result["success"] is True
         assert result["errors"] == []
@@ -132,7 +132,7 @@ class TestCompileLspPosition:
         # An exact point at the start of line 2 (just before bad's
         # statement) -> still no error, and the character is echoed back.
         result = await _server.rocq_compile_lsp(
-            file=str(bad_tail_file), workspace=str(tmp_path),
+            file_path=str(bad_tail_file), workspace=str(tmp_path),
             line=2, character=0, ctx=_Ctx(lstate),
         )
         assert result["success"] is True
@@ -145,7 +145,7 @@ class TestCompileLspPosition:
     ):
         # Through line 3 includes bad -> the error surfaces, at its real line.
         result = await _server.rocq_compile_lsp(
-            file=str(bad_tail_file), workspace=str(tmp_path), line=3, ctx=_Ctx(lstate)
+            file_path=str(bad_tail_file), workspace=str(tmp_path), line=3, ctx=_Ctx(lstate)
         )
         assert result["success"] is False
         assert any(e["line"] == 3 for e in result["errors"])
@@ -161,7 +161,7 @@ class TestCompileLspPosition:
         # here would mean the barrier returned before the prefix checked,
         # or the filter dropped a legitimate prefix error.
         result = await _server.rocq_compile_lsp(
-            file=str(bad_head_file), workspace=str(tmp_path), line=3, ctx=_Ctx(lstate)
+            file_path=str(bad_head_file), workspace=str(tmp_path), line=3, ctx=_Ctx(lstate)
         )
         assert result["success"] is False
         assert any(e["line"] == 1 for e in result["errors"])
@@ -184,7 +184,7 @@ class TestCompileLspCacheOnError:
         (tmp_path / "_CoqProject").write_text("-R . Top\n")
         (tmp_path / "Bad.v").write_text(self._BAD)
         result = await _server.rocq_compile_lsp(
-            file="Bad.v", workspace=str(tmp_path), ctx=_Ctx(lstate)
+            file_path="Bad.v", workspace=str(tmp_path), ctx=_Ctx(lstate)
         )
         assert result["success"] is False
         assert not (tmp_path / "Bad.vof").exists()
@@ -195,7 +195,7 @@ class TestCompileLspCacheOnError:
         (tmp_path / "_CoqProject").write_text("-R . Top\n")
         (tmp_path / "Bad.v").write_text(self._BAD)
         result = await _server.rocq_compile_lsp(
-            file="Bad.v",
+            file_path="Bad.v",
             workspace=str(tmp_path),
             cache_on_error=True,
             ctx=_Ctx(lstate),

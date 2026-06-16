@@ -36,7 +36,7 @@ class TestRunAssumptions:
                 "command": command,
                 "preamble": preamble,
                 "workspace": workspace,
-                "file": kw.get("file", ""),
+                "file_path": kw.get("file_path", ""),
             }
             return self._query_result
 
@@ -50,7 +50,7 @@ class TestRunAssumptions:
         }
         result = await run_assumptions(
             name="add_0_r",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -59,18 +59,18 @@ class TestRunAssumptions:
 
     @pytest.mark.asyncio
     async def test_delegates_to_run_query_with_file(self):
-        """run_assumptions should call run_query with file=... and empty preamble."""
+        """run_assumptions should call run_query with file_path=... and empty preamble."""
         self._query_result = {
             "success": True,
             "output": "Closed under the global context",
         }
         await run_assumptions(
             name="my_thm",
-            file="proofs/test.v",
+            file_path="proofs/test.v",
             workspace="/tmp",
             lifespan_state={},
         )
-        assert self._last_query_kwargs["file"] == "proofs/test.v"
+        assert self._last_query_kwargs["file_path"] == "proofs/test.v"
         assert self._last_query_kwargs["preamble"] == ""
 
     @pytest.mark.asyncio
@@ -85,7 +85,7 @@ class TestRunAssumptions:
         }
         result = await run_assumptions(
             name="my_thm",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -101,7 +101,7 @@ class TestRunAssumptions:
         }
         result = await run_assumptions(
             name="bad_thm",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -112,7 +112,7 @@ class TestRunAssumptions:
     async def test_empty_name(self):
         result = await run_assumptions(
             name="",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -123,7 +123,7 @@ class TestRunAssumptions:
     async def test_whitespace_name(self):
         result = await run_assumptions(
             name="   ",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -138,7 +138,7 @@ class TestRunAssumptions:
         }
         result = await run_assumptions(
             name="bogus",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -153,7 +153,7 @@ class TestRunAssumptions:
         }
         result = await run_assumptions(
             name="thm",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -169,7 +169,7 @@ class TestRunAssumptions:
         }
         result = await run_assumptions(
             name="my_theorem",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -180,7 +180,7 @@ class TestRunAssumptions:
         """Names with special characters should be rejected."""
         result = await run_assumptions(
             name="foo; bar",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -196,7 +196,7 @@ class TestRunAssumptions:
         }
         result = await run_assumptions(
             name="Nat.add_comm",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -217,7 +217,7 @@ class TestRunAssumptions:
         }
         result = await run_assumptions(
             name="mixed_thm",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -244,7 +244,7 @@ class TestRunAssumptions:
         }
         result = await run_assumptions(
             name="  add_0_r  ",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -260,7 +260,7 @@ class TestRunAssumptions:
         }
         result = await run_assumptions(
             name="add_0_r'",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -287,7 +287,7 @@ class TestRunAssumptions:
         ls = {"recent_errors": deque(maxlen=10)}
         result = await run_assumptions(
             name="thm",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state=ls,
         )
@@ -312,7 +312,7 @@ class TestRunAssumptions:
             "output": "Closed under the global context",
         }
         r = await run_assumptions(
-            name="thm", file="test.v", workspace="/tmp", lifespan_state={}
+            name="thm", file_path="test.v", workspace="/tmp", lifespan_state={}
         )
         for legacy_key in (
             "verdict",
@@ -328,7 +328,7 @@ class TestRunAssumptions:
         """Empty file parameter should be rejected before reaching run_query."""
         result = await run_assumptions(
             name="my_thm",
-            file="",
+            file_path="",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -340,7 +340,7 @@ class TestRunAssumptions:
         """Whitespace-only file parameter should be rejected."""
         result = await run_assumptions(
             name="my_thm",
-            file="   ",
+            file_path="   ",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -375,7 +375,7 @@ class TestAssumptionsFileModeIntegration:
 
         result = await run_assumptions(
             name="simple",
-            file="assumptions_int_test.v",
+            file_path="assumptions_int_test.v",
             workspace=str(workspace),
             lifespan_state=lifespan_state,
         )
@@ -406,7 +406,7 @@ class TestAssumptionsFileModeIntegration:
         # Ask for a typo to trigger the available_in_file enrichment path.
         result = await run_assumptions(
             name="depe",  # typo for Outer.Inner.deep
-            file="qualified_avail.v",
+            file_path="qualified_avail.v",
             workspace=str(workspace),
             lifespan_state=lifespan_state,
         )
@@ -434,7 +434,7 @@ class TestRocqAssumptionsWrapper:
     async def test_ctx_none_returns_error(self):
         from rocq_mcp.server import rocq_assumptions
 
-        result = await rocq_assumptions(name="foo", file="test.v", ctx=None)
+        result = await rocq_assumptions(name="foo", file_path="test.v", ctx=None)
         assert result["success"] is False
         assert "context" in result["error"].lower()
 
@@ -446,7 +446,7 @@ class TestRocqAssumptionsWrapper:
         mock_ctx = _MockContext({})
         result = await rocq_assumptions(
             name="foo",
-            file="test.v",
+            file_path="test.v",
             workspace="/nonexistent_rocq_workspace_xyz",
             ctx=mock_ctx,
         )
@@ -472,13 +472,13 @@ class TestRocqAssumptionsWrapper:
 
         await rocq_assumptions(
             name="my_thm",
-            file="proof.v",
+            file_path="proof.v",
             workspace=str(tmp_path),
             ctx=mock_ctx,
         )
 
         assert captured["name"] == "my_thm"
-        assert captured["file"] == "proof.v"
+        assert captured["file_path"] == "proof.v"
         assert captured["lifespan_state"] is mock_ctx.lifespan_context
 
 
@@ -512,7 +512,7 @@ class TestAssumptionsAvailableInFile:
 
         result = await run_assumptions(
             name="foo",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -545,7 +545,7 @@ class TestAssumptionsAvailableInFile:
 
         result = await run_assumptions(
             name="foo",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -575,7 +575,7 @@ class TestAssumptionsAvailableInFile:
 
         result = await run_assumptions(
             name="foo",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -604,7 +604,7 @@ class TestAssumptionsAvailableInFile:
 
         result = await run_assumptions(
             name="thm",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -645,7 +645,7 @@ class TestAssumptionsAvailableInFile:
 
         result = await run_assumptions(
             name="foo",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -685,7 +685,7 @@ class TestAssumptionsAvailableInFile:
 
         result = await run_assumptions(
             name="foo",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state={},
         )
@@ -726,7 +726,7 @@ class TestAssumptionsAvailableInFile:
 
         result = await run_assumptions(
             name="fool_bound",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state=lifespan_state,
         )
@@ -784,7 +784,7 @@ class TestAssumptionsAvailableInFile:
 
         await run_assumptions(
             name="fool_bound",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state=lifespan_state,
         )
@@ -826,7 +826,7 @@ class TestAssumptionsAvailableInFile:
 
         result = await run_assumptions(
             name="foo",
-            file="test.v",
+            file_path="test.v",
             workspace="/tmp",
             lifespan_state=lifespan_state,
         )

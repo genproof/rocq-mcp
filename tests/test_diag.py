@@ -133,7 +133,7 @@ class TestValidationErrorsRecorded:
         ls = _fresh_lifespan_state()
         result = await run_assumptions(
             name="add_comm",
-            file="",  # required
+            file_path="",  # required
             workspace="/tmp",
             lifespan_state=ls,
         )
@@ -147,7 +147,7 @@ class TestValidationErrorsRecorded:
         ls = _fresh_lifespan_state()
         result = await run_assumptions(
             name="not a valid id",
-            file="some.v",
+            file_path="some.v",
             workspace="/tmp",
             lifespan_state=ls,
         )
@@ -160,7 +160,7 @@ class TestValidationErrorsRecorded:
 
         ls = _fresh_lifespan_state()
         result = await run_get_state(
-            file="x.v",
+            file_path="x.v",
             line=-1,  # invalid
             character=0,
             workspace="/tmp",
@@ -175,7 +175,7 @@ class TestValidationErrorsRecorded:
 
         ls = _fresh_lifespan_state()
         result = await run_step(
-            file="x.v",
+            file_path="x.v",
             line=0,
             character=0,
             tactics="Drop.",  # forbidden
@@ -192,7 +192,7 @@ class TestValidationErrorsRecorded:
         ls = _fresh_lifespan_state()
         # _MAX_STEP_MULTI_TACTICS is 20; pass 25 to trigger the limit.
         result = await run_step_multi(
-            file="x.v",
+            file_path="x.v",
             line=0,
             character=0,
             tactics=["auto."] * 25,
@@ -217,7 +217,7 @@ class TestExtraValidationRecording:
 
         ls = _fresh_lifespan_state()
         result = await run_toc(
-            file="../../../etc/passwd",  # path traversal -> ValueError
+            file_path="../../../etc/passwd",  # path traversal -> ValueError
             workspace="/tmp",
             lifespan_state=ls,
         )

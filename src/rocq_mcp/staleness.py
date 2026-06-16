@@ -121,22 +121,22 @@ def _dependency_vo_files(resolved_file: str, workspace: str) -> list[str]:
 
 
 def stale_warning(
-    file: str, workspace: str, *, session_started_at: float | None = None
+    file_path: str, workspace: str, *, session_started_at: float | None = None
 ) -> str | None:
-    """One-line warning if *file*'s compiled imports are stale, else ``None``.
+    """One-line warning if *file_path*'s compiled imports are stale, else ``None``.
 
     *session_started_at* is the spawn time of the coq-lsp session serving
-    *file* (``lsp_meta[key]["spawned_at"]``); when provided, dependencies
+    *file_path* (``lsp_meta[key]["spawned_at"]``); when provided, dependencies
     rebuilt after that time are flagged as needing a ``rocq_restart`` to
     reload (the on-disk ``.vo`` is fresh but the warm process may still
     hold the old one).
     """
     if os.environ.get("ROCQ_STALE_CHECK", "1") == "0":
         return None
-    if not file:
+    if not file_path:
         return None
     try:
-        resolved = str((Path(workspace).resolve() / file).resolve())
+        resolved = str((Path(workspace).resolve() / file_path).resolve())
     except (OSError, ValueError):
         return None
 

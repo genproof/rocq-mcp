@@ -168,7 +168,7 @@ class TestTocPathTraversal:
         lifespan_state = {"op_timeout": 10}
         result = asyncio.run(
             run_toc(
-                file="/etc/passwd",
+                file_path="/etc/passwd",
                 workspace=str(tmp_path),
                 lifespan_state=lifespan_state,
             )
@@ -181,7 +181,7 @@ class TestTocPathTraversal:
         lifespan_state = {"op_timeout": 10}
         result = asyncio.run(
             run_toc(
-                file="../../etc/passwd",
+                file_path="../../etc/passwd",
                 workspace=str(tmp_path),
                 lifespan_state=lifespan_state,
             )

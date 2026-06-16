@@ -96,9 +96,9 @@ def vfile(tmp_path):
     return tmp_path
 
 
-def _state(checker, workspace, op_timeout=7.0, file="t.v"):
+def _state(checker, workspace, op_timeout=7.0, file_path="t.v"):
     state = make_lifespan_state(op_timeout=op_timeout, full=True)
-    inject_checker(state, checker, workspace=workspace, file=file)
+    inject_checker(state, checker, workspace=workspace, file_path=file_path)
     return state
 
 
@@ -106,7 +106,7 @@ class TestReasonMapping:
     @pytest.mark.asyncio
     async def test_get_state_timeout(self, vfile):
         r = await run_get_state(
-            file="t.v", line=1, character=0, workspace=str(vfile),
+            file_path="t.v", line=1, character=0, workspace=str(vfile),
             lifespan_state=_state(_MockChecker(), str(vfile)),
         )
         assert r["success"] is False
@@ -115,7 +115,7 @@ class TestReasonMapping:
     @pytest.mark.asyncio
     async def test_step_timeout(self, vfile):
         r = await run_step(
-            file="t.v", line=2, character=0, tactics="auto.", workspace=str(vfile),
+            file_path="t.v", line=2, character=0, tactics="auto.", workspace=str(vfile),
             lifespan_state=_state(_MockChecker(), str(vfile)),
         )
         assert r["success"] is False
@@ -127,7 +127,7 @@ class TestReasonMapping:
         # "auto." times out; "reflexivity." succeeds -> the batch still
         # runs to completion and each block reports its own outcome.
         r = await run_step_multi(
-            file="t.v", line=2, character=0,
+            file_path="t.v", line=2, character=0,
             tactics=["auto.", "reflexivity."],
             workspace=str(vfile),
             lifespan_state=_state(_MockChecker(ok_for={"reflexivity."}), str(vfile)),
@@ -160,7 +160,7 @@ class TestRealTimeout:
         try:
             t = time.monotonic()
             r = await run_step(
-                file="t.v", line=2, character=0,
+                file_path="t.v", line=2, character=0,
                 tactics="do 100000000000 idtac.",
                 workspace=str(tmp_path), lifespan_state=state, timeout=2.0,
             )
@@ -171,7 +171,7 @@ class TestRealTimeout:
 
             # The session is responsive: a state query returns at once.
             g = await run_get_state(
-                file="t.v", line=2, character=0,
+                file_path="t.v", line=2, character=0,
                 workspace=str(tmp_path), lifespan_state=state, timeout=4.0,
             )
             assert g["success"] is True
@@ -201,7 +201,7 @@ class TestRealTimeout:
         try:
             t = time.monotonic()
             r = await run_step_multi(
-                file="t.v", line=2, character=0,
+                file_path="t.v", line=2, character=0,
                 tactics=[self._DIVERGE, "exact I."],
                 workspace=str(tmp_path), lifespan_state=state, timeout=2.0,
             )
@@ -229,7 +229,7 @@ class TestRealTimeout:
             t = time.monotonic()
             r = await run_query(
                 command=self._DIVERGE, preamble="", workspace=str(tmp_path),
-                lifespan_state=state, file="t.v", line=2, character=0, timeout=2,
+                lifespan_state=state, file_path="t.v", line=2, character=0, timeout=2,
             )
             elapsed = time.monotonic() - t
             assert r["success"] is False and r["reason"] == "timeout"
@@ -238,7 +238,7 @@ class TestRealTimeout:
             # Session responsive: a normal query at the same point succeeds.
             r2 = await run_query(
                 command="Check nat.", preamble="", workspace=str(tmp_path),
-                lifespan_state=state, file="t.v", line=2, character=0, timeout=10,
+                lifespan_state=state, file_path="t.v", line=2, character=0, timeout=10,
             )
             assert r2["success"] is True
         finally:

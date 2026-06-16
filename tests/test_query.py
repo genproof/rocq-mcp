@@ -204,7 +204,7 @@ class TestQueryFileMode:
             preamble="Require Import Arith.",
             workspace="/tmp",
             lifespan_state={},
-            file="test.v",
+            file_path="test.v",
         )
         assert result["success"] is False
         assert "not both" in result["error"].lower()
@@ -231,7 +231,7 @@ class TestQueryFileMode:
             preamble="",
             workspace=str(tmp_path),
             lifespan_state={},
-            file="test.v",
+            file_path="test.v",
         )
         assert result["success"] is True
 
@@ -253,7 +253,7 @@ class TestQueryFileMode:
             preamble="   ",
             workspace=str(tmp_path),
             lifespan_state={},
-            file="test.v",
+            file_path="test.v",
         )
         assert result["success"] is True
 
@@ -277,7 +277,7 @@ class TestQueryFileMode:
             preamble="",
             workspace=str(tmp_path),
             lifespan_state={"current_workspace": None},
-            file="../../../etc/passwd",
+            file_path="../../../etc/passwd",
         )
         assert result["success"] is False
         assert "within workspace" in result["error"].lower()
@@ -300,7 +300,7 @@ class TestQueryFileMode:
             preamble="",
             workspace=str(tmp_path),
             lifespan_state={"current_workspace": None},
-            file="nonexistent.v",
+            file_path="nonexistent.v",
         )
         assert result["success"] is False
         assert "not found" in result["error"].lower()
@@ -323,7 +323,7 @@ class TestQueryFileMode:
             preamble="",
             workspace=str(tmp_path),
             lifespan_state={"current_workspace": None},
-            file="/etc/passwd",
+            file_path="/etc/passwd",
         )
         assert result["success"] is False
         assert "within workspace" in result["error"].lower()
@@ -418,7 +418,7 @@ class TestQueryFileModeIntegration:
             preamble="",
             workspace=str(workspace),
             lifespan_state=lifespan_state,
-            file="query_file_test.v",
+            file_path="query_file_test.v",
         )
         assert result["success"] is True
         assert "nat" in result["output"].lower() or "42" in result["output"]
@@ -474,7 +474,7 @@ class TestRocqQueryWrapper:
         await rocq_query(
             command="Check nat.",
             preamble="Require Import Arith.",
-            file="test.v",
+            file_path="test.v",
             workspace=str(tmp_path),
             max_results=5,
             ctx=mock_ctx,
@@ -482,7 +482,7 @@ class TestRocqQueryWrapper:
 
         assert captured["command"] == "Check nat."
         assert captured["preamble"] == "Require Import Arith."
-        assert captured["file"] == "test.v"
+        assert captured["file_path"] == "test.v"
         assert captured["max_results"] == 5
         assert captured["lifespan_state"] is mock_ctx.lifespan_context
 

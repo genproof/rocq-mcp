@@ -68,7 +68,7 @@ class TestPositionValidation:
     @pytest.mark.asyncio
     async def test_get_state_bad_line(self):
         r = await run_get_state(
-            file="x.v", line=-1, character=0, workspace="/tmp",
+            file_path="x.v", line=-1, character=0, workspace="/tmp",
             lifespan_state=make_lifespan_state(),
         )
         assert r["success"] is False
@@ -77,7 +77,7 @@ class TestPositionValidation:
     @pytest.mark.asyncio
     async def test_step_forbidden(self):
         r = await run_step(
-            file="x.v", line=0, character=0, tactics="Drop.", workspace="/tmp",
+            file_path="x.v", line=0, character=0, tactics="Drop.", workspace="/tmp",
             lifespan_state=make_lifespan_state(),
         )
         assert r["success"] is False
@@ -86,7 +86,7 @@ class TestPositionValidation:
     @pytest.mark.asyncio
     async def test_step_empty(self):
         r = await run_step(
-            file="x.v", line=0, character=0, tactics="   ", workspace="/tmp",
+            file_path="x.v", line=0, character=0, tactics="   ", workspace="/tmp",
             lifespan_state=make_lifespan_state(),
         )
         assert r["success"] is False
@@ -94,7 +94,7 @@ class TestPositionValidation:
     @pytest.mark.asyncio
     async def test_step_multi_empty_list(self):
         r = await run_step_multi(
-            file="x.v", line=0, character=0, tactics=[], workspace="/tmp",
+            file_path="x.v", line=0, character=0, tactics=[], workspace="/tmp",
             lifespan_state=make_lifespan_state(),
         )
         assert r["success"] is False
@@ -103,7 +103,7 @@ class TestPositionValidation:
     @pytest.mark.asyncio
     async def test_step_multi_too_many(self):
         r = await run_step_multi(
-            file="x.v", line=0, character=0, tactics=["auto."] * 21,
+            file_path="x.v", line=0, character=0, tactics=["auto."] * 21,
             workspace="/tmp", lifespan_state=make_lifespan_state(),
         )
         assert r["success"] is False
@@ -121,7 +121,7 @@ class TestPositionValidation:
     @pytest.mark.asyncio
     async def test_get_state_file_not_found(self):
         r = await run_get_state(
-            file="nope.v", line=0, character=0, workspace="/tmp",
+            file_path="nope.v", line=0, character=0, workspace="/tmp",
             lifespan_state=make_lifespan_state(),
         )
         assert r["success"] is False
@@ -138,7 +138,7 @@ class TestGetState:
     async def test_initial_goal_after_proof(self, proof_ws, lstate):
         # Just after "Proof." -> the initial (forall) goal.
         r = await run_get_state(
-            file="t.v", line=2, character=0, workspace=str(proof_ws),
+            file_path="t.v", line=2, character=0, workspace=str(proof_ws),
             lifespan_state=lstate,
         )
         assert r["success"] is True
@@ -154,7 +154,7 @@ class TestGetState:
         # operates on (the forall goal, before intros); before=False
         # shows the state after it (n, m in context).
         before = await run_get_state(
-            file="t.v", line=3, character=2, workspace=str(proof_ws),
+            file_path="t.v", line=3, character=2, workspace=str(proof_ws),
             lifespan_state=lstate,
         )
         assert before["success"] is True
@@ -162,7 +162,7 @@ class TestGetState:
         assert before["goals"][0]["hyps"] == []  # no hyps before intros
 
         after = await run_get_state(
-            file="t.v", line=3, character=2, workspace=str(proof_ws),
+            file_path="t.v", line=3, character=2, workspace=str(proof_ws),
             lifespan_state=lstate, before=False,
         )
         assert {"names": ["n", "m"], "type": "nat"} in after["goals"][0]["hyps"]
@@ -171,7 +171,7 @@ class TestGetState:
     async def test_not_in_proof(self, proof_ws, lstate):
         # The Require line is not inside any proof.
         r = await run_get_state(
-            file="t.v", line=0, character=0, workspace=str(proof_ws),
+            file_path="t.v", line=0, character=0, workspace=str(proof_ws),
             lifespan_state=lstate,
         )
         assert r["success"] is True
@@ -201,7 +201,7 @@ class TestGetState:
         (tmp_path / "b.v").write_text(src)
         # before=True (default): the goal admit operates on.
         r = await run_get_state(
-            file="b.v", line=3, character=4, workspace=str(tmp_path),
+            file_path="b.v", line=3, character=4, workspace=str(tmp_path),
             lifespan_state=lstate,
         )
         assert r["success"] is True
@@ -209,7 +209,7 @@ class TestGetState:
         assert "1 = 1" in r["goals"][0]["conclusion"]
         # before=False: the state after admit -- discharged, given-up.
         r2 = await run_get_state(
-            file="b.v", line=3, character=4, workspace=str(tmp_path),
+            file_path="b.v", line=3, character=4, workspace=str(tmp_path),
             lifespan_state=lstate, before=False,
         )
         assert r2["goals"] == []
@@ -227,7 +227,7 @@ class TestStep:
     async def test_step_block_advances(self, proof_ws, lstate):
         # From after Proof., run a two-tactic block; the file is untouched.
         r = await run_step(
-            file="t.v", line=2, character=0, tactics="intros n m. induction n.",
+            file_path="t.v", line=2, character=0, tactics="intros n m. induction n.",
             workspace=str(proof_ws), lifespan_state=lstate,
         )
         assert r["success"] is True
@@ -240,7 +240,7 @@ class TestStep:
     async def test_step_failure(self, proof_ws, lstate):
         # reflexivity cannot close n + m = m + n.
         r = await run_step(
-            file="t.v", line=2, character=0, tactics="intros n m. reflexivity.",
+            file_path="t.v", line=2, character=0, tactics="intros n m. reflexivity.",
             workspace=str(proof_ws), lifespan_state=lstate,
         )
         assert r["success"] is False
@@ -253,7 +253,7 @@ class TestStep:
     @pytest.mark.asyncio
     async def test_step_reports_elapsed_s(self, proof_ws, lstate):
         r = await run_step(
-            file="t.v", line=2, character=0, tactics="intros n m.",
+            file_path="t.v", line=2, character=0, tactics="intros n m.",
             workspace=str(proof_ws), lifespan_state=lstate,
         )
         assert r["success"] is True
@@ -320,7 +320,7 @@ class TestStepUpstreamError:
         # A step at X (line 4, after the failed tac1 + tac2) succeeds against
         # coq-lsp's recovered state and surfaces no upstream-error signal.
         r = await run_step(
-            file="u.v", line=4, character=0, tactics="idtac.",
+            file_path="u.v", line=4, character=0, tactics="idtac.",
             workspace=str(tmp_path), lifespan_state=lstate,
         )
         assert r["success"] is True
@@ -342,7 +342,7 @@ class TestStepMulti:
     async def test_multi_outcomes(self, proof_ws, lstate):
         # After "intros n m." (line 3) try several next steps.
         r = await run_step_multi(
-            file="t.v", line=3, character=2,
+            file_path="t.v", line=3, character=2,
             tactics=["induction n.", "reflexivity."],
             workspace=str(proof_ws), lifespan_state=lstate,
         )
@@ -371,7 +371,7 @@ class TestQueryPosition:
         # After "intros n m." the hypotheses n, m are in scope.
         r = await run_query(
             command="Check (n + m).", preamble="", workspace=str(proof_ws),
-            lifespan_state=lstate, file="t.v", line=3, character=14,
+            lifespan_state=lstate, file_path="t.v", line=3, character=14,
         )
         assert r["success"] is True
         assert "nat" in r["output"]
@@ -382,7 +382,7 @@ class TestQueryPosition:
         r = await run_query(
             command="Search (?a + ?b = ?b + ?a).", preamble="",
             workspace=str(proof_ws), lifespan_state=lstate,
-            file="t.v", line=3, character=14,
+            file_path="t.v", line=3, character=14,
         )
         assert r["success"] is True
         assert "add_comm" in r["output"]
@@ -392,7 +392,7 @@ class TestQueryPosition:
         r = await run_query(
             command="Check no_such_symbol_xyz.", preamble="",
             workspace=str(proof_ws), lifespan_state=lstate,
-            file="t.v", line=3, character=14,
+            file_path="t.v", line=3, character=14,
         )
         assert r["success"] is False
         assert r["reason"] == "crashed"
@@ -411,7 +411,7 @@ class TestQueryPosition:
         (tmp_path / "n.v").write_text(src)
         r = await run_query(
             command="Print bar.", preamble="", workspace=str(tmp_path),
-            lifespan_state=lstate, file="n.v", line=1, character=0,
+            lifespan_state=lstate, file_path="n.v", line=1, character=0,
         )
         assert r["success"] is True
         assert "bar = 42" in r["output"]
@@ -444,7 +444,7 @@ class TestQueryPositionRouting:
                   command=None, command_timeout=None, pp_format="Str",
                   mode=None, timeout=0, sentence_timeout=0.0):
             self.goals_calls.append(
-                {"file": file_path, "line": line, "character": character,
+                {"file_path": file_path, "line": line, "character": character,
                  "command": command}
             )
             return {
@@ -468,11 +468,11 @@ class TestQueryPositionRouting:
             [{"range": None, "level": 3, "text": "foo\n     : nat"}]
         )
         state = make_lifespan_state(op_timeout=30.0)
-        inject_checker(state, chk, workspace=str(tmp_path), file="f.v")
+        inject_checker(state, chk, workspace=str(tmp_path), file_path="f.v")
 
         r = await run_query(
             command="Check foo", preamble="", workspace=str(tmp_path),
-            lifespan_state=state, file="f.v", line=0, character=0,
+            lifespan_state=state, file_path="f.v", line=0, character=0,
         )
         assert r["success"] is True
         assert r["output"] == "foo\n     : nat"
@@ -494,10 +494,10 @@ class TestQueryPositionRouting:
         # include_warnings=True -> both; default keeps warnings.
         state = make_lifespan_state(op_timeout=30.0)
         chk = self._FakeChecker(msgs)
-        inject_checker(state, chk, workspace=str(tmp_path), file="f.v")
+        inject_checker(state, chk, workspace=str(tmp_path), file_path="f.v")
         r = await run_query(
             command="Check foo", preamble="", workspace=str(tmp_path),
-            lifespan_state=state, file="f.v", line=0, character=0,
+            lifespan_state=state, file_path="f.v", line=0, character=0,
             include_warnings=True,
         )
         assert "info-line" in r["output"] and "warning-line" in r["output"]
@@ -505,10 +505,10 @@ class TestQueryPositionRouting:
         # include_warnings=False -> drop the level-2 warning.
         state2 = make_lifespan_state(op_timeout=30.0)
         chk2 = self._FakeChecker(msgs)
-        inject_checker(state2, chk2, workspace=str(tmp_path), file="f.v")
+        inject_checker(state2, chk2, workspace=str(tmp_path), file_path="f.v")
         r2 = await run_query(
             command="Check foo", preamble="", workspace=str(tmp_path),
-            lifespan_state=state2, file="f.v", line=0, character=0,
+            lifespan_state=state2, file_path="f.v", line=0, character=0,
             include_warnings=False,
         )
         assert "info-line" in r2["output"]

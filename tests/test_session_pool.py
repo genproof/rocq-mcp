@@ -294,7 +294,7 @@ class TestRocqRestart:
         }
 
         result = await rocq_restart(
-            file="a.v", workspace=str(tmp_path), ctx=self._ctx(ls)
+            file_path="a.v", workspace=str(tmp_path), ctx=self._ctx(ls)
         )
 
         assert result["success"] is True
@@ -334,7 +334,7 @@ class TestRocqRestart:
         ls = make_lifespan_state(full=True)
         ls["lsp_pool"] = {}
         result = await rocq_restart(
-            file="ghost.v", workspace=str(tmp_path), ctx=self._ctx(ls)
+            file_path="ghost.v", workspace=str(tmp_path), ctx=self._ctx(ls)
         )
         assert result["success"] is True
         assert result["restarted"] == []
@@ -397,10 +397,10 @@ class TestRealMultiServer:
 
         try:
             ra = await rocq_get_state(
-                file="a.v", line=2, character=0, workspace=str(tmp_path), ctx=ctx
+                file_path="a.v", line=2, character=0, workspace=str(tmp_path), ctx=ctx
             )
             rb = await rocq_get_state(
-                file="b.v", line=2, character=0, workspace=str(tmp_path), ctx=ctx
+                file_path="b.v", line=2, character=0, workspace=str(tmp_path), ctx=ctx
             )
             assert ra["success"] is True
             assert rb["success"] is True
@@ -451,7 +451,7 @@ class TestRealMultiServer:
 
         async def _check(idx):
             return await rocq_compile_lsp(
-                file=f"slow_{idx}.v", workspace=str(tmp_path), ctx=ctx
+                file_path=f"slow_{idx}.v", workspace=str(tmp_path), ctx=ctx
             )
 
         try:
@@ -513,18 +513,18 @@ class TestRealMultiServer:
         # Prime both sessions so subprocess spawn cost is excluded.
         try:
             await rocq_get_state(
-                file="a.v", line=2, character=0, workspace=str(tmp_path), ctx=ctx
+                file_path="a.v", line=2, character=0, workspace=str(tmp_path), ctx=ctx
             )
             await rocq_get_state(
-                file="b.v", line=2, character=0, workspace=str(tmp_path), ctx=ctx
+                file_path="b.v", line=2, character=0, workspace=str(tmp_path), ctx=ctx
             )
 
             results = await asyncio.gather(
                 rocq_get_state(
-                    file="a.v", line=2, character=0, workspace=str(tmp_path), ctx=ctx
+                    file_path="a.v", line=2, character=0, workspace=str(tmp_path), ctx=ctx
                 ),
                 rocq_get_state(
-                    file="b.v", line=2, character=0, workspace=str(tmp_path), ctx=ctx
+                    file_path="b.v", line=2, character=0, workspace=str(tmp_path), ctx=ctx
                 ),
             )
             assert all(r["success"] for r in results)

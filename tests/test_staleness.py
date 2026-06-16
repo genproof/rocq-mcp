@@ -166,7 +166,7 @@ class TestAttachStaleWarning:
     def test_passes_session_spawned_at(self, monkeypatch):
         captured = {}
 
-        def _spy(file, workspace, *, session_started_at=None):
+        def _spy(file_path, workspace, *, session_started_at=None):
             captured["started"] = session_started_at
             return None
 

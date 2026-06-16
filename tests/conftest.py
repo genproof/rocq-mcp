@@ -240,7 +240,7 @@ def make_lifespan_state(op_timeout: float = 30.0, *, full: bool = False) -> dict
     return state
 
 
-def inject_checker(state: dict, checker, *, workspace: str, file=None):
+def inject_checker(state: dict, checker, *, workspace: str, file_path=None):
     """Place *checker* in the session pool under the key a tool will derive.
 
     Mirrors what ``_run_with_lsp`` looks up: ``_session_key(workspace,
@@ -249,7 +249,7 @@ def inject_checker(state: dict, checker, *, workspace: str, file=None):
     """
     import rocq_mcp.server as _server
 
-    key = _server._session_key(workspace, file)
+    key = _server._session_key(workspace, file_path)
     state.setdefault("lsp_pool", {})[key] = checker
     state.setdefault("lsp_meta", {}).setdefault(
         key, {"peak_rss_mb": 0.0, "trim_count": 0, "generation": 0}
@@ -267,19 +267,19 @@ def stop_all_checkers(state: dict) -> None:
                 pass
 
 
-def pool_checker(state: dict, *, workspace: str, file=None):
+def pool_checker(state: dict, *, workspace: str, file_path=None):
     """Return the pooled checker a tool would use for (workspace, file)."""
     import rocq_mcp.server as _server
 
-    key = _server._session_key(workspace, file)
+    key = _server._session_key(workspace, file_path)
     return state.get("lsp_pool", {}).get(key)
 
 
-def session_meta(state: dict, *, workspace: str, file=None) -> dict:
+def session_meta(state: dict, *, workspace: str, file_path=None) -> dict:
     """Return the per-session stats dict for (workspace, file)."""
     import rocq_mcp.server as _server
 
-    key = _server._session_key(workspace, file)
+    key = _server._session_key(workspace, file_path)
     return state.get("lsp_meta", {}).get(key, {})
 
 

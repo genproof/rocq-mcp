@@ -34,26 +34,26 @@ The server exposes thirteen MCP tools:
 
 | Tool | Description |
 |------|-------------|
-| **`rocq_compile`** | Batch-compile Rocq source code via coqc. Best for checking a finished proof. On error, returns error positions and a `hint`; inspect the proof goals at an error inside a proof with `rocq_get_state(file=..., line=..., character=...)`. For iterative development, prefer `rocq_compile_lsp` (incremental). |
+| **`rocq_compile`** | Batch-compile Rocq source code via coqc. Best for checking a finished proof. On error, returns error positions and a `hint`; inspect the proof goals at an error inside a proof with `rocq_get_state(file_path=..., line=..., character=...)`. For iterative development, prefer `rocq_compile_lsp` (incremental). |
 | **`rocq_compile_file`** | Like `rocq_compile` but takes a file path instead of source string. More efficient for large files (avoids transmitting full source over MCP). Cleans up compilation artifacts but preserves the source file. |
 | **`rocq_verify`** | Verify that a proof actually proves the original statement. Wraps in a `Module M.` sandbox to catch type redefinition, `Admitted`/`Abort`, custom axioms, and statement mismatches. Run after `rocq_compile` succeeds. |
 
 ### Interactive & query tools (coq-lsp-based)
 
-These are **stateless and position-addressed**: every proof state is referred to by `(file, line, character)` on the live file. There is no `state_id` and no session to manage — the agent edits the file and re-queries by position.
+These are **stateless and position-addressed**: every proof state is referred to by `(file_path, line, character)` on the live file. There is no `state_id` and no session to manage — the agent edits the file and re-queries by position.
 
 | Tool | Description |
 |------|-------------|
 | **`rocq_compile_lsp`** | Incrementally check a `.v` file via coq-lsp. Much faster than `rocq_compile_file` for iterative development — coq-lsp caches the unchanged prefix and only re-checks the delta. Pass an optional `line` (and `character`) to get the diagnostics *up to that point* as soon as the check reaches it, without waiting for the rest of the file (which keeps checking in the background) — so you can verify a lemma near the top of a file with an expensive proof below and get its result immediately. The result then carries `checked_through`. A full check (no `line`) writes the [`.vof` warm-start cache](#warm-start-cache-vof) on success; by default only for a clean check — pass `cache_on_error=True` to snapshot a completed-but-erroring file anyway. Set `sentence_timeout` (seconds) — or the global [`ROCQ_SENTENCE_TIMEOUT`](#environment-variables) default — to bound each sentence: a tactic that runs longer is reported as a `Timeout!` and checking continues, so one slow/diverging proof can't wedge a whole-file check. |
-| **`rocq_get_state`** | Show the proof goals at a `(file, line, character)` position (0-indexed). Positions round **backward** by default (`before=true`): you see the goal the sentence at the point operates on, so pointing at `- admit.` shows the goal it discharges; pass `before=false` for the state after. Returns `goals` — a list of `{hyps: [{names, type, def?}], conclusion}` objects (empty when no foreground goals remain) — and `in_proof`. Use it to inspect a proof mid-way or at an error position from `rocq_compile`. |
+| **`rocq_get_state`** | Show the proof goals at a `(file_path, line, character)` position (0-indexed). Positions round **backward** by default (`before=true`): you see the goal the sentence at the point operates on, so pointing at `- admit.` shows the goal it discharges; pass `before=false` for the state after. Returns `goals` — a list of `{hyps: [{names, type, def?}], conclusion}` objects (empty when no foreground goals remain) — and `in_proof`. Use it to inspect a proof mid-way or at an error position from `rocq_compile`. |
 | **`rocq_step`** | Run a tactic **block** from a position and see the resulting goals — *speculatively*: the file on disk is **not** modified. Runs from the state *before* the sentence at the point by default (`before=false` to run from the state after it). On a rejected block, returns `reason: "tactic_failed"` and the Coq error; on a timeout, `reason: "timeout"`. To keep a step, write it into the file yourself, then re-query by position. |
 | **`rocq_step_multi`** | Try multiple tactic blocks from one position (≤20) and get each outcome — useful for an automation battery without committing any of it. Speculative, and rounds backward by default, like `rocq_step`. |
-| **`rocq_query`** | Search the Rocq environment — find lemmas, check types, inspect definitions. Three context modes: **preamble** (import commands as a string), **file** (a `.v` file path whose definitions are in scope), or **position** (`file` + `line` + `character` to query at a point in a proof, where local hypotheses are visible). Optional `max_results` limits output. Does not modify anything. |
-| **`rocq_assumptions`** | List the axioms a theorem depends on. Takes a required `file` parameter (path to the `.v` file where the theorem is defined) to set up the full environment. Returns `assumptions: list[str]` of `"name : type"` pairs from `Print Assumptions` (empty when the theorem is closed under the global context) plus the full `raw_output`. No classification — pure introspection. Use `rocq_verify` for a sandboxed trust decision. |
+| **`rocq_query`** | Search the Rocq environment — find lemmas, check types, inspect definitions. Three context modes: **preamble** (import commands as a string), **file** (a `.v` file path whose definitions are in scope), or **position** (`file_path` + `line` + `character` to query at a point in a proof, where local hypotheses are visible). Optional `max_results` limits output. Does not modify anything. |
+| **`rocq_assumptions`** | List the axioms a theorem depends on. Takes a required `file_path` parameter (path to the `.v` file where the theorem is defined) to set up the full environment. Returns `assumptions: list[str]` of `"name : type"` pairs from `Print Assumptions` (empty when the theorem is closed under the global context) plus the full `raw_output`. No classification — pure introspection. Use `rocq_verify` for a sandboxed trust decision. |
 | **`rocq_toc`** | Get the structure of a `.v` file: all definitions, lemmas, theorems, and sections as an outline. Does not require a session. |
-| **`rocq_extract`** | Split the goal at a `(file, line, character)` position (0-indexed, on the goal's tactic) into a standalone `<name>_goal.v` (the fully-closed goal as `Definition <name>_Goal`) and `<name>_proof.v` (a `Lemma <name>_proof` skeleton whose proof state equals the state at the extraction point). Re-running rewrites `<name>_goal.v` and refreshes only the first `intros` of an existing `<name>_proof.v`. By default also wires a `confirm_extraction "<hash>"` staleness tripwire into the source (`annotate=false` leaves it untouched). |
+| **`rocq_extract`** | Split the goal at a `(file_path, line, character)` position (0-indexed, on the goal's tactic) into a standalone `<name>_goal.v` (the fully-closed goal as `Definition <name>_Goal`) and `<name>_proof.v` (a `Lemma <name>_proof` skeleton whose proof state equals the state at the extraction point). Re-running rewrites `<name>_goal.v` and refreshes only the first `intros` of an existing `<name>_proof.v`. By default also wires a `confirm_extraction "<hash>"` staleness tripwire into the source (`annotate=false` leaves it untouched). |
 | **`rocq_diag`** | Operational diagnostics: coq-lsp pid / memory headroom and recent errors. Use before a long `vm_compute` to check memory headroom, or after a `memory_exhausted` failure. |
-| **`rocq_restart`** | Restart the underlying coq-lsp subprocess(es). The server keeps one coq-lsp process **per file**; pass `file` to restart only that file's session (e.g. after rebuilding a dependency `.vo`, or when a tool reported a stale-import warning), `workspace` for that workspace's shared session, or neither to restart **all** sessions. |
+| **`rocq_restart`** | Restart the underlying coq-lsp subprocess(es). The server keeps one coq-lsp process **per file**; pass `file_path` to restart only that file's session (e.g. after rebuilding a dependency `.vo`, or when a tool reported a stale-import warning), `workspace` for that workspace's shared session, or neither to restart **all** sessions. |
 
 > **Live file:** the interactive tools read the file on disk at call time (coq-lsp re-syncs on each call), so there is no session to go stale — edit the file and re-query. `rocq_step` / `rocq_step_multi` never modify the file; they show what a tactic block *would* do.
 
@@ -68,14 +68,14 @@ the goals, try a block, and — if you like the result — write it into the
 file yourself and move on.
 
     # 1. See the goals where you are (0-indexed position).
-    rocq_get_state(file="foo.v", line=4, character=2)
+    rocq_get_state(file_path="foo.v", line=4, character=2)
 
     # 2. Try a block speculatively (file is NOT modified).
-    rocq_step(file="foo.v", line=4, character=2,
+    rocq_step(file_path="foo.v", line=4, character=2,
               tactics="intros n m. induction n.")
 
     # 3. Not sure which tactic? Try several at once.
-    rocq_step_multi(file="foo.v", line=4, character=2,
+    rocq_step_multi(file_path="foo.v", line=4, character=2,
                     tactics=["ring.", "lia.", "reflexivity."])
 
     # 4. Edit foo.v to add the winning block, then re-query by position.
@@ -94,9 +94,9 @@ Statements like `Require Import`, `From X Require Y`, `Open Scope`,
         command="Search (_ + _).",
     )
 
-For a query against a file's full environment, pass `file=<path>`. For a
+For a query against a file's full environment, pass `file_path=<path>`. For a
 mid-proof query — e.g. `Check H.` where `H` is a hypothesis — pass
-`file` + `line` + `character` to query at that point in the proof.
+`file_path` + `line` + `character` to query at that point in the proof.
 
 ### Failure envelope and `reason` taxonomy
 

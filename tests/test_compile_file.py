@@ -23,13 +23,13 @@ class TestCompileFileSuccess:
     def test_simple_proof_file(self, workspace, simple_proof):
         path = workspace / "simple.v"
         path.write_text(simple_proof)
-        result = run_compile_file(file="simple.v", workspace=str(workspace), timeout=60)
+        result = run_compile_file(file_path="simple.v", workspace=str(workspace), timeout=60)
         assert result["success"] is True
 
     def test_empty_file(self, workspace):
         path = workspace / "empty.v"
         path.write_text("")
-        result = run_compile_file(file="empty.v", workspace=str(workspace), timeout=60)
+        result = run_compile_file(file_path="empty.v", workspace=str(workspace), timeout=60)
         assert result["success"] is True
 
 
@@ -45,7 +45,7 @@ class TestCompileFileErrors:
         path = workspace / "type_err.v"
         path.write_text("Theorem bad : nat = bool.\nProof. reflexivity. Qed.\n")
         result = run_compile_file(
-            file="type_err.v", workspace=str(workspace), timeout=60
+            file_path="type_err.v", workspace=str(workspace), timeout=60
         )
         assert result["success"] is False
         assert "error" in result
@@ -56,7 +56,7 @@ class TestCompileFileErrors:
         path = workspace / "label_test.v"
         path.write_text("Theorem bad : nat = bool.\nProof. reflexivity. Qed.\n")
         result = run_compile_file(
-            file="label_test.v", workspace=str(workspace), timeout=60
+            file_path="label_test.v", workspace=str(workspace), timeout=60
         )
         assert result["success"] is False
         assert "label_test.v" in result["error"]
@@ -73,14 +73,14 @@ class TestCompileFileValidation:
 
     def test_nonexistent_file(self, workspace):
         result = run_compile_file(
-            file="nonexistent.v", workspace=str(workspace), timeout=60
+            file_path="nonexistent.v", workspace=str(workspace), timeout=60
         )
         assert result["success"] is False
         assert "not found" in result["error"].lower()
 
     def test_path_traversal(self, workspace):
         result = run_compile_file(
-            file="../../../etc/passwd", workspace=str(workspace), timeout=60
+            file_path="../../../etc/passwd", workspace=str(workspace), timeout=60
         )
         assert result["success"] is False
         assert "within workspace" in result["error"].lower()
@@ -91,7 +91,7 @@ class TestCompileFileValidation:
         import rocq_mcp.server as _srv
 
         monkeypatch.setattr(_srv, "ROCQ_MAX_SOURCE_SIZE", 50)
-        result = run_compile_file(file="big.v", workspace=str(workspace), timeout=60)
+        result = run_compile_file(file_path="big.v", workspace=str(workspace), timeout=60)
         assert result["success"] is False
         assert "size" in result["error"].lower()
 
@@ -107,7 +107,7 @@ class TestCompileFileCleanup:
     def test_source_preserved_artifacts_cleaned(self, workspace, simple_proof):
         path = workspace / "preserved.v"
         path.write_text(simple_proof)
-        run_compile_file(file="preserved.v", workspace=str(workspace), timeout=60)
+        run_compile_file(file_path="preserved.v", workspace=str(workspace), timeout=60)
         # Source file must still exist
         assert path.exists(), "Source .v file was deleted"
         # Artifacts should be cleaned
@@ -118,7 +118,7 @@ class TestCompileFileCleanup:
     def test_source_preserved_on_error(self, workspace):
         path = workspace / "err_preserve.v"
         path.write_text("Theorem bad : .\nQed.\n")
-        run_compile_file(file="err_preserve.v", workspace=str(workspace), timeout=60)
+        run_compile_file(file_path="err_preserve.v", workspace=str(workspace), timeout=60)
         assert path.exists(), "Source .v file was deleted on error"
 
 
@@ -134,7 +134,7 @@ class TestCompileFileForbidden:
         path = workspace / "forbidden_drop.v"
         path.write_text("Drop.\n")
         result = run_compile_file(
-            file="forbidden_drop.v", workspace=str(workspace), timeout=60
+            file_path="forbidden_drop.v", workspace=str(workspace), timeout=60
         )
         assert result["success"] is False
         assert "error" in result
@@ -143,7 +143,7 @@ class TestCompileFileForbidden:
         path = workspace / "forbidden_redirect.v"
         path.write_text('Redirect "/tmp/out" Check nat.\n')
         result = run_compile_file(
-            file="forbidden_redirect.v", workspace=str(workspace), timeout=60
+            file_path="forbidden_redirect.v", workspace=str(workspace), timeout=60
         )
         assert result["success"] is False
         assert "error" in result
@@ -160,7 +160,7 @@ class TestCompileFileDirectory:
     def test_not_a_file(self, workspace):
         subdir = workspace / "subdir"
         subdir.mkdir(exist_ok=True)
-        result = run_compile_file(file="subdir", workspace=str(workspace), timeout=60)
+        result = run_compile_file(file_path="subdir", workspace=str(workspace), timeout=60)
         assert result["success"] is False
         assert "not found" in result["error"].lower()
 
@@ -194,7 +194,7 @@ class TestCompileFileTimeout:
             },
         )
         result = run_compile_file(
-            file="timeout_test.v", workspace=str(workspace), timeout=5
+            file_path="timeout_test.v", workspace=str(workspace), timeout=5
         )
         assert result["success"] is False
         assert "timed out" in result["error"].lower()
@@ -213,7 +213,7 @@ class TestCompileFileStructuredErrors:
         path = workspace / "pos_test.v"
         path.write_text("Theorem bad : nat = bool.\nProof. reflexivity. Qed.\n")
         result = run_compile_file(
-            file="pos_test.v", workspace=str(workspace), timeout=60
+            file_path="pos_test.v", workspace=str(workspace), timeout=60
         )
         assert result["success"] is False
         assert "error_positions" in result
@@ -228,7 +228,7 @@ class TestCompileFileStructuredErrors:
         path = workspace / "hint_test.v"
         path.write_text("Theorem bad : nat = bool.\nProof. reflexivity. Qed.\n")
         result = run_compile_file(
-            file="hint_test.v", workspace=str(workspace), timeout=60
+            file_path="hint_test.v", workspace=str(workspace), timeout=60
         )
         assert result["success"] is False
         assert "hint" in result

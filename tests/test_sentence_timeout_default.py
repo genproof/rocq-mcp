@@ -108,7 +108,7 @@ async def test_env_default_resolution_whole_file(
 ):
     monkeypatch.setattr(_server, "ROCQ_SENTENCE_TIMEOUT", env_default)
     await _server.rocq_compile_lsp(
-        file=str(vfile),
+        file_path=str(vfile),
         workspace=str(tmp_path),
         sentence_timeout=param,
         ctx=_Ctx(make_lifespan_state(full=True)),
@@ -123,7 +123,7 @@ async def test_env_default_applies_to_position_mode(
     # The same resolution feeds the position-limited path (check_up_to).
     monkeypatch.setattr(_server, "ROCQ_SENTENCE_TIMEOUT", 3.0)
     await _server.rocq_compile_lsp(
-        file=str(vfile),
+        file_path=str(vfile),
         workspace=str(tmp_path),
         line=1,
         sentence_timeout=None,
