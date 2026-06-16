@@ -962,6 +962,12 @@ async def _memory_watchdog(
     if interval is None:
         interval = _MEMORY_WATCHDOG_INTERVAL
 
+    # One psutil handle reused across samples: cpu_percent() reports CPU since
+    # the previous call on the *same* object, so a fresh handle every tick would
+    # always read 0.  Reset (re-prime) when the watched pid changes (restart).
+    ps_proc = None
+    ps_pid: int | None = None
+
     try:
         while not main_task.done():
             await asyncio.sleep(interval)
@@ -977,22 +983,42 @@ async def _memory_watchdog(
             process = get_process()
             if process is None:
                 continue
+            new_handle = ps_proc is None or process.pid != ps_pid
             try:
                 pid = process.pid
-                rss_bytes = psutil.Process(pid).memory_info().rss
+                if new_handle:
+                    ps_proc = psutil.Process(pid)
+                    ps_pid = pid
+                rss_bytes = ps_proc.memory_info().rss
             except (psutil.Error, AttributeError, OSError):
                 # psutil.Error covers NoSuchProcess / AccessDenied / ZombieProcess;
                 # OSError catches raw ProcessLookupError if the subprocess died
-                # between Process() construction and memory_info().
+                # between Process() construction and memory_info().  Drop the
+                # handle so the next tick re-primes against a fresh process.
+                ps_proc = None
+                ps_pid = None
                 continue
             rss_mb = rss_bytes // (1024 * 1024)
             if on_rss is not None:
                 on_rss(rss_mb)
+            # CPU% since the previous sample -- distinguishes a CPU-bound spin (a
+            # non-cooperative divergence sits near 100%) from an idle hang (~0%).
+            # Best-effort and isolated: a cpu read failure must never drop the
+            # RSS sample or the breach check.  A freshly (re)created handle has
+            # no baseline -- prime it and report None for that one tick.
+            cpu_pct = None
+            try:
+                if new_handle:
+                    ps_proc.cpu_percent()  # prime baseline (first read is 0.0)
+                else:
+                    cpu_pct = round(ps_proc.cpu_percent(), 1)
+            except (psutil.Error, AttributeError, OSError):
+                cpu_pct = None
             dlog.verbose_event("watchdog", "rss_sample", proc=pid, rss_mb=rss_mb,
-                               limit_mb=max_rss_mb)
+                               cpu_pct=cpu_pct, limit_mb=max_rss_mb)
             if rss_mb > max_rss_mb:
                 dlog.event("watchdog", "rss_breach", proc=pid, rss_mb=rss_mb,
-                           limit_mb=max_rss_mb)
+                           cpu_pct=cpu_pct, limit_mb=max_rss_mb)
                 event.set()
                 main_task.cancel()
                 return

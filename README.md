@@ -172,7 +172,7 @@ where `pid`/`thread` identify the source). Events are grouped by `cat`:
 | `lsp` | `request.send` / `request.recv` / `notify.send` / `request.timeout` / `request.dead` | Every coq-lsp request/notification, correlated by JSON-RPC `id`, with params, a result summary, and round-trip `duration_s`. (`publishDiagnostics` / `serverStatus` are verbose-only.) |
 | `process` | `spawn` / `ready` / `stop` | coq-lsp subprocess lifecycle (with handshake time). |
 | `pool` | `session.create` / `session.invalidate` | Per-file session pool spawns and restarts. |
-| `watchdog` | `rss_breach` (and verbose `rss_sample`) | Memory-watchdog samples and threshold breaches. |
+| `watchdog` | `rss_breach` (and verbose `rss_sample`) | Memory-watchdog samples and threshold breaches. Each carries `rss_mb` and `cpu_pct` (the watched coq-lsp's CPU% since the previous sample) — `cpu_pct` near 100 means a CPU-bound spin (e.g. a non-cooperative divergence), near 0 an idle hang. `cpu_pct` is `null` on the first sample of a session (no baseline yet). |
 | `trim` | `soft_trim` / `trim_caches` | `coq/trimCaches` soft-trims with the RSS that triggered them. |
 | `vof` | `save.ok` / `save.rejected` / `load.hit` / `load.miss` | `.vof` warm-start cache activity. |
 | `stale` | `warning` | Stale-import warnings attached to results. |

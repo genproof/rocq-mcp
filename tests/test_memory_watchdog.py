@@ -141,6 +141,44 @@ class TestWatchdogCoroutine:
         with pytest.raises(asyncio.CancelledError):
             await main_task
 
+    @pytest.mark.asyncio
+    async def test_watchdog_samples_cpu(self, monkeypatch):
+        """rss_sample carries cpu_pct measured from the reused per-pid handle.
+
+        The first sample primes the handle (no baseline yet -> None); later
+        samples report the fake's fixed cpu_percent.  This is what lets a future
+        incident log tell a CPU-bound spin from an idle hang.
+        """
+        import psutil
+
+        monkeypatch.setattr(
+            psutil, "Process",
+            lambda pid: _FakePsutilProcess(50 * 1024 * 1024, cpu_pct=87.0),
+        )
+        samples: list[dict] = []
+        monkeypatch.setattr(
+            _server.dlog, "verbose_event",
+            lambda cat, ev, **f: samples.append(f) if ev == "rss_sample" else None,
+        )
+
+        checker = _FakeLspChecker()
+        event = asyncio.Event()
+
+        async def work():
+            await asyncio.sleep(0.1)  # ~10 ticks at the 0.01s test interval
+
+        main_task = asyncio.create_task(work())
+        await _server._memory_watchdog(
+            100_000, main_task, event, get_process=lambda: checker._process
+        )
+
+        assert len(samples) >= 2, f"too few samples: {samples}"
+        # First sample primes the handle -> cpu_pct is None; a later sample
+        # carries the measured value.
+        assert samples[0]["cpu_pct"] is None
+        assert any(s["cpu_pct"] == 87.0 for s in samples)
+        assert not event.is_set()
+
 
 # ---------------------------------------------------------------------------
 # coq-lsp watchdog (ROCQ_MAX_LSP_RSS_MB)

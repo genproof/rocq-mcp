@@ -289,22 +289,28 @@ class _FakeMemoryInfo:
 
 
 class FakePsutilProcess:
-    """Stand-in for ``psutil.Process`` returning a fixed RSS in bytes."""
+    """Stand-in for ``psutil.Process`` returning a fixed RSS in bytes and a
+    fixed ``cpu_percent`` (the watchdog reads both)."""
 
-    def __init__(self, rss_bytes: int) -> None:
+    def __init__(self, rss_bytes: int, cpu_pct: float = 0.0) -> None:
         self._rss = rss_bytes
+        self._cpu = cpu_pct
 
     def memory_info(self) -> _FakeMemoryInfo:
         return _FakeMemoryInfo(self._rss)
 
+    def cpu_percent(self, interval=None) -> float:
+        return self._cpu
 
-def patch_psutil_rss(monkeypatch, rss_mb: int) -> None:
-    """Make ``psutil.Process(pid)`` return a fake process with the given RSS."""
+
+def patch_psutil_rss(monkeypatch, rss_mb: int, cpu_pct: float = 0.0) -> None:
+    """Make ``psutil.Process(pid)`` return a fake process with the given RSS
+    (and optional fixed ``cpu_percent``)."""
     import psutil
 
     rss_bytes = rss_mb * 1024 * 1024
 
     def _factory(pid: int) -> FakePsutilProcess:
-        return FakePsutilProcess(rss_bytes)
+        return FakePsutilProcess(rss_bytes, cpu_pct)
 
     monkeypatch.setattr(psutil, "Process", _factory)
