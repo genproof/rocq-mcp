@@ -1086,8 +1086,8 @@ async def _run_phase2_shared_defs(
         problem_statement, workspace, lifespan_state
     )
 
-    # Pet died during toc — surface pet_restarted to the caller instead
-    # of silently falling through to Phase 3.  Without this the
+    # coq-lsp died during documentSymbol — surface lsp_restarted to the
+    # caller instead of silently falling through to Phase 3.  Without this the
     # rocq_diag breadcrumb on the wrapper docstring is unreachable
     # through the Phase 2 path.
     if isinstance(structure, dict):

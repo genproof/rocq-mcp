@@ -120,8 +120,7 @@ def _lsp_run_query(
     file) failed to load; an error *at or after* it means the query
     command itself was rejected (e.g. a misspelled reference) -- reported
     with ``reason="crashed"`` so callers' not-found enrichment (see
-    :func:`run_assumptions`) kicks in, mirroring the old pet
-    ``PetanqueError`` path.
+    :func:`run_assumptions`) kicks in.
 
     Runs on the LSP worker thread (called via ``_run_with_lsp``).
     """
@@ -165,8 +164,8 @@ def _lsp_run_query(
     errors = result.get("errors", [])
     # coq-lsp is error-resilient: it processes the appended command even
     # when an earlier sentence errored, so a query on a symbol defined
-    # before an unrelated error still resolves (matching pet's old
-    # behavior of querying a partially-loaded file end-state).  Precedence:
+    # before an unrelated error still resolves (it queries the
+    # partially-loaded file's end-state).  Precedence:
     #   1. command itself errored          -> report that (e.g. typo'd name)
     #   2. command produced output          -> success, even if the context
     #                                          has unrelated errors elsewhere
@@ -644,17 +643,17 @@ async def run_assumptions(
         # a "transport failure":
         #   * reason in {timeout, lock_contended, unavailable,
         #     memory_exhausted}; or
-        #   * reason == "crashed" *and* ``pet_restarted`` is True (the
-        #     pet process actually died — see ``_run_with_pet``).
-        # A bare ``reason == "crashed"`` without ``pet_restarted`` is a
-        # live PetanqueError (typically a Coq "Reference X not found"
-        # error from a typo'd theorem name) — exactly the case the
-        # enrichment exists to help with, so we DO run it.
+        #   * reason == "crashed" *and* ``lsp_restarted`` is True (the
+        #     coq-lsp session actually died — see ``_run_with_lsp``).
+        # A bare ``reason == "crashed"`` without ``lsp_restarted`` is a
+        # live Coq error (typically ``Reference X not found.`` from a
+        # typo'd theorem name) — exactly the case the enrichment exists to
+        # help with, so we DO run it.
         reason = query_result.get("reason")
-        pet_restarted = query_result.get("pet_restarted") is True
+        lsp_restarted = query_result.get("lsp_restarted") is True
         is_transport_failure = (
             reason in _TRANSPORT_FAILURE_REASONS and reason != "crashed"
-        ) or (reason == "crashed" and pet_restarted)
+        ) or (reason == "crashed" and lsp_restarted)
         if "available_in_file" not in query_result and not is_transport_failure:
             result = await _fetch_available_in_file(
                 file_path=file_path,
@@ -672,7 +671,7 @@ async def run_assumptions(
                 if query_result.get("reason") != "not_found":
                     query_result["reason"] = "not_found"
                     # Drop the just-recorded rocq_query/crashed entry
-                    # (set by _run_with_pet on the live PetanqueError)
+                    # (set by ``_lsp_run_query`` on the live Coq error)
                     # before re-recording as rocq_assumptions/not_found.
                     # Without this, rocq_diag reports the same failure
                     # twice with conflicting tool / reason attribution.
@@ -869,17 +868,17 @@ def _collect_toc_names(toc_result: Any, source: str = "") -> list[str]:
 _DEFAULT_TOC_LIMIT: int = 500
 
 
-# Reasons that indicate the pet itself is stressed/dead.  When
+# Reasons that indicate the coq-lsp session is stressed/dead.  When
 # ``run_query`` failed for one of these, the ``available_in_file``
-# enrichment skips the extra ``pet.toc`` call: the failure was not
-# about the requested name and the pet should not be hammered further.
+# enrichment skips the extra symbol-list lookup: the failure was not
+# about the requested name and the session should not be hammered further.
 #
 # ``"crashed"`` is intentionally listed here for the *transport* sense
-# (pet process died, indicated by ``pet_restarted: True``).  It is also
-# the reason ``_run_with_pet`` records for a *live* PetanqueError —
-# typically a Coq error such as ``Reference foo not found.`` — where
-# enrichment IS useful.  The runtime gate (in ``run_assumptions``)
-# treats those two cases differently using ``pet_restarted``.
+# (coq-lsp session died, indicated by ``lsp_restarted: True``).  It is also
+# the reason ``_lsp_run_query`` records for a *live* Coq error — typically
+# ``Reference foo not found.`` — where enrichment IS useful.  The runtime
+# gate (in ``run_assumptions``) treats those two cases differently using
+# ``lsp_restarted``.
 #
 # This set is a strict subset of :data:`server._RECENT_ERROR_REASONS`
 # (the larger set also includes validation-only and tool-specific
@@ -956,8 +955,8 @@ async def _fetch_available_in_file(
 ) -> _AvailableInFile:
     """Async wrapper that fetches the (capped) name list for *file_path*.
 
-    Resolves *file_path* against *workspace*, runs ``pet.toc`` (cached) under
-    the pet lock, and returns an :class:`_AvailableInFile` with
+    Resolves *file_path* against *workspace*, runs coq-lsp ``documentSymbol``
+    (cached), and returns an :class:`_AvailableInFile` with
     ``names``, ``truncated``, and ``total``.  On any error returns an
     empty result (``names=[]``, ``truncated=False``, ``total=0``) —
     this is best-effort enrichment that must never break the primary

@@ -2666,28 +2666,28 @@ class TestVerifyEnvelopeContract:
         assert result["success"] is False
         assert result.get("reason") == "validation"
 
-    async def test_pet_restarted_failure_not_double_recorded(
+    async def test_lsp_restarted_failure_not_double_recorded(
         self, workspace, monkeypatch
     ):
-        """When Phase 2's pet toc lookup crashes, ``_run_with_pet`` records
-        ``rocq_verify/crashed`` into recent_errors and returns a
-        ``pet_restarted: True`` envelope.  ``run_verify`` propagates that
-        envelope; the wrapper used to record it AGAIN, producing two
-        entries for one call with conflicting attribution.  The wrapper
-        must skip its own _record_error when ``pet_restarted`` is set."""
+        """When Phase 2's coq-lsp documentSymbol lookup crashes,
+        ``_run_with_lsp`` records ``rocq_verify/crashed`` into recent_errors
+        and returns an ``lsp_restarted: True`` envelope.  ``run_verify``
+        propagates that envelope; the wrapper used to record it AGAIN,
+        producing two entries for one call with conflicting attribution.  The
+        wrapper must skip its own _record_error when ``lsp_restarted`` is set."""
         from collections import deque
 
         from rocq_mcp.server import rocq_verify
         import rocq_mcp.server as _server
         from tests.conftest import _MockContext
 
-        # Pre-populate the buffer with the entry _run_with_pet would
+        # Pre-populate the buffer with the entry _run_with_lsp would
         # have recorded inside _extract_problem_structure.
         ls = {"recent_errors": deque(maxlen=10)}
         ls["recent_errors"].append(
             {
                 "tool": "rocq_verify",
-                "message": "Pet process died: <foo>",
+                "message": "coq-lsp session died: <foo>",
                 "reason": "crashed",
                 "occurred_at": 0.0,
             }
@@ -2696,9 +2696,9 @@ class TestVerifyEnvelopeContract:
         async def fake_run_verify(**kwargs):
             return {
                 "success": False,
-                "error": "Pet process died: <foo>",
+                "error": "coq-lsp session died: <foo>",
                 "reason": "crashed",
-                "pet_restarted": True,
+                "lsp_restarted": True,
             }
 
         monkeypatch.setattr(_server, "run_verify", fake_run_verify)

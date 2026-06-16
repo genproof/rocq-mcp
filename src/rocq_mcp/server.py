@@ -1493,9 +1493,9 @@ async def rocq_verify(
     On success, ``assumptions`` and ``verification_method`` describe how
     the verdict was reached (``module_m``, ``shared_defs``, ``direct``).
 
-    On ``pet_restarted: True`` (Phase 2 ``rocq_query`` path crashed pet
-    while extracting shared definitions), call ``rocq_diag`` for memory
-    headroom and recent error history.
+    On ``lsp_restarted: True`` (Phase 2 ``documentSymbol`` path crashed
+    coq-lsp while extracting shared definitions), call ``rocq_diag`` for
+    memory headroom and recent error history.
     """
     workspace = workspace or ROCQ_WORKSPACE
     timeout = timeout if timeout is not None and timeout > 0 else ROCQ_VERIFY_TIMEOUT
@@ -1520,18 +1520,18 @@ async def rocq_verify(
         lifespan_state=ctx.lifespan_context if ctx else None,
     )
     # Record verification failures (success=False with an error message)
-    # so rocq_diag surfaces them.  Pet-level crashes routed through
-    # run_verify -> _run_with_pet (Phase 2 toc lookup) are already
-    # recorded inside that helper, so skip when ``pet_restarted=True``
+    # so rocq_diag surfaces them.  coq-lsp session crashes routed through
+    # run_verify -> _run_with_lsp (Phase 2 documentSymbol lookup) are already
+    # recorded inside that helper, so skip when ``lsp_restarted=True``
     # to avoid the double-record bug — the prior entry already carries
     # tool="rocq_verify" with the right reason because _extract_problem_structure
-    # passes that tool name to _run_with_pet.
+    # passes that tool name to _run_with_lsp.
     if (
         ctx is not None
         and isinstance(result, dict)
         and result.get("success") is False
         and result.get("error")
-        and not result.get("pet_restarted")
+        and not result.get("lsp_restarted")
     ):
         _record_error(
             ctx.lifespan_context,
@@ -1698,7 +1698,7 @@ async def rocq_assumptions(
     included; call ``rocq_toc`` for the full list.  Agents can fuzzy-
     match the requested name against this list to recover from typos.
 
-    On ``pet_restarted: True``, call ``rocq_diag`` for memory headroom and
+    On ``lsp_restarted: True``, call ``rocq_diag`` for memory headroom and
     recent error history.
     """
     workspace = workspace or _find_project_root_from_file(file_path) or ROCQ_WORKSPACE
@@ -1754,7 +1754,7 @@ async def rocq_toc(
             ``dune-project``; falls back to the ``ROCQ_WORKSPACE`` env var
             (default: cwd).
 
-    On ``pet_restarted: True``, call ``rocq_diag`` for memory headroom and
+    On ``lsp_restarted: True``, call ``rocq_diag`` for memory headroom and
     recent error history.
     """
     workspace = workspace or _find_project_root_from_file(file_path) or ROCQ_WORKSPACE

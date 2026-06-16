@@ -657,10 +657,10 @@ class TestAssumptionsAvailableInFile:
         assert called["count"] == 0
 
     @pytest.mark.asyncio
-    async def test_pet_restarted_crashed_skips_enrichment(self, monkeypatch):
-        """``reason="crashed"`` *with* ``pet_restarted: True`` means the
-        pet process actually died — skip the extra ``pet.toc`` call.
-        (A bare ``reason="crashed"`` without ``pet_restarted`` is a live
+    async def test_lsp_restarted_crashed_skips_enrichment(self, monkeypatch):
+        """``reason="crashed"`` *with* ``lsp_restarted: True`` means the
+        coq-lsp session actually died — skip the extra symbol-list call.
+        (A bare ``reason="crashed"`` without ``lsp_restarted`` is a live
         Coq error — typo recovery — and DOES trigger enrichment; that
         path is covered by ``test_typo_failure_records_not_found_reason``.)
         """
@@ -669,9 +669,9 @@ class TestAssumptionsAvailableInFile:
         async def mock_run_query(**kwargs):
             return {
                 "success": False,
-                "error": "Pet process died.",
+                "error": "coq-lsp session died.",
                 "reason": "crashed",
-                "pet_restarted": True,
+                "lsp_restarted": True,
             }
 
         called = {"count": 0}
@@ -692,7 +692,7 @@ class TestAssumptionsAvailableInFile:
 
         assert result["success"] is False
         assert result["reason"] == "crashed"
-        assert result["pet_restarted"] is True
+        assert result["lsp_restarted"] is True
         assert "available_in_file" not in result
         assert called["count"] == 0
 
