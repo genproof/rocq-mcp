@@ -113,18 +113,20 @@ class TestQueryErrors:
     """Queries that should fail gracefully."""
 
     @pytest.mark.asyncio
-    async def test_timeout(self, workspace):
-        """A query that exceeds the timeout should return a timeout error."""
-        # Use an extremely short timeout to trigger it
+    async def test_tiny_op_timeout_does_not_bound_query(self, workspace):
+        """op_timeout no longer bounds a document-check query: the check blocks
+        and is bounded by ROCQ_SENTENCE_TIMEOUT + the stall watchdog (like
+        rocq_compile_lsp), so a tiny op_timeout is ignored and a fast query
+        still succeeds."""
         state = _make_lifespan_state(op_timeout=0.001)
         result = await run_query(
-            command="Search _.",
+            command="Check nat.",
             preamble="",
             workspace=str(workspace),
             lifespan_state=state,
         )
-        assert result["success"] is False
-        assert "timed out" in result["error"].lower()
+        assert result["success"] is True
+        assert "nat" in result["output"]
 
     @pytest.mark.asyncio
     async def test_invalid_command(self, workspace, lifespan_state):
@@ -219,7 +221,9 @@ class TestQueryFileMode:
         # Mock _run_with_lsp to avoid needing actual coq-lsp
         import rocq_mcp.server as _server
 
-        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace, key=None):
+        async def mock_run_with_lsp(
+            fn, lifespan_state, desc, *, workspace, key=None, **kwargs
+        ):
             # We just want to verify no mutual-exclusivity error was returned
             # before reaching pet. Return a fake success.
             return {"success": True, "output": "mock"}
@@ -243,7 +247,9 @@ class TestQueryFileMode:
 
         import rocq_mcp.server as _server
 
-        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace, key=None):
+        async def mock_run_with_lsp(
+            fn, lifespan_state, desc, *, workspace, key=None, **kwargs
+        ):
             return {"success": True, "output": "mock"}
 
         monkeypatch.setattr(_server, "_run_with_lsp", mock_run_with_lsp)
@@ -263,7 +269,9 @@ class TestQueryFileMode:
         import rocq_mcp.server as _server
 
         # Mock _run_with_lsp to exercise the _do_lsp inner function
-        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace, key=None):
+        async def mock_run_with_lsp(
+            fn, lifespan_state, desc, *, workspace, key=None, **kwargs
+        ):
             # Call fn with a mock pet to trigger the path validation
             from unittest.mock import MagicMock
 
@@ -287,7 +295,9 @@ class TestQueryFileMode:
         """Non-existent file should return error."""
         import rocq_mcp.server as _server
 
-        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace, key=None):
+        async def mock_run_with_lsp(
+            fn, lifespan_state, desc, *, workspace, key=None, **kwargs
+        ):
             from unittest.mock import MagicMock
 
             mock_checker = MagicMock()
@@ -310,7 +320,9 @@ class TestQueryFileMode:
         """Absolute file path should be rejected by containment check."""
         import rocq_mcp.server as _server
 
-        async def mock_run_with_lsp(fn, lifespan_state, desc, *, workspace, key=None):
+        async def mock_run_with_lsp(
+            fn, lifespan_state, desc, *, workspace, key=None, **kwargs
+        ):
             from unittest.mock import MagicMock
 
             mock_checker = MagicMock()
@@ -498,25 +510,26 @@ from tests.conftest import _MockContext
 
 
 class TestQueryTimeoutRunQuery:
-    """run_query bakes the resolved timeout into the coq-lsp check.
+    """run_query bakes the resolved budget into the coq-lsp check.
 
-    In file/preamble mode the query runs by appending the command to a
-    scratch document and checking it via ``LspChecker.check_content``
-    (under ``_run_with_lsp``); the per-request timeout is forwarded as
-    that call's ``timeout`` argument.  ``None`` resolves to the
-    lifespan ``op_timeout`` default (30s); an explicit value passes
-    through unchanged.
+    Whole-file / preamble mode appends the command to a scratch document and
+    checks it via ``LspChecker.check_content`` (under ``_run_with_lsp``).  Like
+    rocq_compile_lsp the check now **blocks** (``timeout=0`` -- no client-side
+    give-up); the per-call budget is forwarded as the ``sentence_timeout``
+    instead, and the watchdog's stall phase bounds the check.  ``None`` resolves
+    to the global ``ROCQ_SENTENCE_TIMEOUT``; an explicit value passes through.
     """
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "timeout_arg,expected",
-        [(None, 30.0), (60, 60.0)],
+        "timeout_arg,expected_sentence",
+        [(None, 120.0), (60, 60.0)],
         ids=["default-none", "explicit-60"],
     )
-    async def test_timeout_forwarded(
-        self, monkeypatch, tmp_path, timeout_arg, expected
+    async def test_doc_check_blocks_and_forwards_sentence_budget(
+        self, monkeypatch, tmp_path, timeout_arg, expected_sentence
     ):
+        monkeypatch.setattr(_server, "ROCQ_SENTENCE_TIMEOUT", 120.0)
         captured: dict = {}
 
         class _FakeChecker:
@@ -530,6 +543,7 @@ class TestQueryTimeoutRunQuery:
                 sentence_timeout=0.0,
             ):
                 captured["timeout"] = timeout
+                captured["sentence_timeout"] = sentence_timeout
                 return {
                     "success": True,
                     "errors": [],
@@ -550,7 +564,10 @@ class TestQueryTimeoutRunQuery:
             **kwargs,
         )
         assert result["success"] is True
-        assert captured["timeout"] == expected
+        # Document check blocks (no op_timeout give-up); the budget is the
+        # per-sentence timeout instead.
+        assert captured["timeout"] == 0
+        assert captured["sentence_timeout"] == expected_sentence
 
 
 class TestRocqQueryTimeout:
@@ -608,35 +625,19 @@ class TestRocqQueryTimeout:
         assert "clamped_timeout" not in result
 
     @pytest.mark.asyncio
-    async def test_above_cap_clamped_with_signal(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(_server, "ROCQ_QUERY_TIMEOUT_CAP", 100)
+    async def test_large_timeout_is_uncapped(self, monkeypatch, tmp_path):
+        """rocq_query is uncapped (like rocq_step): a large explicit timeout is
+        forwarded verbatim as the command budget, with no clamped_timeout."""
         captured = self._patch(monkeypatch)
         result = await rocq_query(
-            command="Check nat.",
+            command="Time Eval vm_compute in 1.",
             workspace=str(tmp_path),
             timeout=9999,
             ctx=_MockContext({}),
         )
         assert result["success"] is True
-        assert captured["timeout"] == 100
-        assert result["clamped_timeout"] == 100
-
-    @pytest.mark.asyncio
-    async def test_at_cap_not_clamped(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(_server, "ROCQ_QUERY_TIMEOUT_CAP", 100)
-        captured = self._patch(monkeypatch)
-        result = await rocq_query(
-            command="Check nat.",
-            workspace=str(tmp_path),
-            timeout=100,
-            ctx=_MockContext({}),
-        )
-        assert result["success"] is True
-        assert captured["timeout"] == 100
+        assert captured["timeout"] == 9999
         assert "clamped_timeout" not in result
-
-    def test_default_cap_is_300(self):
-        assert _server.ROCQ_QUERY_TIMEOUT_CAP == 300
 
 
 # ---------------------------------------------------------------------------

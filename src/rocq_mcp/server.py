@@ -39,15 +39,17 @@ ROCQ_VERIFY_TIMEOUT: int = int(os.environ.get("ROCQ_VERIFY_TIMEOUT", "120"))
 ROCQ_OP_TIMEOUT: float = float(
     os.environ.get("ROCQ_OP_TIMEOUT", os.environ.get("ROCQ_PET_TIMEOUT", "30"))
 )
-ROCQ_QUERY_TIMEOUT_CAP: int = int(os.environ.get("ROCQ_QUERY_TIMEOUT_CAP", "300"))
 # Global default per-sentence wall-clock budget (seconds) for coq-lsp document
 # checking, honored by every tool that drives a check: rocq_compile_lsp and the
 # goals-driven tools (rocq_get_state / rocq_step / rocq_step_multi /
-# rocq_query).  0 (the default) disables it; when > 0, a single slow/diverging
-# sentence is aborted coq-lsp-side ("rocq-lsp: sentence timeout") so it cannot
-# wedge the check.  rocq_compile_lsp's per-call ``sentence_timeout`` parameter
-# overrides this for that tool (pass 0 to force-disable).
-ROCQ_SENTENCE_TIMEOUT: float = float(os.environ.get("ROCQ_SENTENCE_TIMEOUT", "0"))
+# rocq_query).  Default 120s: a single slow/diverging sentence is aborted
+# coq-lsp-side ("rocq-lsp: sentence timeout") so it cannot wedge the check, and
+# it arms the watchdog's elaborate-phase stall (sentence_timeout +
+# ROCQ_PROGRESS_GRACE) that kills+restarts a *non-cooperative* diverging
+# sentence.  Set to 0 to disable (then only the command-phase / hard-timeout
+# backstops bound a check).  rocq_compile_lsp's per-call ``sentence_timeout``
+# parameter overrides this for that tool.
+ROCQ_SENTENCE_TIMEOUT: float = float(os.environ.get("ROCQ_SENTENCE_TIMEOUT", "120"))
 # Hard wall-clock backstop (seconds) for any single coq-lsp operation.  0 (the
 # default) disables it.  When > 0, an operation that runs longer is aborted by
 # KILLING and restarting that session's coq-lsp subprocess -- the only lever
@@ -733,6 +735,10 @@ _RECENT_ERROR_REASONS: frozenset[str] = frozenset(
         # Progress-stall backstop: no $/coq/fileProgress for sentence_timeout +
         # ROCQ_PROGRESS_GRACE -- a diverging sentence; coq-lsp killed + restarted.
         "stall_timeout",
+        # Command-stall backstop (pretac tools): a speculative proof/goals
+        # command ignored Coq's interrupt for command budget +
+        # ROCQ_PROGRESS_GRACE -- coq-lsp killed + restarted.
+        "command_timeout",
         "lock_contended",
         "unavailable",
         "validation",
@@ -962,6 +968,52 @@ def _build_lsp_stall_timeout_response(
     return response
 
 
+def _build_lsp_command_timeout_response(
+    lifespan_state: dict[str, Any],
+    tool: str,
+    key: str,
+    command_text: str | None,
+    command_window: float | None,
+) -> dict[str, Any]:
+    """Command-timeout recovery for one coq-lsp session.
+
+    Kills the *key* session's coq-lsp subprocess (so the next call respawns it,
+    reloading the ``.vof`` warm-start) and returns a ``command_timeout``
+    envelope *naming the diverging command*.  The command-phase counterpart of
+    :func:`_build_lsp_stall_timeout_response`: used for the speculative
+    ``proof/goals`` tools (rocq_step / rocq_step_multi / rocq_query /
+    rocq_assumptions) when the command ignores Coq's interrupt for
+    ``command_window`` seconds (command budget + ``ROCQ_PROGRESS_GRACE``) -- the
+    coq-side ``command_timeout`` could not abort it, so killing the process is
+    the only way to free the session.  The command runs after the frontier
+    reaches the point and emits no ``$/coq/fileProgress`` of its own, so
+    *command_text* is the locator (vs the stall path's frontier sentence).
+    Other sessions are untouched.
+    """
+    _invalidate_lsp(lifespan_state, key)
+    window = f"{command_window:.0f}s" if command_window is not None else "the budget"
+    cmd = command_text.strip() if command_text else None
+    if cmd and len(cmd) > 300:
+        cmd = cmd[:300] + " …"
+    loc = f" Diverging command: {cmd}" if cmd else ""
+    error = (
+        f"{tool} aborted: the speculative command made no progress for {window} "
+        "(command budget + ROCQ_PROGRESS_GRACE) and ignores Coq's interrupt "
+        "(a non-cooperative loop or runaway computation). coq-lsp has been "
+        f"restarted.{loc}"
+    )
+    _record_error(lifespan_state, tool, error, reason="command_timeout")
+    response: dict[str, Any] = {
+        "success": False,
+        "error": error,
+        "reason": "command_timeout",
+        "lsp_restarted": True,
+    }
+    if cmd:
+        response["diverging_command"] = cmd
+    return response
+
+
 def _checker_process(checker: Any) -> Any:
     """Return *checker*'s coq-lsp subprocess (with ``.pid``) or None."""
     if checker is None:
@@ -1035,15 +1087,18 @@ async def _memory_watchdog(
     get_progress: Callable[[], tuple[float, int, int] | None] | None = None,
     stall_window: float | None = None,
     stall_event: asyncio.Event | None = None,
+    command_window: float | None = None,
+    command_event: asyncio.Event | None = None,
+    point: tuple[int, int] | None = None,
     op_start: float | None = None,
 ) -> None:
-    """Watch one coq-lsp op: on RSS breach, hard-timeout, *or* progress stall,
-    cancel *main_task*.
+    """Watch one coq-lsp op: on RSS breach, hard-timeout, progress stall, *or*
+    command stall, cancel *main_task*.
 
     Runs concurrently with the main work thread, watching a *single*
-    coq-lsp process (one per session — see :func:`_run_with_lsp`).  Three
-    independent triggers, each cancelling the main task so the caller's
-    recovery path can kill and respawn just that session's subprocess:
+    coq-lsp process (one per session — see :func:`_run_with_lsp`).  The
+    triggers each cancel the main task so the caller's recovery path can kill
+    and respawn just that session's subprocess:
 
     - **RSS:** when the process's RSS exceeds ``max_rss_mb`` MB, set
       *event* (memory exhaustion).
@@ -1052,16 +1107,26 @@ async def _memory_watchdog(
       *non-cooperative* divergence (one that ignores Coq's polled interrupt),
       since cancelling the worker alone does not stop the blocked LSP read —
       the caller kills the process, which unblocks it.
-    - **Progress stall:** when ``get_progress`` reports no new
-      ``$/coq/fileProgress`` frontier for ``stall_window`` seconds, set
-      *stall_event*.  rocq-lsp announces each sentence (frontier advance)
-      before elaborating it, so a stalled frontier means the current sentence
-      is diverging.  A smarter, self-locating variant of the hard timeout: it
-      bounds *per-sentence* wall-clock (not the whole op), so an honestly long
-      check that keeps making progress is never killed, while a wedged sentence
-      is — and the frontier pinpoints it.  ``op_start`` (the op's
-      ``time.monotonic()`` start) seeds the baseline so a divergence in the
-      first sentence, before any progress arrives, is still caught.
+    - **Progress / command stall:** a single frontier-anchored watchdog with
+      two *phases*, told apart by where the ``$/coq/fileProgress`` frontier
+      sits relative to the op's *point* (the pretac position; ``None`` for a
+      pure document check).  rocq-lsp drives the frontier to the point, then —
+      for a pretac op — runs the speculative command there (no further
+      progress).  So:
+
+      * **Elaborate phase** (frontier below the point): no advance for
+        ``stall_window`` seconds → the current sentence is diverging → set
+        *stall_event*.  Bounds *per-sentence* wall-clock, so an honestly long
+        check that keeps progressing is never killed, and the frontier
+        pinpoints the culprit.
+      * **Command phase** (frontier reached the point, or no frontier yet on a
+        warm/cached op): no result for ``command_window`` seconds → the
+        speculative command is diverging → set *command_event*.
+
+      ``op_start`` seeds the baseline so a first-sentence divergence (before
+      any progress) is still caught; the frontier freezes when it reaches the
+      point, so the same "time since last activity" measures the command's
+      wall-clock during the command phase.
 
     ``get_process`` returns the subprocess-like object (with a ``.pid``)
     to watch, or ``None`` if it is not yet spawned.  ``on_rss`` (if
@@ -1098,18 +1163,53 @@ async def _memory_watchdog(
                     timeout_event.set()
                 main_task.cancel()
                 return
-            # Progress-stall backstop: the per-sentence-aware counterpart to the
-            # hard deadline.  The frontier advances once per sentence (before it
-            # is elaborated), so no advance for stall_window seconds means the
-            # current sentence is diverging.  Seed from op_start so a first-
-            # sentence divergence (before any progress) still trips.
-            if stall_window is not None and get_progress is not None:
+            # Frontier-anchored stall backstop, in two phases told apart by the
+            # frontier's position relative to the point (see docstring).  The
+            # frontier advances once per sentence (before it is elaborated) and
+            # freezes when it reaches the point, so "now - last_activity"
+            # measures per-sentence wall-clock while elaborating and the
+            # command's wall-clock once the pretac is running.  Seed from
+            # op_start so a first-sentence divergence (before any progress)
+            # still trips.
+            if get_progress is not None and (
+                stall_window is not None or command_window is not None
+            ):
                 prog = get_progress()
+                # Defensive: last_progress() returns a (ts, line, char) tuple or
+                # None; anything else (e.g. an unconfigured mock) is treated as
+                # "no progress" so a malformed signal can never crash the
+                # watchdog and silently disable the kill backstops.
+                if not (
+                    isinstance(prog, tuple)
+                    and len(prog) == 3
+                    and isinstance(prog[0], (int, float))
+                ):
+                    prog = None
                 base = op_start if op_start is not None else 0.0
                 last_activity = prog[0] if (prog and prog[0] >= base) else base
-                if time.monotonic() - last_activity > stall_window:
-                    if stall_event is not None:
-                        stall_event.set()
+                # Command phase: a pretac op whose elaboration has reached the
+                # point -- frontier at/after it, or no frontier yet (a warm /
+                # cached op whose prefix needed no checking).  Else elaborate.
+                in_command = command_window is not None and (
+                    prog is None or point is None or (prog[1], prog[2]) >= point
+                )
+                # NB: a distinct local (not ``event``, which is the memory
+                # event) -- rebinding ``event`` here would make the RSS-breach
+                # ``event.set()`` below fire the wrong watchdog.
+                if in_command:
+                    window, frontier_event = command_window, command_event
+                elif stall_window is not None:
+                    window, frontier_event = stall_window, stall_event
+                else:
+                    # Pretac op with no per-sentence (elaborate) bound: the
+                    # command window also covers elaboration, so a diverging
+                    # prefix sentence still can't hang the blocked op (reported
+                    # as command_timeout -- less precise than the sentence, but
+                    # never a silent hang).
+                    window, frontier_event = command_window, command_event
+                if window is not None and time.monotonic() - last_activity > window:
+                    if frontier_event is not None:
+                        frontier_event.set()
                     main_task.cancel()
                     return
             process = get_process()
@@ -1166,6 +1266,10 @@ async def _run_with_lsp(
     workspace: str,
     key: str | None = None,
     sentence_timeout: float | None = None,
+    command_timeout: float | None = None,
+    command_text: str | None = None,
+    command_count: int = 1,
+    point: tuple[int, int] | None = None,
 ) -> Any:
     """Run *fn(checker)* against one coq-lsp session with a memory watchdog.
 
@@ -1192,9 +1296,22 @@ async def _run_with_lsp(
     (``None`` uses the global ``ROCQ_SENTENCE_TIMEOUT``).  When it is > 0 the
     progress-stall watchdog is armed at ``sentence_timeout +
     ROCQ_PROGRESS_GRACE``: if coq-lsp stops reporting ``$/coq/fileProgress``
-    for that long, the current sentence is diverging non-cooperatively and the
-    session is killed+restarted with a ``stall_timeout`` envelope naming the
-    sentence (see :func:`_build_lsp_stall_timeout_response`).
+    for that long while *elaborating*, the current sentence is diverging
+    non-cooperatively and the session is killed+restarted with a
+    ``stall_timeout`` envelope naming the sentence (see
+    :func:`_build_lsp_stall_timeout_response`).
+
+    *command_timeout* marks a *pretac* op (one that runs a speculative
+    ``proof/goals`` command at *point* -- rocq_step / _multi / rocq_query /
+    rocq_assumptions).  It arms the *command* phase of the same watchdog at
+    ``command_count * command_timeout + ROCQ_PROGRESS_GRACE`` (``command_count``
+    > 1 for the rocq_step_multi batch): once the frontier reaches *point* the
+    speculative command is running, and if it ignores Coq's interrupt for that
+    long the session is killed+restarted with a ``command_timeout`` envelope
+    naming *command_text* (see :func:`_build_lsp_command_timeout_response`).
+    The single watchdog switches between the two phases by where the frontier
+    sits relative to *point*, so elaboration and the command are bounded
+    independently within one op.
     """
     if key is None:
         key = _session_key(workspace)
@@ -1215,12 +1332,14 @@ async def _run_with_lsp(
     mem_event = asyncio.Event()
     timeout_event = asyncio.Event()
     stall_event = asyncio.Event()
+    command_event = asyncio.Event()
     deadline = (
         time.monotonic() + ROCQ_HARD_TIMEOUT if ROCQ_HARD_TIMEOUT > 0 else None
     )
-    # Progress-stall window = per-sentence budget + grace.  Active only when
-    # the effective sentence_timeout > 0 (it is the per-sentence bound the
-    # grace extends); 0 leaves the blunt ROCQ_HARD_TIMEOUT as the only backstop.
+    # Elaborate-phase (per-sentence) window = sentence budget + grace.  Active
+    # when the effective sentence_timeout > 0 (the per-sentence bound the grace
+    # extends); 0 leaves the blunt ROCQ_HARD_TIMEOUT as the only elaborate-phase
+    # backstop.
     eff_sentence_timeout = (
         ROCQ_SENTENCE_TIMEOUT if sentence_timeout is None else sentence_timeout
     )
@@ -1229,10 +1348,17 @@ async def _run_with_lsp(
         if eff_sentence_timeout > 0
         else None
     )
+    # Command-phase window for a pretac op = (batch-aware) command budget +
+    # grace; bounds the speculative command once the frontier reaches *point*.
+    command_window = (
+        command_count * command_timeout + ROCQ_PROGRESS_GRACE
+        if command_timeout and command_timeout > 0
+        else None
+    )
     # Fresh per-op progress baseline so a stall is attributed to THIS op's
     # checking frontier, not one left over from a prior call on the warm
-    # session.  Guarded so it is a no-op when the stall watchdog is disabled.
-    if stall_window is not None:
+    # session.  No-op when neither frontier watchdog phase is armed.
+    if stall_window is not None or command_window is not None:
         reset = getattr(checker, "reset_progress", None)
         if reset is not None:
             reset()
@@ -1248,6 +1374,9 @@ async def _run_with_lsp(
             get_progress=getattr(checker, "last_progress", None),
             stall_window=stall_window,
             stall_event=stall_event,
+            command_window=command_window,
+            command_event=command_event,
+            point=point,
             op_start=_t0,
         )
     )
@@ -1292,6 +1421,15 @@ async def _run_with_lsp(
             )
             return _build_lsp_stall_timeout_response(
                 lifespan_state, tool, key, prog, stall_window
+            )
+        if command_event.is_set():
+            dlog.event(
+                "op", "lsp_op.command_timeout", tool=tool, key=key,
+                duration_s=round(time.monotonic() - _t0, 6),
+                command_window_s=command_window,
+            )
+            return _build_lsp_command_timeout_response(
+                lifespan_state, tool, key, command_text, command_window
             )
         dlog.event(
             "op", "lsp_op.cancelled", tool=tool, key=key,
@@ -1600,18 +1738,15 @@ async def rocq_query(
         include_warnings: If True (default), include all feedback returned
             by the query.  If False, drop entries at LSP Warning severity
             so warning noise does not crowd out tool output.
-        timeout: Per-call timeout in seconds for expensive computations
-            like ``Time Eval vm_compute in ...``.  ``0`` (default) means
-            use the default op timeout.  Clamped to ``ROCQ_QUERY_TIMEOUT_CAP``
-            (default 300s); when clamping fires the response includes
-            ``clamped_timeout: <cap>``.
+        timeout: Per-call coq-side budget (seconds) for expensive computations
+            like ``Time Eval vm_compute in ...``.  ``0`` (default) uses the
+            built-in default.  Uncapped.  In **position mode** it is the
+            per-command budget (default op timeout); in **whole-file / preamble
+            mode** the per-sentence budget for the document check (default the
+            global ``ROCQ_SENTENCE_TIMEOUT``).  Either way the op blocks and a
+            non-cooperative divergence is killed at this + ``ROCQ_PROGRESS_GRACE``.
     """
-    effective_timeout: int | None
-    if timeout and timeout > 0:
-        effective_timeout = min(timeout, ROCQ_QUERY_TIMEOUT_CAP)
-    else:
-        effective_timeout = None
-    clamped = effective_timeout is not None and timeout > ROCQ_QUERY_TIMEOUT_CAP
+    effective_timeout = float(timeout) if timeout and timeout > 0 else None
 
     workspace = workspace or _find_project_root_from_file(file_path) or ROCQ_WORKSPACE
 
@@ -1640,8 +1775,6 @@ async def rocq_query(
         line=line,
         character=character,
     )
-    if clamped:
-        result["clamped_timeout"] = ROCQ_QUERY_TIMEOUT_CAP
     return _attach_stale_warning(result, file_path, workspace, ctx.lifespan_context)
 
 
@@ -1956,9 +2089,13 @@ async def rocq_step(
     On success returns ``goals`` -- a list of ``{hyps, conclusion}``
     objects, empty when no foreground goals remain.
     If Coq rejects the block, returns ``{success: False, reason:
-    "tactic_failed", error: <coq message>}``.  If the block exceeds the timeout, returns
-    ``{success: False, reason: "timeout"}`` (coq-lsp keeps computing it in
-    the background until the next call preempts it).
+    "tactic_failed", error: <coq message>}``.  A *cooperative* slow block is
+    aborted coq-side at ``timeout`` and returns ``{success: False, reason:
+    "timeout"}`` with the session left warm.  A *non-cooperative* block (one
+    that ignores Coq's interrupt) is killed after ``timeout +
+    ROCQ_PROGRESS_GRACE`` -- coq-lsp is restarted and the call returns
+    ``{success: False, reason: "command_timeout", lsp_restarted: True,
+    diverging_command: <tactics>}``.
 
     Args:
         file_path: Path to the .v file (relative to workspace).
@@ -1967,7 +2104,9 @@ async def rocq_step(
         tactics: A tactic block to run speculatively (e.g. "intros n m.
             induction n.").
         workspace: Workspace directory (auto-detected from *file_path* if omitted).
-        timeout: Per-call timeout in seconds (0 = default op timeout).
+        timeout: Per-call coq-side command budget in seconds (0 = the default
+            per-command budget); a non-cooperative block is killed at this +
+            ROCQ_PROGRESS_GRACE.
         include_warnings: Include severity-2 warnings in any block output.
         before: Run from the state *before* the sentence at the point
             (default True) -- in place of it; False runs from the state
@@ -2025,7 +2164,12 @@ async def rocq_step_multi(
     rocq_get_state).  Per block: success -> ``{tactics, goals}``;
     Coq rejection -> ``{tactics, success: False,
     reason: "tactic_failed", error}``; timeout -> ``{tactics, success:
-    False, reason: "timeout", error}`` (the batch still runs to the end).
+    False, reason: "timeout", error}`` (a cooperative block aborted coq-side;
+    the batch still runs to the end).  A *non-cooperative* block (ignoring
+    Coq's interrupt) cannot be aborted per-block: it is killed after the
+    batch's wall-clock budget (``len(tactics) * timeout + ROCQ_PROGRESS_GRACE``)
+    and the whole call returns ``{success: False, reason: "command_timeout",
+    lsp_restarted: True}``.
 
     Useful for an automation battery without committing any of it::
 
@@ -2037,7 +2181,8 @@ async def rocq_step_multi(
         character: 0-based character offset to run each block from.
         tactics: List of tactic blocks to try (max 20).
         workspace: Workspace directory (auto-detected from *file_path* if omitted).
-        timeout: Per-call timeout in seconds (0 = default op timeout).
+        timeout: Per-block coq-side command budget in seconds (0 = the default
+            per-command budget).
         include_warnings: Include severity-2 warnings in any block output.
         before: Run from the state *before* the sentence at the point
             (default True) -- in place of it; False runs from the state
@@ -2110,8 +2255,12 @@ async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
       - **coq-lsp transport**: ``"timeout"``, ``"crashed"``,
         ``"memory_exhausted"``, ``"hard_timeout"`` (the ``ROCQ_HARD_TIMEOUT``
         backstop tripped; coq-lsp was killed + restarted), ``"stall_timeout"``
-        (no checking progress for ``sentence_timeout + ROCQ_PROGRESS_GRACE`` --
-        a diverging sentence; coq-lsp killed + restarted), ``"unavailable"``.
+        (elaborate phase: no checking progress for ``sentence_timeout +
+        ROCQ_PROGRESS_GRACE`` -- a diverging sentence; coq-lsp killed +
+        restarted), ``"command_timeout"`` (command phase, for rocq_step /
+        _multi / rocq_query / rocq_assumptions: a speculative command ignored
+        Coq's interrupt for the command budget + ``ROCQ_PROGRESS_GRACE``;
+        coq-lsp killed + restarted), ``"unavailable"``.
       - **Validation / lookup** (set by tools): ``"validation"``,
         ``"not_found"`` (e.g. rocq_assumptions on a typo).
       - **Tactic rejected** (rocq_step / rocq_step_multi): ``"tactic_failed"``.

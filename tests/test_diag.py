@@ -283,6 +283,7 @@ class TestExtraValidationRecording:
                 "memory_exhausted",
                 "hard_timeout",
                 "stall_timeout",
+                "command_timeout",
                 "lock_contended",
                 "unavailable",
                 "validation",

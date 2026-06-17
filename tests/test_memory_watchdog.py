@@ -229,6 +229,62 @@ class TestWatchdogCoroutine:
         )
         assert not stall.is_set()
 
+    @pytest.mark.asyncio
+    async def test_watchdog_command_phase_fires_at_point(self, monkeypatch):
+        """Frontier at/after the point -> command phase: command_event fires
+        (not stall) when the frozen frontier exceeds the command window."""
+        _patch_psutil_rss(monkeypatch, 10)
+
+        checker = _FakeLspChecker()
+        stall = asyncio.Event()
+        cmd = asyncio.Event()
+
+        async def work():
+            await asyncio.sleep(10)
+
+        main_task = asyncio.create_task(work())
+        t0 = time.monotonic()
+        await _server._memory_watchdog(
+            100_000, main_task, asyncio.Event(),
+            get_process=lambda: checker._process,
+            get_progress=lambda: (t0, 5, 0),  # frozen frontier at line 5
+            stall_window=10.0, stall_event=stall,         # large: must NOT fire
+            command_window=0.05, command_event=cmd,       # small: fires
+            point=(5, 0), op_start=t0,                    # frontier >= point
+        )
+        assert cmd.is_set()
+        assert not stall.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            await main_task
+
+    @pytest.mark.asyncio
+    async def test_watchdog_elaborate_phase_uses_stall(self, monkeypatch):
+        """Frontier below the point -> elaborate phase: stall_event fires (not
+        command) for a pretac op still checking its prefix."""
+        _patch_psutil_rss(monkeypatch, 10)
+
+        checker = _FakeLspChecker()
+        stall = asyncio.Event()
+        cmd = asyncio.Event()
+
+        async def work():
+            await asyncio.sleep(10)
+
+        main_task = asyncio.create_task(work())
+        t0 = time.monotonic()
+        await _server._memory_watchdog(
+            100_000, main_task, asyncio.Event(),
+            get_process=lambda: checker._process,
+            get_progress=lambda: (t0, 2, 0),  # frozen frontier at line 2
+            stall_window=0.05, stall_event=stall,         # small: fires
+            command_window=10.0, command_event=cmd,       # large: must NOT fire
+            point=(9, 0), op_start=t0,                    # frontier < point
+        )
+        assert stall.is_set()
+        assert not cmd.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            await main_task
+
 
 # ---------------------------------------------------------------------------
 # coq-lsp watchdog (ROCQ_MAX_LSP_RSS_MB)
@@ -310,6 +366,41 @@ class TestLspMemoryWatchdogBreach:
             and e.get("tool") == "rocq_compile_lsp"
             for e in ls["recent_errors"]
         )
+
+    @pytest.mark.asyncio
+    async def test_rss_breach_with_frontier_armed_is_memory_not_stall(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression: an RSS breach must report ``memory_exhausted`` even when
+        the stall watchdog is armed.  The frontier branch rebound the shared
+        ``event`` local, so the RSS-breach ``event.set()`` fired the *stall*
+        watchdog -> a memory breach was mis-reported as ``stall_timeout``."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 100)
+        monkeypatch.setattr(_server, "ROCQ_HARD_TIMEOUT", 0.0)
+        monkeypatch.setattr(_server, "ROCQ_SENTENCE_TIMEOUT", 120.0)  # stall armed
+        monkeypatch.setattr(_server, "ROCQ_PROGRESS_GRACE", 120.0)
+        _patch_psutil_rss(monkeypatch, 500)  # 500 MB > 100 MB cap
+
+        vfile = tmp_path / "probe.v"
+        vfile.write_text("Theorem t : True. Proof. exact I. Qed.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()
+        # A live (advancing) frontier -> stall would never fire on its own; the
+        # only trigger is the RSS breach, which must report memory_exhausted.
+        checker.last_progress = lambda: (time.monotonic(), 0, 0)
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
+
+        ctx = _MockLspContext(ls)
+        result = await rocq_compile_lsp(
+            file_path=str(vfile), workspace=str(tmp_path), ctx=ctx
+        )
+        assert result["success"] is False
+        assert result["reason"] == "memory_exhausted"  # not "stall_timeout"
+        assert result["lsp_restarted"] is True
 
     @pytest.mark.asyncio
     async def test_low_lsp_rss_does_not_abort(self, tmp_path, monkeypatch):
@@ -549,6 +640,146 @@ class TestLspProgressStall:
         assert "lsp_restarted" not in result
         assert pool_checker(ls, workspace=str(tmp_path), file_path=str(vfile)) is checker
         assert not checker.stop.called
+
+
+_TIMEOUT_ENVELOPE = {"_lsp_error": "proof/goals timed out", "_lsp_timeout": True}
+
+
+class _GoalsChecker:
+    """Stand-in driving the pretac path (``checker.goals``).  *block* seconds
+    per call stands in for a non-cooperative command that ignores the
+    interrupt; *answer* is what a returning call yields.  ``last_progress``
+    returns a frozen frontier at/after the point so the watchdog is in the
+    command phase.  ``_process = None`` keeps the RSS watchdog idle."""
+
+    _process = None
+
+    def __init__(self, block=0.0, answer=None, frontier=(5, 0)):
+        self._block = block
+        self._answer = answer or {
+            "goals": {"goals": [], "shelf": [], "given_up": []}, "messages": []
+        }
+        self._frontier = frontier
+        self._t = time.monotonic()
+        self.events: list[str] = []
+
+    def _is_alive(self):
+        return True
+
+    def trim_caches(self):
+        pass
+
+    def last_progress(self):
+        # Frozen frontier at/after the point -> command phase.
+        return (self._t, self._frontier[0], self._frontier[1])
+
+    def reset_progress(self):
+        self._t = time.monotonic()
+
+    def goals(self, *a, **kw):
+        if self._block:
+            time.sleep(self._block)
+        return self._answer
+
+    def force_kill(self):
+        self.events.append("force_kill")
+
+    def stop(self):
+        self.events.append("stop")
+
+
+class TestLspCommandTimeout:
+    """The command phase kills + restarts coq-lsp when a speculative
+    proof/goals command (the pretac tools) ignores Coq's interrupt for the
+    command budget + ROCQ_PROGRESS_GRACE.  A *cooperative* command (aborted
+    coq-side at the budget) must NOT be killed."""
+
+    @pytest.mark.asyncio
+    async def test_step_command_timeout_kills_and_names(self, tmp_path, monkeypatch):
+        """A blocking (non-cooperative) step pretac at/after the point ->
+        command_timeout + lsp_restarted + diverging_command, killed fast."""
+        from rocq_mcp.interactive import run_step
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 100_000)
+        monkeypatch.setattr(_server, "ROCQ_HARD_TIMEOUT", 0.0)
+        monkeypatch.setattr(_server, "ROCQ_SENTENCE_TIMEOUT", 0.0)
+        monkeypatch.setattr(_server, "ROCQ_PROGRESS_GRACE", 0.03)
+        _patch_psutil_rss(monkeypatch, 10)
+
+        (tmp_path / "t.v").write_text("Theorem t : True.\nProof.\nidtac.\nQed.\n")
+        # command_window = 1 * op_timeout + grace = 0.02 + 0.03 = 0.05 s
+        ls = make_lifespan_state(op_timeout=0.02, full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _GoalsChecker(block=0.5, frontier=(2, 0))  # frontier == point
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path="t.v")
+
+        t0 = time.monotonic()
+        r = await run_step(
+            file_path="t.v", line=2, character=0, tactics="do 99999 idtac.",
+            workspace=str(tmp_path), lifespan_state=ls,
+        )
+        elapsed = time.monotonic() - t0
+
+        assert r["success"] is False
+        assert r["reason"] == "command_timeout"
+        assert r["lsp_restarted"] is True
+        assert r["diverging_command"] == "do 99999 idtac."
+        assert "do 99999 idtac." in r["error"]
+        assert elapsed < 0.4, f"did not abort at the window (took {elapsed:.2f}s)"
+        assert checker.events == ["force_kill", "stop"]
+        assert pool_checker(ls, workspace=str(tmp_path), file_path="t.v") is None
+        assert any(
+            e.get("reason") == "command_timeout" and e.get("tool") == "rocq_step"
+            for e in ls["recent_errors"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_step_cooperative_timeout_not_killed(self, tmp_path, monkeypatch):
+        """A command aborted coq-side at the budget returns reason "timeout"
+        with the session warm -- the command phase does not fire."""
+        from rocq_mcp.interactive import run_step
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 100_000)
+        monkeypatch.setattr(_server, "ROCQ_HARD_TIMEOUT", 0.0)
+        monkeypatch.setattr(_server, "ROCQ_SENTENCE_TIMEOUT", 0.0)
+        monkeypatch.setattr(_server, "ROCQ_PROGRESS_GRACE", 0.03)
+        _patch_psutil_rss(monkeypatch, 10)
+
+        (tmp_path / "t.v").write_text("Theorem t : True.\nProof.\nidtac.\nQed.\n")
+        ls = make_lifespan_state(op_timeout=0.02, full=True)
+        ls["workspace"] = str(tmp_path)
+        # Returns a coq-side timeout envelope at once (no block) -> cooperative.
+        checker = _GoalsChecker(block=0.0, answer=dict(_TIMEOUT_ENVELOPE))
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path="t.v")
+
+        r = await run_step(
+            file_path="t.v", line=2, character=0, tactics="auto.",
+            workspace=str(tmp_path), lifespan_state=ls,
+        )
+        assert r["success"] is False
+        assert r["reason"] == "timeout"  # NOT command_timeout
+        assert "lsp_restarted" not in r
+        assert checker.events == []  # not killed
+        assert pool_checker(ls, workspace=str(tmp_path), file_path="t.v") is checker
+
+
+def test_build_command_timeout_response():
+    """_build_lsp_command_timeout_response: kills the session, names the command."""
+    ls = make_lifespan_state(full=True)
+    checker = MagicMock()
+    ls["lsp_pool"]["k"] = checker
+
+    r = _server._build_lsp_command_timeout_response(
+        ls, "rocq_step", "k", "do 9999999 idtac.", 0.05
+    )
+    assert r["success"] is False
+    assert r["reason"] == "command_timeout"
+    assert r["lsp_restarted"] is True
+    assert r["diverging_command"] == "do 9999999 idtac."
+    assert "do 9999999 idtac." in r["error"]
+    assert checker.force_kill.called and checker.stop.called
+    assert "k" not in ls["lsp_pool"]
+    assert any(e.get("reason") == "command_timeout" for e in ls["recent_errors"])
 
 
 def test_progress_frontier_parsing():

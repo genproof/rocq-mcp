@@ -266,9 +266,12 @@ def _lsp_query_at_position(
         command=cmd,
         command_timeout=timeout,
         pp_format="Str",
-        timeout=timeout + _COMMAND_TIMEOUT_GRACE,
-        # Bound each sentence on the way to the point coq-lsp-side (the pretac
-        # itself is bounded by command_timeout above); global
+        # Block (no client-side give-up): a cooperative command is aborted
+        # coq-side by command_timeout above; a non-cooperative one is killed by
+        # the watchdog's command phase in _run_with_lsp (command budget + grace)
+        # instead of being abandoned as a background zombie.
+        timeout=0,
+        # Bound each sentence on the way to the point coq-lsp-side; global
         # ROCQ_SENTENCE_TIMEOUT, 0 = off.
         sentence_timeout=_server.ROCQ_SENTENCE_TIMEOUT,
     )
@@ -475,8 +478,12 @@ async def run_query(
     answers the instant the check reaches the point -- no truncated scratch
     copy, no re-elaboration of the (possibly slow) proof prefix.  When
     ``include_warnings=False``, severity-2 warnings are dropped.
-    ``timeout`` falls back to ``lifespan_state["op_timeout"]``; the MCP
-    wrapper applies ``ROCQ_QUERY_TIMEOUT_CAP``.
+
+    ``timeout`` means different things per mode: in **position mode** it is the
+    per-command budget for the pretac (default ``lifespan_state["op_timeout"]``),
+    and in **whole-file / preamble mode** it is the per-sentence budget for the
+    document check (default the global ``ROCQ_SENTENCE_TIMEOUT``).  Either way
+    the op blocks and the watchdog bounds it -- there is no client-side give-up.
     """
     pos_mode = line is not None or character is not None
     if pos_mode and not file_path:
@@ -510,8 +517,17 @@ async def run_query(
         if err:
             return err
 
+    # Position mode runs the command as a *pretac*: *timeout* is the per-command
+    # budget (default op_timeout), bounded by the watchdog's command phase.
     _q_timeout = (
         float(timeout) if timeout else float(lifespan_state.get("op_timeout", 30.0))
+    )
+    # Whole-file / preamble mode is a *document check* (the command is appended
+    # as a sentence), so -- like rocq_compile_lsp -- it blocks and the watchdog's
+    # stall phase bounds it; *timeout* is then the per-sentence budget (default
+    # the global ROCQ_SENTENCE_TIMEOUT), with no op_timeout client-side give-up.
+    _doc_sentence_timeout = (
+        float(timeout) if timeout and timeout > 0 else _server.ROCQ_SENTENCE_TIMEOUT
     )
 
     def _do_lsp(checker: Any) -> dict[str, Any]:
@@ -552,20 +568,39 @@ async def run_query(
             context_text=context_text,
             command=command,
             workspace=workspace,
-            timeout=_q_timeout,
+            # Block (no client-side give-up): the stall watchdog in
+            # _run_with_lsp (sentence budget + grace) bounds the check and
+            # kills+restarts a non-cooperative sentence, exactly like
+            # rocq_compile_lsp.
+            timeout=0,
             include_warnings=include_warnings,
             max_results=max_results,
-            sentence_timeout=_server.ROCQ_SENTENCE_TIMEOUT,
+            sentence_timeout=_doc_sentence_timeout,
         )
 
     # File / position mode get a per-file session (parallel with other
     # files); preamble mode shares the per-workspace scratch session.
+    # Position mode runs a speculative pretac at (line, character): arm the
+    # watchdog's command phase (kill+restart if the command ignores the
+    # interrupt).  Preamble / whole-file mode is a document check (the command
+    # is elaborated as a sentence), so it stays on the stall phase only.
+    pretac_point = (
+        (line, character)
+        if pos_mode and line is not None and character is not None
+        else None
+    )
     return await _server._run_with_lsp(
         _do_lsp,
         lifespan_state,
         "rocq_query",
         workspace=workspace,
         key=_server._session_key(workspace, file_path or None),
+        command_timeout=_q_timeout if pretac_point is not None else None,
+        command_text=command if pretac_point is not None else None,
+        point=pretac_point,
+        # Document-check modes arm the stall watchdog at the (possibly
+        # per-call) sentence budget; position mode uses the global default.
+        sentence_timeout=None if pretac_point is not None else _doc_sentence_timeout,
     )
 
 
@@ -1238,12 +1273,6 @@ def _position_timeout(lifespan_state: dict[str, Any], timeout: float | None) -> 
     return float(lifespan_state.get("op_timeout", 30.0))
 
 
-# Extra seconds given to the LSP round-trip over the Coq-side command budget,
-# so Coq's own timeout fires first and replies before our deadline (keeping
-# the session responsive) rather than us giving up while it keeps computing.
-_COMMAND_TIMEOUT_GRACE: float = 5.0
-
-
 def _is_coq_timeout(message: Any) -> bool:
     """True if an error is one of our wall-clock timeouts (vs an ordinary
     failure).
@@ -1301,7 +1330,12 @@ async def run_get_state(
     except (ValueError, FileNotFoundError) as e:
         return _server._fail(lifespan_state, "rocq_get_state", str(e))
 
-    _t = _position_timeout(lifespan_state, timeout)
+    # rocq_get_state is a pure elaborate-and-read op (no pretac): block
+    # (timeout=0) by default and let the watchdog's elaborate-phase stall
+    # (ROCQ_SENTENCE_TIMEOUT + grace) bound the drive to the point -- a
+    # diverging prefix sentence is killed + restarted (stall_timeout), not
+    # abandoned.  An explicit *timeout* > 0 still imposes a client-side wait.
+    _t = float(timeout) if timeout and timeout > 0 else 0.0
 
     def _do(checker: Any) -> dict[str, Any]:
         answer = checker.goals(
@@ -1311,8 +1345,9 @@ async def run_get_state(
             mode=_goals_mode(before),
             timeout=_t,
             # Bound each sentence on the way to the point coq-lsp-side (global
-            # ROCQ_SENTENCE_TIMEOUT, 0 = off), so a slow/diverging sentence
-            # before it is aborted in Coq instead of only by the Python wait.
+            # ROCQ_SENTENCE_TIMEOUT), so a cooperative slow sentence before it
+            # is aborted in Coq; a non-cooperative one is caught by the stall
+            # watchdog in _run_with_lsp.
             sentence_timeout=_server.ROCQ_SENTENCE_TIMEOUT,
         )
         kind, payload = _classify_goals_answer(answer)
@@ -1564,14 +1599,16 @@ async def run_step(
 
     def _do(checker: Any) -> dict[str, Any]:
         _start = time.monotonic()
-        # coq-lsp/Coq bounds the speculative block with a single wall-clock
-        # budget (*_t*) and aborts a slow/diverging tactic itself -- so the
-        # session stays responsive.  Give the LSP round-trip a little extra
-        # so Coq's timeout fires first and replies before our own deadline.
+        # Coq bounds the speculative block with a wall-clock budget (*_t*) and
+        # aborts a *cooperative* slow/diverging tactic itself ("Timeout!"), so
+        # the session stays warm.  Block here (timeout=0) rather than give up:
+        # a *non-cooperative* tactic that ignores the interrupt is killed by the
+        # watchdog's command phase in _run_with_lsp (_t + grace) instead of
+        # being abandoned as a background zombie.
         answer = checker.goals(
             resolved, line, character, command=tactics,
             command_timeout=_t, mode=_goals_mode(before),
-            timeout=_t + _COMMAND_TIMEOUT_GRACE,
+            timeout=0,
             sentence_timeout=_server.ROCQ_SENTENCE_TIMEOUT,
         )
         elapsed_s = round(time.monotonic() - _start, 3)
@@ -1628,6 +1665,9 @@ async def run_step(
         "rocq_step",
         workspace=workspace,
         key=_server._session_key(workspace, file_path),
+        command_timeout=_t,
+        command_text=tactics,
+        point=(line, character),
     )
 
 
@@ -1684,13 +1724,16 @@ async def run_step_multi(
         for tac in tactics:
             entry: dict[str, Any] = {"tactics": tac}
             _start = time.monotonic()
-            # Coq bounds each block with its own wall-clock budget and aborts
-            # a slow/diverging one itself, so the next block is never blocked
-            # behind a runaway computation.
+            # Coq bounds each block with its own wall-clock budget and aborts a
+            # *cooperative* slow/diverging one itself ("Timeout!"), so the next
+            # block is never blocked behind it.  Block here (timeout=0): a
+            # *non-cooperative* block that ignores the interrupt is killed by the
+            # watchdog's command phase in _run_with_lsp, whose window scales with
+            # the batch (command_count * _t + grace).
             answer = checker.goals(
                 resolved, line, character, command=tac,
                 command_timeout=_t, mode=_goals_mode(before),
-                timeout=_t + _COMMAND_TIMEOUT_GRACE,
+                timeout=0,
                 sentence_timeout=_server.ROCQ_SENTENCE_TIMEOUT,
             )
             entry["elapsed_s"] = round(time.monotonic() - _start, 3)
@@ -1738,6 +1781,10 @@ async def run_step_multi(
         "rocq_step_multi",
         workspace=workspace,
         key=_server._session_key(workspace, file_path),
+        command_timeout=_t,
+        command_text=" | ".join(tactics),
+        command_count=len(tactics),
+        point=(line, character),
     )
 
 
