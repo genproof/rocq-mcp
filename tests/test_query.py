@@ -510,26 +510,23 @@ from tests.conftest import _MockContext
 
 
 class TestQueryTimeoutRunQuery:
-    """run_query bakes the resolved budget into the coq-lsp check.
+    """run_query forwards the resolved per-command budget into the pretac.
 
-    Whole-file / preamble mode appends the command to a scratch document and
-    checks it via ``LspChecker.check_content`` (under ``_run_with_lsp``).  Like
-    rocq_compile_lsp the check now **blocks** (``timeout=0`` -- no client-side
-    give-up); the per-call budget is forwarded as the ``sentence_timeout``
-    instead, and the watchdog's stall phase bounds the check.  ``None`` resolves
-    to the global ``ROCQ_SENTENCE_TIMEOUT``; an explicit value passes through.
+    Every mode runs the command as a single ``proof/goals`` pretac.  *timeout*
+    (default the lifespan ``op_timeout``) is forwarded as the goals
+    ``command_timeout`` (the per-command budget); the goals client wait is 0 --
+    it blocks, and the watchdog's command phase bounds it (no give-up).
     """
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "timeout_arg,expected_sentence",
-        [(None, 120.0), (60, 60.0)],
+        "timeout_arg,expected",
+        [(None, 30.0), (60, 60.0)],
         ids=["default-none", "explicit-60"],
     )
-    async def test_doc_check_blocks_and_forwards_sentence_budget(
-        self, monkeypatch, tmp_path, timeout_arg, expected_sentence
+    async def test_command_budget_forwarded(
+        self, monkeypatch, tmp_path, timeout_arg, expected
     ):
-        monkeypatch.setattr(_server, "ROCQ_SENTENCE_TIMEOUT", 120.0)
         captured: dict = {}
 
         class _FakeChecker:
@@ -538,19 +535,14 @@ class TestQueryTimeoutRunQuery:
             def _is_alive(self):
                 return True
 
-            def check_content(
-                self, path, content, workspace="", timeout=0, wait_full=False,
+            def goals(
+                self, file_path, line, character, *, content=None, command=None,
+                command_timeout=None, pp_format="Str", mode=None, timeout=None,
                 sentence_timeout=0.0,
             ):
+                captured["command_timeout"] = command_timeout
                 captured["timeout"] = timeout
-                captured["sentence_timeout"] = sentence_timeout
-                return {
-                    "success": True,
-                    "errors": [],
-                    "warnings": [],
-                    "info": [],
-                    "timed_out": False,
-                }
+                return {"pretac_messages": [{"range": None, "level": 3, "text": "nat : Set"}]}
 
         state = {"op_timeout": 30.0, "lsp_pool": {}, "lsp_meta": {}}
         inject_checker(state, _FakeChecker(), workspace=str(tmp_path))
@@ -564,10 +556,10 @@ class TestQueryTimeoutRunQuery:
             **kwargs,
         )
         assert result["success"] is True
-        # Document check blocks (no op_timeout give-up); the budget is the
-        # per-sentence timeout instead.
+        # The pretac is bounded by command_timeout (the budget); the goals
+        # client wait is 0 (blocks; the watchdog bounds it).
+        assert captured["command_timeout"] == expected
         assert captured["timeout"] == 0
-        assert captured["sentence_timeout"] == expected_sentence
 
 
 class TestRocqQueryTimeout:
@@ -649,10 +641,9 @@ class TestRocqQueryTimeout:
 class TestLspWarningSeverity:
     """coq-lsp warning severity flows through run_query's include_warnings.
 
-    run_query (file / preamble mode) runs a query by appending the
-    command to a scratch document and collecting the diagnostics it
-    produces: ``info`` (LSP severity 3) is always kept, ``warnings``
-    (severity 2) only when ``include_warnings=True``.  This pins that
+    run_query runs the command as a ``proof/goals`` pretac and collects its
+    ``pretac_messages``: ``info`` (LSP level 3) is always kept, ``warnings``
+    (level 2) only when ``include_warnings=True``.  This pins that
     severity-2 filter end-to-end on the coq-lsp engine.
 
     We trigger a *deterministic* deprecation warning by declaring a
@@ -706,3 +697,47 @@ class TestLspWarningSeverity:
         # The info result stays; the severity-2 deprecation warning is gone.
         assert "rocq_mcp_old" in result["output"]
         assert "deprecated" not in result["output"].lower()
+
+
+@pytest.mark.skipif(not COQLSP_AVAILABLE, reason="coq-lsp not available")
+class TestLspWholeFileQuery:
+    """Whole-file query runs a single end-of-file pretac on the real file --
+    error-resilient and works on an empty file."""
+
+    @pytest.fixture
+    def lifespan_state(self):
+        state = _make_lifespan_state()
+        yield state
+        stop_all_checkers(state)
+
+    @pytest.mark.asyncio
+    async def test_empty_file_queries_base_env(self, tmp_path, lifespan_state):
+        """An empty .v file has no node for a pretac; the no-op context lets the
+        query resolve against the base environment instead of returning nothing."""
+        (tmp_path / "_CoqProject").write_text("-R . Top\n")
+        (tmp_path / "empty.v").write_text("")
+        result = await run_query(
+            command="Check nat.", preamble="", workspace=str(tmp_path),
+            lifespan_state=lifespan_state, file_path="empty.v",
+        )
+        assert result["success"] is True
+        assert "nat" in result["output"]
+
+    @pytest.mark.asyncio
+    async def test_whole_file_query_is_error_resilient(self, tmp_path, lifespan_state):
+        """A whole-file query resolves symbols even when the file has an
+        unrelated error elsewhere (the pretac runs against the recovered
+        end-state) -- both before and after the error."""
+        (tmp_path / "_CoqProject").write_text("-R . Top\n")
+        (tmp_path / "e.v").write_text(
+            "Definition good := 1.\n"
+            "Definition bad := nonexistent_xyz.\n"
+            "Definition after := 3.\n"
+        )
+        for name in ("good", "after"):
+            result = await run_query(
+                command=f"Check {name}.", preamble="", workspace=str(tmp_path),
+                lifespan_state=lifespan_state, file_path="e.v",
+            )
+            assert result["success"] is True, name
+            assert name in result["output"]

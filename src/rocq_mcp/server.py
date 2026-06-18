@@ -1738,13 +1738,12 @@ async def rocq_query(
         include_warnings: If True (default), include all feedback returned
             by the query.  If False, drop entries at LSP Warning severity
             so warning noise does not crowd out tool output.
-        timeout: Per-call coq-side budget (seconds) for expensive computations
-            like ``Time Eval vm_compute in ...``.  ``0`` (default) uses the
-            built-in default.  Uncapped.  In **position mode** it is the
-            per-command budget (default op timeout); in **whole-file / preamble
-            mode** the per-sentence budget for the document check (default the
-            global ``ROCQ_SENTENCE_TIMEOUT``).  Either way the op blocks and a
-            non-cooperative divergence is killed at this + ``ROCQ_PROGRESS_GRACE``.
+        timeout: Per-call coq-side command budget (seconds) for the query
+            pretac (e.g. ``Time Eval vm_compute in ...``).  ``0`` (default) uses
+            the default op timeout.  Uncapped.  All modes run the command as a
+            single ``proof/goals`` pretac (position at the point, file/preamble
+            at end-of-file), so the op blocks and a non-cooperative command is
+            killed at this + ``ROCQ_PROGRESS_GRACE``.
     """
     effective_timeout = float(timeout) if timeout and timeout > 0 else None
 

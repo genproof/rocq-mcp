@@ -28,16 +28,18 @@ class TestQueryIncludeWarnings:
             def _is_alive(self):
                 return True
 
-            def check_content(
-                self, path, content, workspace="", timeout=0, wait_full=False,
+            def goals(
+                self, file_path, line, character, *, content=None, command=None,
+                command_timeout=None, pp_format="Str", mode=None, timeout=None,
                 sentence_timeout=0.0,
             ):
+                # pretac feedback: the diagnostic ``severity`` is the LSP
+                # ``level`` (2 = warning, 3 = information).
                 return {
-                    "success": True,
-                    "errors": [],
-                    "warnings": [d for d in diags if d["severity"] == 2],
-                    "info": [d for d in diags if d["severity"] == 3],
-                    "timed_out": False,
+                    "pretac_messages": [
+                        {"range": None, "level": d["severity"], "text": d["message"]}
+                        for d in diags
+                    ],
                 }
 
         checker = MockChecker()

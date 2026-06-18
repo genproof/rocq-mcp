@@ -97,128 +97,26 @@ def _lsp_scratch_path(workspace: str) -> str:
     return str(Path(workspace).resolve() / f"rocq_mcp_scratch_{os.getpid()}.v")
 
 
-def _lsp_run_query(
-    checker: Any,
-    *,
-    lifespan_state: dict[str, Any],
-    tool: str,
-    context_text: str,
-    command: str,
-    workspace: str,
-    timeout: float,
-    include_warnings: bool = True,
-    max_results: int | None = None,
-    sentence_timeout: float = 0.0,
-) -> dict[str, Any]:
-    """Run a single query *command* in *context_text* via coq-lsp.
+# An empty preamble has no node for a pretac to run against; this no-op comment
+# keeps the scratch document non-empty so the query still resolves against the
+# base environment (see run_query, preamble mode).
+_EMPTY_QUERY_CONTEXT = "(* rocq_query context *)\n"
 
-    Builds ``context_text`` + the appended *command*, checks it, and
-    returns ``{"success": True, "output": <joined info messages>}`` or a
-    failure envelope (recorded in ``recent_errors`` via
-    :func:`_server._fail`, under *tool*).  Errors are attributed by line:
-    an error *before* the command line means the context (preamble /
-    file) failed to load; an error *at or after* it means the query
-    command itself was rejected (e.g. a misspelled reference) -- reported
-    with ``reason="crashed"`` so callers' not-found enrichment (see
-    :func:`run_assumptions`) kicks in.
 
-    Runs on the LSP worker thread (called via ``_run_with_lsp``).
+def _eof_point(content: str) -> tuple[int, int]:
+    """End-of-file ``(line, character)`` for *content* (0-indexed).
+
+    The query pretac runs here for file / preamble mode -- the document's
+    global end-state.  The character is capped to the position range.
     """
-    ctx = (
-        context_text + "\n"
-        if context_text and not context_text.endswith("\n")
-        else context_text
-    )
-    # 0-based line where the appended command begins.
-    append_line = ctx.count("\n")
-    cmd = command.strip()
-    if not cmd.endswith("."):
-        cmd += "."
-    content = ctx + cmd + "\n"
-
-    scratch = _lsp_scratch_path(workspace)
-    # wait_full=True: coq-lsp recovers from earlier errors and keeps going
-    # (max_errors=150), so the appended query's output only lands once the
-    # whole document is processed -- a short-circuit on the first error
-    # would miss it (and miss queries on symbols defined before that error).
-    result = checker.check_content(
-        scratch,
-        content,
-        workspace=workspace,
-        timeout=timeout,
-        wait_full=True,
-        # Bound each sentence coq-lsp-side (global ROCQ_SENTENCE_TIMEOUT, 0 =
-        # off) so a slow/diverging preamble or query sentence is aborted in Coq
-        # rather than only by the Python wait below.
-        sentence_timeout=sentence_timeout,
-    )
-
-    if result.get("timed_out"):
-        return _server._fail(
-            lifespan_state,
-            tool,
-            f"{tool} timed out after {timeout}s.",
-            "timeout",
-        )
-
-    errors = result.get("errors", [])
-    # coq-lsp is error-resilient: it processes the appended command even
-    # when an earlier sentence errored, so a query on a symbol defined
-    # before an unrelated error still resolves (it queries the
-    # partially-loaded file's end-state).  Precedence:
-    #   1. command itself errored          -> report that (e.g. typo'd name)
-    #   2. command produced output          -> success, even if the context
-    #                                          has unrelated errors elsewhere
-    #   3. no output but context errored     -> the upstream break prevented
-    #                                          the query from running
-    #   4. no output, no error              -> legitimately empty
-    cmd_errors = [e for e in errors if e["line"] >= append_line]
-    if cmd_errors:
-        msg = cmd_errors[0]["message"]
-        # A sentence_timeout abort on the query command surfaces as a
-        # "rocq-lsp: sentence timeout" error -- report it as a timeout.
-        reason = "timeout" if _is_coq_timeout(msg) else "crashed"
-        return _server._fail(lifespan_state, tool, msg, reason)
-
-    diags = list(result.get("info", []))
-    if include_warnings:
-        diags += result.get("warnings", [])
-    region = [d for d in diags if d["line"] >= append_line]
-    region.sort(key=lambda d: (d["line"], d["character"]))
-    messages = [d["message"] for d in region]
-
-    if not messages:
-        ctx_errors = [e for e in errors if e["line"] < append_line]
-        if ctx_errors:
-            first = ctx_errors[0]
-            return _server._fail(
-                lifespan_state,
-                tool,
-                "Context failed to load before the query could run "
-                f"(line {first['line']}): {first['message']}",
-                "crashed",
-            )
-
-    total_results = len(messages)
-    if max_results is not None and max_results > 0 and total_results > max_results:
-        messages = messages[:max_results]
-    output = "\n".join(messages)
-    if max_results is not None and max_results > 0 and total_results > max_results:
-        output += (
-            f"\n... ({total_results - max_results} more results, "
-            f"{total_results} total)"
-        )
-    if len(output) > _MAX_QUERY_OUTPUT:
-        output = (
-            output[:_MAX_QUERY_OUTPUT] + f"\n... (truncated, {len(output)} total chars)"
-        )
-    return {"success": True, "output": output or "(no output)"}
+    lines = content.split("\n")
+    return len(lines) - 1, min(len(lines[-1]), _MAX_LINE_CHAR_RANGE)
 
 
 # Message ``level`` is an LSP severity: 1=error, 2=warning, 3=information,
 # 4=hint (see ``Lang.Diagnostic.Severity`` in rocq-lsp).  A query's
 # Check/Print/Search output is ``information``; warnings it emits are
-# ``warning`` -- mirroring the info/warnings split of :func:`_lsp_run_query`.
+# ``warning``.
 _LEVEL_INFORMATION = 3
 _LEVEL_WARNING = 2
 
@@ -245,8 +143,7 @@ def _lsp_query_at_position(
     ``Search`` output in the response's ``pretac_messages`` field (this
     relies on the rocq-lsp patch that surfaces pretac feedback there).
 
-    Unlike the append-to-scratch path (:func:`_lsp_run_query`), this does
-    **not** re-elaborate a truncated copy of the file: it reuses the
+    This does **not** re-elaborate a scratch copy of the file: it reuses the
     file's warm / incremental / ``.vof`` state and coq-lsp answers the
     moment the check reaches the point.  A mid-proof query therefore costs
     the same as :func:`rocq_get_state`, not a full re-check of the (slow)
@@ -289,8 +186,7 @@ def _lsp_query_at_position(
             )
         # A goals-request error is the query command failing (e.g. an unknown
         # reference) or a sentence at/before the point being broken; both
-        # surface as ``crashed`` so callers' not-found enrichment kicks in,
-        # mirroring :func:`_lsp_run_query`.
+        # surface as ``crashed`` so callers' not-found enrichment kicks in.
         msg = err.get("message") if isinstance(err, dict) else str(err)
         # A Coq-side command_timeout abort comes back as a "Timeout!" error;
         # report it as a timeout (the session stays responsive).
@@ -470,20 +366,19 @@ async def run_query(
       hypotheses, local definitions visible there.  Point at a sentence
       boundary (e.g. just after a tactic's ``.``).
 
-    Preamble and whole-file modes append the command to an error-free
-    context document, check it, and return the resulting ``info``
-    diagnostics.  **Position mode** instead runs the command as a
-    speculative ``proof/goals`` pretac against the *live* document at the
-    point: it reuses the file's warm / incremental / ``.vof`` state and
-    answers the instant the check reaches the point -- no truncated scratch
-    copy, no re-elaboration of the (possibly slow) proof prefix.  When
+    All three run the command as a speculative ``proof/goals`` pretac (see
+    :func:`_lsp_query_at_position`) -- never a re-checked scratch copy:
+    position mode at the point; **file mode at end-of-file** (so it reuses the
+    file's warm / incremental / ``.vof`` state -- a whole-file query on a warm
+    session costs ~one pretac, not a full re-elaboration -- and is
+    error-resilient, querying symbols even when the file has an unrelated error
+    elsewhere); **preamble mode** on a small scratch document holding the
+    preamble (a no-op keeps it non-empty so the pretac has a node).  When
     ``include_warnings=False``, severity-2 warnings are dropped.
 
-    ``timeout`` means different things per mode: in **position mode** it is the
-    per-command budget for the pretac (default ``lifespan_state["op_timeout"]``),
-    and in **whole-file / preamble mode** it is the per-sentence budget for the
-    document check (default the global ``ROCQ_SENTENCE_TIMEOUT``).  Either way
-    the op blocks and the watchdog bounds it -- there is no client-side give-up.
+    ``timeout`` is the per-command budget for the pretac (default
+    ``lifespan_state["op_timeout"]``): the op blocks and the watchdog's command
+    phase bounds it -- no client-side give-up.
     """
     pos_mode = line is not None or character is not None
     if pos_mode and not file_path:
@@ -517,90 +412,67 @@ async def run_query(
         if err:
             return err
 
-    # Position mode runs the command as a *pretac*: *timeout* is the per-command
-    # budget (default op_timeout), bounded by the watchdog's command phase.
+    # Every mode runs the command as a single proof/goals pretac: *timeout* is
+    # the per-command budget (default op_timeout), bounded by the watchdog's
+    # command phase.  Resolve the pretac target, content, and point up front --
+    # the watchdog needs the point, and the file is read here, not in the worker.
     _q_timeout = (
         float(timeout) if timeout else float(lifespan_state.get("op_timeout", 30.0))
     )
-    # Whole-file / preamble mode is a *document check* (the command is appended
-    # as a sentence), so -- like rocq_compile_lsp -- it blocks and the watchdog's
-    # stall phase bounds it; *timeout* is then the per-sentence budget (default
-    # the global ROCQ_SENTENCE_TIMEOUT), with no op_timeout client-side give-up.
-    _doc_sentence_timeout = (
-        float(timeout) if timeout and timeout > 0 else _server.ROCQ_SENTENCE_TIMEOUT
-    )
+    if file_path:
+        try:
+            resolved = _server._resolve_file_in_workspace(file_path, workspace)
+            content = Path(resolved).read_text()
+        except (ValueError, FileNotFoundError) as e:
+            return _server._fail(lifespan_state, "rocq_query", str(e))
+        except (OSError, PermissionError):
+            return _server._fail(
+                lifespan_state, "rocq_query", f"File not accessible: {file_path}"
+            )
+        target = resolved
+        key = _server._session_key(workspace, file_path)
+        # Position mode queries the point; file mode the end-of-file state.
+        q_line, q_char = (line, character) if pos_mode else _eof_point(content)
+    else:
+        # Preamble mode: a small scratch document holds the context (there is no
+        # real file).
+        target = _lsp_scratch_path(workspace)
+        content = preamble
+        key = _server._session_key(workspace, None)
+        q_line, q_char = _eof_point(content)
+
+    # An empty / whitespace-only context -- an empty file or empty preamble --
+    # has no node for the pretac to run against (it returns nothing).  Swap in a
+    # no-op so the query still resolves against the base environment.  Position
+    # mode always targets a real point, so it is exempt.
+    if not pos_mode and not content.strip():
+        content = _EMPTY_QUERY_CONTEXT
+        q_line, q_char = _eof_point(content)
 
     def _do_lsp(checker: Any) -> dict[str, Any]:
-        if file_path:
-            try:
-                resolved = _server._resolve_file_in_workspace(file_path, workspace)
-                content = Path(resolved).read_text()
-            except (ValueError, FileNotFoundError) as e:
-                return _server._fail(lifespan_state, "rocq_query", str(e))
-            except (OSError, PermissionError):
-                return _server._fail(
-                    lifespan_state, "rocq_query", f"File not accessible: {file_path}"
-                )
-            if pos_mode:
-                # Position mode runs the query against the *live* document via
-                # proof/goals (no truncated scratch copy, no re-elaboration of
-                # the proof prefix) -- see _lsp_query_at_position.
-                return _lsp_query_at_position(
-                    checker,
-                    lifespan_state=lifespan_state,
-                    tool="rocq_query",
-                    resolved_file=resolved,
-                    content=content,
-                    line=line,
-                    character=character,
-                    command=command,
-                    timeout=_q_timeout,
-                    include_warnings=include_warnings,
-                    max_results=max_results,
-                )
-            context_text = content
-        else:
-            context_text = preamble
-        return _lsp_run_query(
+        return _lsp_query_at_position(
             checker,
             lifespan_state=lifespan_state,
             tool="rocq_query",
-            context_text=context_text,
+            resolved_file=target,
+            content=content,
+            line=q_line,
+            character=q_char,
             command=command,
-            workspace=workspace,
-            # Block (no client-side give-up): the stall watchdog in
-            # _run_with_lsp (sentence budget + grace) bounds the check and
-            # kills+restarts a non-cooperative sentence, exactly like
-            # rocq_compile_lsp.
-            timeout=0,
+            timeout=_q_timeout,
             include_warnings=include_warnings,
             max_results=max_results,
-            sentence_timeout=_doc_sentence_timeout,
         )
 
-    # File / position mode get a per-file session (parallel with other
-    # files); preamble mode shares the per-workspace scratch session.
-    # Position mode runs a speculative pretac at (line, character): arm the
-    # watchdog's command phase (kill+restart if the command ignores the
-    # interrupt).  Preamble / whole-file mode is a document check (the command
-    # is elaborated as a sentence), so it stays on the stall phase only.
-    pretac_point = (
-        (line, character)
-        if pos_mode and line is not None and character is not None
-        else None
-    )
     return await _server._run_with_lsp(
         _do_lsp,
         lifespan_state,
         "rocq_query",
         workspace=workspace,
-        key=_server._session_key(workspace, file_path or None),
-        command_timeout=_q_timeout if pretac_point is not None else None,
-        command_text=command if pretac_point is not None else None,
-        point=pretac_point,
-        # Document-check modes arm the stall watchdog at the (possibly
-        # per-call) sentence budget; position mode uses the global default.
-        sentence_timeout=None if pretac_point is not None else _doc_sentence_timeout,
+        key=key,
+        command_timeout=_q_timeout,
+        command_text=command,
+        point=(q_line, q_char),
     )
 
 
@@ -728,7 +600,7 @@ async def run_assumptions(
                 if query_result.get("reason") != "not_found":
                     query_result["reason"] = "not_found"
                     # Drop the just-recorded rocq_query/crashed entry
-                    # (set by ``_lsp_run_query`` on the live Coq error)
+                    # (set by the query pretac on the live Coq error)
                     # before re-recording as rocq_assumptions/not_found.
                     # Without this, rocq_diag reports the same failure
                     # twice with conflicting tool / reason attribution.
@@ -932,7 +804,7 @@ _DEFAULT_TOC_LIMIT: int = 500
 #
 # ``"crashed"`` is intentionally listed here for the *transport* sense
 # (coq-lsp session died, indicated by ``lsp_restarted: True``).  It is also
-# the reason ``_lsp_run_query`` records for a *live* Coq error — typically
+# the reason the query pretac records for a *live* Coq error — typically
 # ``Reference foo not found.`` — where enrichment IS useful.  The runtime
 # gate (in ``run_assumptions``) treats those two cases differently using
 # ``lsp_restarted``.

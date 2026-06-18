@@ -1,10 +1,10 @@
 """Unit tests for the max_results parameter in run_query.
 
 These tests mock _run_with_lsp (the coq-lsp execution helper) to avoid
-needing a real coq-lsp — they test the info-diagnostic truncation and
-count logic in ``_lsp_run_query`` only.  The mock checker returns
-exactly 20 ``info`` diagnostics, standing in for a ``Search`` that
-matched 20 results.
+needing a real coq-lsp — they test the pretac-message truncation and
+count logic in ``_lsp_query_at_position`` only.  The mock checker's
+``goals`` returns exactly 20 information ``pretac_messages``, standing in
+for a ``Search`` that matched 20 results.
 """
 
 from __future__ import annotations
@@ -19,36 +19,25 @@ import rocq_mcp.interactive as _int
 def _patch_run_with_lsp(monkeypatch):
     """Patch _run_with_lsp to run the callback with a mock coq-lsp checker.
 
-    The mock's ``check_content`` returns 20 ``info`` diagnostics (one per
-    simulated ``Search`` hit), all on the appended command's line, so the
-    ``max_results`` truncation/count logic can be exercised without a
-    live coq-lsp.
+    The mock's ``goals`` returns 20 information ``pretac_messages`` (one per
+    simulated ``Search`` hit), so the ``max_results`` truncation/count logic
+    can be exercised without a live coq-lsp.
     """
 
     class MockChecker:
         def _is_alive(self):
             return True
 
-        def check_content(
-            self, path, content, workspace="", timeout=0, wait_full=False,
+        def goals(
+            self, file_path, line, character, *, content=None, command=None,
+            command_timeout=None, pp_format="Str", mode=None, timeout=None,
             sentence_timeout=0.0,
         ):
             return {
-                "success": True,
-                "errors": [],
-                "warnings": [],
-                "info": [
-                    {
-                        "line": 0,
-                        "character": i,
-                        "end_line": 0,
-                        "end_character": i,
-                        "message": f"result_{i}",
-                        "severity": 3,
-                    }
+                "pretac_messages": [
+                    {"range": None, "level": 3, "text": f"result_{i}"}
                     for i in range(20)
                 ],
-                "timed_out": False,
             }
 
     mock_checker = MockChecker()
