@@ -2357,7 +2357,7 @@ async def rocq_compile_lsp(
     line: int | None = None,
     character: int | None = None,
     stop_at_first_error: bool = True,
-    cache_on_error: bool = False,
+    save_vof_with_errors: bool = False,
     sentence_timeout: float | None = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
@@ -2428,7 +2428,7 @@ async def rocq_compile_lsp(
             below the error is never run.  Set to False to check through to
             the end (or *line*) and report every error.  Applies to both the
             whole-file and position-limited checks.
-        cache_on_error: Persist the ``.vof`` warm-start snapshot even when
+        save_vof_with_errors: Persist the ``.vof`` warm-start snapshot even when
             the file has errors (default: False).  By default a snapshot is
             saved only for a clean full check; set this to cache a
             completed-but-erroring document anyway (e.g. to warm-start a
@@ -2442,8 +2442,8 @@ async def rocq_compile_lsp(
             recovers and moves on, so one slow/diverging tactic cannot wedge
             the check (or the session).  Bounds each sentence individually, not
             the whole file.  Default ``None`` uses the ``ROCQ_SENTENCE_TIMEOUT``
-            env var (itself 0 = disabled); pass an explicit value to override
-            it for this call (``0`` force-disables).  Note this relies on the
+            env var (120 by default; ``0`` disables); pass an explicit value to
+            override it for this call (``0`` force-disables).  Note this relies on the
             tactic cooperatively polling Coq's interrupt (essentially all real
             computation does); a trivial non-polling loop like ``do N idtac``
             is not caught.
@@ -2481,9 +2481,9 @@ async def rocq_compile_lsp(
             f"line and character must be in range [0, {_MAX_LINE_CHAR_RANGE}].",
         )
 
-    # Snapshotting a broken file (cache_on_error) needs a completed, EOF-
+    # Snapshotting a broken file (save_vof_with_errors) needs a completed, EOF-
     # reaching check, so it implies a full check (overrides stop-at-first).
-    effective_stop = stop_at_first_error and not cache_on_error
+    effective_stop = stop_at_first_error and not save_vof_with_errors
 
     # None (the default) means "use the global ROCQ_SENTENCE_TIMEOUT default";
     # an explicit value (including 0 to force-disable) overrides it.
@@ -2501,7 +2501,7 @@ async def rocq_compile_lsp(
                 workspace,
                 0.0,
                 effective_stop,
-                save_vof_on_error=cache_on_error,
+                save_vof_on_error=save_vof_with_errors,
                 sentence_timeout=eff_sentence_timeout,
             )
         return checker.check_up_to(
