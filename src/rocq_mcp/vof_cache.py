@@ -98,22 +98,45 @@ def _dep_fingerprint(resolved_file: str, workspace: str) -> list:
     return sorted(fp)
 
 
-def record(resolved_file: str, workspace: str) -> None:
+def record(resolved_file: str, workspace: str, version: int = 1) -> None:
     """Write the sidecar meta after a successful ``coq/saveVof``.
 
     Captures the content hash, toolchain id, and dependency fingerprint so
     :func:`is_valid` can later decide whether the snapshot is still
-    trustworthy.  Best-effort.
+    trustworthy.  *version* is the document version coq-lsp marshaled into
+    the ``.vof`` (its ``Doc.t.version``); a reloading session must resume
+    numbering *above* it so the first ``didChange`` is not dropped as stale
+    (see :func:`saved_version` and ``LspChecker._try_load_vof``).
+    Best-effort.
     """
     meta = {
         "content_sha": _file_sha(resolved_file),
         "toolchain": toolchain_id(),
         "deps": _dep_fingerprint(resolved_file, workspace),
+        "version": int(version),
     }
     try:
         Path(_meta_path(resolved_file)).write_text(json.dumps(meta))
     except OSError:
         pass
+
+
+def saved_version(resolved_file: str) -> int | None:
+    """The document version the ``.vof`` was marshaled at, or ``None``.
+
+    coq-lsp restores a reloaded ``.vof`` at exactly this version and then
+    ignores any ``didChange`` whose version is not strictly greater (see
+    ``Fleche.Theory.change``).  A reloading session reads this to resume its
+    version counter above the snapshot so the first edit re-elaborates
+    instead of being silently dropped (the "stale-green" bug).  ``None`` when
+    the sidecar is missing or predates this field.
+    """
+    try:
+        meta = json.loads(Path(_meta_path(resolved_file)).read_text())
+    except (OSError, ValueError):
+        return None
+    v = meta.get("version")
+    return int(v) if isinstance(v, int) else None
 
 
 def is_valid(resolved_file: str, workspace: str) -> bool:

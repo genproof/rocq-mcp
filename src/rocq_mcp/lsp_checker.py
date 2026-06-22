@@ -60,6 +60,12 @@ _HANDSHAKE_TIMEOUT: float = 30.0
 # so this is generous; configurable via ROCQ_VOF_SAVE_TIMEOUT.
 _VOF_SAVE_TIMEOUT: float = float(os.environ.get("ROCQ_VOF_SAVE_TIMEOUT", "300"))
 
+# Version baseline for a reloaded ``.vof`` whose sidecar predates the recorded
+# save-time version (no ``version`` field).  coq-lsp ignores a didChange whose
+# version is not strictly greater than the reloaded snapshot's, so we start
+# high enough that the next edit's version exceeds any plausible saved version.
+_VOF_RELOAD_BASE_VERSION: int = 1_000_000
+
 # Grace period (seconds) to keep collecting trailing diagnostics after a
 # barrier response, catching a final publishDiagnostics that races just
 # behind it.
@@ -547,8 +553,12 @@ class LspChecker:
                     file=str(Path(file_path).resolve()), error=resp["_lsp_error"],
                 )
                 return False
+            # The version coq-lsp marshals into the .vof is the doc's current
+            # version, which we track in _open_docs.  Capture it under the lock
+            # so a reloading session can resume numbering above it.
+            version = self._open_docs[uri]
         # Record the fingerprint outside the lock (pure filesystem work).
-        vof_cache.record(str(Path(file_path).resolve()), self._workspace)
+        vof_cache.record(str(Path(file_path).resolve()), self._workspace, version)
         dlog.event("vof", "save.ok", file=str(Path(file_path).resolve()))
         return True
 
@@ -577,9 +587,18 @@ class LspChecker:
         with self._cv:
             self._saw_busy = False
         self._notify("coq/loadVof", {"textDocument": {"uri": uri}})
-        self._open_docs[uri] = 1
+        # coq-lsp restores the snapshot at the version it was marshaled at and
+        # then drops any didChange not strictly greater (Fleche.Theory.change).
+        # Resume our counter at that saved version so the first edit's
+        # didChange (saved + 1) re-elaborates instead of being silently ignored
+        # -- otherwise the stale snapshot answers every barrier and an edited,
+        # now-broken file reports a false success ("stale-green").  Legacy
+        # snapshots without a recorded version fall back to a base high enough
+        # that any plausible saved version is exceeded.
+        saved_ver = vof_cache.saved_version(resolved)
+        self._open_docs[uri] = saved_ver if saved_ver is not None else _VOF_RELOAD_BASE_VERSION
         self._last_content[uri] = content
-        dlog.event("vof", "load.hit", file=resolved, uri=uri)
+        dlog.event("vof", "load.hit", file=resolved, uri=uri, base=self._open_docs[uri])
         return True
 
     # ------------------------------------------------------------------

@@ -253,3 +253,67 @@ class TestCheckUpToMethod:
             assert any(e["line"] == 1 for e in res["errors"])
         finally:
             checker.stop()
+
+
+# ---------------------------------------------------------------------------
+# Regression: ".vof reload then edit" stale-green.
+#
+# coq-lsp marshals the document *version* into the .vof snapshot and, on
+# reload, ignores any didChange whose version is not strictly greater
+# (Fleche.Theory.change: `if version > doc.version then ... else IS.empty`).
+# A warm session that checks a file more than once saves the snapshot at
+# version >= 2.  A fresh session reloads it (coq/loadVof) but resumes its
+# didChange counter at 2, so the first edit's didChange (version=2) is
+# dropped as stale -- the now-broken file is checked against the stale clean
+# snapshot and reports a false success.
+# ---------------------------------------------------------------------------
+
+
+@_lsp_only
+def test_vof_reload_then_edit_does_not_report_stale_green(tmp_path, monkeypatch):
+    """A reloaded ``.vof`` must not mask a subsequent edit's error.
+
+    Reproduces the stale-green bug end-to-end against real coq-lsp: warm a
+    ``.vof`` at document version >= 2, drop the session, reload the snapshot
+    in a fresh session, then make a dependent edit that breaks a textually
+    unchanged theorem.  The edit's error must surface; a ``success`` here is
+    the bug (coq-lsp silently dropped the stale-versioned didChange).
+    """
+    from rocq_mcp.lsp_checker import LspChecker
+
+    monkeypatch.setenv("ROCQ_VOF_CACHE", "1")
+    (tmp_path / "_CoqProject").write_text("-R . Top\n")
+    v = tmp_path / "Dep.v"
+    clean = (
+        "Definition n : nat := 0.\n"
+        "Theorem t : n = 0.\n"
+        "Proof. reflexivity. Qed.\n"
+    )
+    # Dependent edit: retype n.  The theorem text is unchanged, so its error
+    # appears only if coq-lsp actually re-elaborates the edited document.
+    broken = clean.replace("Definition n : nat := 0.", "Definition n : bool := true.")
+    v.write_text(clean)
+
+    # Warm session: two whole-file checks bump the doc version to 2, so the
+    # saved .vof is marshaled at version 2 (>= 2 is what arms the bug).
+    warm = LspChecker(workspace=str(tmp_path))
+    try:
+        for _ in range(2):
+            assert warm.check_file(str(v), workspace=str(tmp_path))["success"] is True
+    finally:
+        warm.stop()
+    assert (tmp_path / "Dep.vof").is_file()
+
+    # Fresh session: a positioned check reloads the .vof (still clean), then
+    # the file is broken and re-checked.  The error MUST surface.
+    fresh = LspChecker(workspace=str(tmp_path))
+    try:
+        clean_res = fresh.check_up_to(str(v), line=2, workspace=str(tmp_path))
+        assert clean_res["success"] is True  # the reload served the clean prefix
+
+        v.write_text(broken)
+        broken_res = fresh.check_up_to(str(v), line=2, workspace=str(tmp_path))
+        assert broken_res["success"] is False, "stale-green: the edit's error was masked"
+        assert broken_res["errors"]
+    finally:
+        fresh.stop()
