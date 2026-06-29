@@ -49,6 +49,15 @@ ROCQ_OP_TIMEOUT: float = float(
 # sentence.  Set to 0 to disable (then only the command-phase / hard-timeout
 # backstops bound a check).  rocq_compile_lsp's per-call ``sentence_timeout``
 # parameter overrides this for that tool.
+#
+# Proof-closing commands (``Qed`` / ``Defined`` / ``Save`` / ``Admitted``) are
+# EXEMPT from this per-sentence abort on the genproof rocq-lsp fork: their cost
+# is honest kernel verification of the proof term, not a diverging tactic, so a
+# long ``Qed`` is never reified as a "sentence timeout".  The progress-stall
+# backstop exempts them too (see ROCQ_PROGRESS_GRACE) -- a frontier parked on a
+# ``Qed`` is not treated as a hang -- so a long ``Qed`` is bounded only by
+# ``ROCQ_HARD_TIMEOUT`` (if set) and the RSS memory watchdog, never by the
+# sentence-timeout machinery.
 ROCQ_SENTENCE_TIMEOUT: float = float(os.environ.get("ROCQ_SENTENCE_TIMEOUT", "120"))
 # Hard wall-clock backstop (seconds) for any single coq-lsp operation.  0 (the
 # default) disables it.  When > 0, an operation that runs longer is aborted by
@@ -68,7 +77,9 @@ ROCQ_HARD_TIMEOUT: float = float(os.environ.get("ROCQ_HARD_TIMEOUT", "0"))
 # diverging sentence.  Smarter than ``ROCQ_HARD_TIMEOUT`` -- it bounds
 # per-sentence wall-clock, not the whole op, so an honestly long check that
 # keeps progressing is never killed.  Only armed when the effective
-# sentence_timeout > 0.
+# sentence_timeout > 0.  A frontier parked on a proof-closing command (``Qed`` /
+# ``Defined`` / ...) is exempt -- honest kernel verification, not a hang -- so a
+# long ``Qed`` is never killed here (only ROCQ_HARD_TIMEOUT / RSS bound it).
 ROCQ_PROGRESS_GRACE: float = float(os.environ.get("ROCQ_PROGRESS_GRACE", "120"))
 ROCQ_COQC_BINARY: str = os.environ.get("ROCQ_COQC_BINARY", "coqc")
 ROCQ_MAX_SOURCE_SIZE: int = int(os.environ.get("ROCQ_MAX_SOURCE_SIZE", "1000000"))
@@ -920,6 +931,22 @@ def _extract_sentence(
     return sentence or None
 
 
+# A proof-closing command (Qed / Defined / Save / Admitted), optionally under a
+# control wrapper (``Time Qed.``, ``Timeout 5 Qed.``, ``Fail Qed.`` ...).  Used
+# to exempt such a sentence from the progress-stall watchdog: its cost is honest
+# kernel verification, not a diverging tactic, so a long Qed must not be killed
+# for parking the frontier.  Matches the whitespace-collapsed text from
+# :func:`_extract_sentence`.
+_PROOF_CLOSING_RE = re.compile(
+    r"^(?:(?:Time|Fail|Succeed|Timeout\s+\d+)\s+)*(?:Qed|Defined|Admitted|Save)\b"
+)
+
+
+def _is_proof_closing_sentence(text: str | None) -> bool:
+    """True if *text* begins a proof-closing command (see ``_PROOF_CLOSING_RE``)."""
+    return bool(text and _PROOF_CLOSING_RE.match(text))
+
+
 def _build_lsp_stall_timeout_response(
     lifespan_state: dict[str, Any],
     tool: str,
@@ -1091,6 +1118,7 @@ async def _memory_watchdog(
     command_event: asyncio.Event | None = None,
     point: tuple[int, int] | None = None,
     op_start: float | None = None,
+    stall_path: str | None = None,
 ) -> None:
     """Watch one coq-lsp op: on RSS breach, hard-timeout, progress stall, *or*
     command stall, cancel *main_task*.
@@ -1208,10 +1236,27 @@ async def _memory_watchdog(
                     # never a silent hang).
                     window, frontier_event = command_window, command_event
                 if window is not None and time.monotonic() - last_activity > window:
-                    if frontier_event is not None:
-                        frontier_event.set()
-                    main_task.cancel()
-                    return
+                    # Exempt a proof-closing command (Qed / Defined / ...) from
+                    # the elaborate-phase stall: its kernel verification is
+                    # honest, possibly-long work, not a diverging tactic, so a
+                    # parked frontier there is not a hang.  Only the stall phase
+                    # is exempt -- a pretac command (command phase) is never a
+                    # Qed -- and a runaway Qed is still bounded by
+                    # ROCQ_HARD_TIMEOUT / the RSS watchdog.  Re-checked each tick
+                    # (cheap) so the kill re-arms the moment the frontier moves.
+                    exempt = (
+                        frontier_event is stall_event
+                        and stall_path is not None
+                        and prog is not None
+                        and _is_proof_closing_sentence(
+                            _extract_sentence(stall_path, prog[1], prog[2])
+                        )
+                    )
+                    if not exempt:
+                        if frontier_event is not None:
+                            frontier_event.set()
+                        main_task.cancel()
+                        return
             process = get_process()
             if process is None:
                 continue
@@ -1378,6 +1423,7 @@ async def _run_with_lsp(
             command_event=command_event,
             point=point,
             op_start=_t0,
+            stall_path=key,
         )
     )
     try:
@@ -2460,7 +2506,11 @@ async def rocq_compile_lsp(
             override it for this call (``0`` force-disables).  Note this relies on the
             tactic cooperatively polling Coq's interrupt (essentially all real
             computation does); a trivial non-polling loop like ``do N idtac``
-            is not caught.
+            is not caught.  Proof-closing commands (``Qed`` / ``Defined`` / ``Save``
+            / ``Admitted``) are exempt -- their kernel verification is honest work,
+            not a diverging tactic -- from both this abort and the progress-stall
+            backstop, so a long ``Qed`` runs to completion (only ``ROCQ_HARD_TIMEOUT``
+            and the RSS watchdog bound a truly runaway one).
     """
     # Same workspace handling as the other file tools: auto-detect the
     # project root from *file_path* when no explicit workspace is given.

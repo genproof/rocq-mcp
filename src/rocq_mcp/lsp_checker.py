@@ -639,7 +639,9 @@ class LspChecker:
         reported as a "Timeout!" error, then checking continues with the next
         sentence.  This keeps a single diverging tactic from wedging the whole
         check (and the session).  ``0.0`` (default) disables it -- some proofs
-        have legitimately minutes-long sentences.
+        have legitimately minutes-long sentences.  Proof-closing commands
+        (``Qed`` / ``Defined`` / ``Save`` / ``Admitted``) are exempt on the
+        genproof fork: an honest, long kernel check is never cut short.
 
         Returns:
             {

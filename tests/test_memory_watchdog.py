@@ -285,6 +285,62 @@ class TestWatchdogCoroutine:
         with pytest.raises(asyncio.CancelledError):
             await main_task
 
+    @pytest.mark.asyncio
+    async def test_watchdog_stall_exempts_qed_frontier(self, monkeypatch, tmp_path):
+        """A frontier parked on a ``Qed`` is exempt: the elaborate-phase stall
+        does NOT fire (honest kernel verification, not a hang)."""
+        _patch_psutil_rss(monkeypatch, 10)
+        f = tmp_path / "p.v"
+        f.write_text("Lemma l : True.\nProof.\nQed.\n")  # Qed on line 2
+
+        checker = _FakeLspChecker()
+        stall = asyncio.Event()
+
+        async def work():
+            await asyncio.sleep(0.2)  # > stall_window; ends the watchdog loop
+
+        main_task = asyncio.create_task(work())
+        t0 = time.monotonic()
+        await _server._memory_watchdog(
+            100_000, main_task, asyncio.Event(),
+            get_process=lambda: checker._process,
+            get_progress=lambda: (t0, 2, 0),  # frozen frontier on the Qed line
+            stall_window=0.05, stall_event=stall, op_start=t0,
+            stall_path=str(f),
+        )
+        assert not stall.is_set()
+        assert not main_task.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_watchdog_stall_fires_for_non_qed_frontier(
+        self, monkeypatch, tmp_path
+    ):
+        """Control: with stall_path set but the frontier on a *tactic*, the
+        stall still fires -- the exemption is specific to proof-closing
+        commands."""
+        _patch_psutil_rss(monkeypatch, 10)
+        f = tmp_path / "p.v"
+        f.write_text("Lemma l : True.\nProof.\ninduction n.\n")  # tactic on line 2
+
+        checker = _FakeLspChecker()
+        stall = asyncio.Event()
+
+        async def work():
+            await asyncio.sleep(10)
+
+        main_task = asyncio.create_task(work())
+        t0 = time.monotonic()
+        await _server._memory_watchdog(
+            100_000, main_task, asyncio.Event(),
+            get_process=lambda: checker._process,
+            get_progress=lambda: (t0, 2, 0),  # frozen frontier on the tactic
+            stall_window=0.05, stall_event=stall, op_start=t0,
+            stall_path=str(f),
+        )
+        assert stall.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            await main_task
+
 
 # ---------------------------------------------------------------------------
 # coq-lsp watchdog (ROCQ_MAX_LSP_RSS_MB)
@@ -1099,3 +1155,41 @@ class TestLspCheckerTrimWire:
                '"method": "coq/trimCaches"' in payload
         # Notification (no id) per LSP convention.
         assert '"id"' not in payload
+
+
+# ---------------------------------------------------------------------------
+# _is_proof_closing_sentence (stall-watchdog Qed exemption predicate)
+# ---------------------------------------------------------------------------
+
+
+class TestIsProofClosingSentence:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Qed.",
+            "Defined.",
+            "Admitted.",
+            "Save foo.",
+            "Time Qed.",
+            "Timeout 5 Qed.",
+            "Fail Qed.",
+            "Time Defined.",
+        ],
+    )
+    def test_matches_proof_closing(self, text):
+        assert _server._is_proof_closing_sentence(text)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "induction n.",
+            "reflexivity.",
+            "exact I.",
+            "Qedditch.",  # word boundary: not Qed
+            "apply Qed_lemma.",  # Qed not at the start
+            "",
+            None,
+        ],
+    )
+    def test_rejects_non_proof_closing(self, text):
+        assert not _server._is_proof_closing_sentence(text)
