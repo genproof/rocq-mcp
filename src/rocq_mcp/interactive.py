@@ -999,16 +999,21 @@ def _structure_goal_list(goals_list: list[Any]) -> list[dict[str, Any]]:
 
     coq-lsp already returns each goal as
     ``{"hyps": [{"names": [...], "def": <str|null>, "ty": <str>}], "ty": <str>}``;
-    we reshape it to ``{"hyps": [{"names": [...], "type": str, "def"?: str}],
-    "conclusion": str}`` (``def`` is included only for let-bound
-    hypotheses).  At most :data:`_MAX_GOALS_SHOWN` goals are returned (the
-    caller surfaces the remainder via ``goals_omitted``).
+    we reshape it to ``{"hyps": {"<names>": "<type>"}, "conclusion": str}``.
+    Each hypothesis group becomes one entry keyed by its space-joined names
+    (``["n", "m"]`` -> ``"n m"``); the value is the type.  A let-bound
+    hypothesis carries its body inline as ``"<type> := <def>"`` (these display
+    strings are for reading, not re-parsing -- a type may itself contain
+    ``:=``).  At most :data:`_MAX_GOALS_SHOWN` goals are returned (the caller
+    surfaces the remainder via ``goals_omitted``).
 
-    Each rendered term -- every hypothesis ``type``/``def`` and each
-    ``conclusion`` -- is capped at ``ROCQ_MAX_GOAL_CHARS`` chars
-    (truncated with a marker).  Because the cap is *per term*, a single
-    huge hypothesis can't crowd out the rest, and the conclusion (its own
-    field) is never lost to truncation.
+    Keys preserve coq-lsp's hypothesis order (Python/JSON objects keep
+    insertion order); names are unique within a context, so keys never
+    collide.  Each rendered term -- every hypothesis type/def and each
+    ``conclusion`` -- is capped at ``ROCQ_MAX_GOAL_CHARS`` chars (truncated
+    with a marker).  Because the cap is *per term*, a single huge hypothesis
+    can't crowd out the rest, and the conclusion (its own field) is never
+    lost to truncation.
     """
     cap = _server.ROCQ_MAX_GOAL_CHARS
 
@@ -1020,15 +1025,13 @@ def _structure_goal_list(goals_list: list[Any]) -> list[dict[str, Any]]:
 
     structured: list[dict[str, Any]] = []
     for g in goals_list[:_MAX_GOALS_SHOWN]:
-        hyps: list[dict[str, Any]] = []
+        hyps: dict[str, str] = {}
         for h in g.get("hyps") or []:
-            entry: dict[str, Any] = {
-                "names": h.get("names") or [],
-                "type": _term(h.get("ty")),
-            }
+            key = " ".join(h.get("names") or [])
+            value = _term(h.get("ty"))
             if h.get("def"):
-                entry["def"] = _term(h.get("def"))
-            hyps.append(entry)
+                value = f"{value} := {_term(h.get('def'))}"
+            hyps[key] = value
         structured.append({"hyps": hyps, "conclusion": _term(g.get("ty"))})
     return structured
 

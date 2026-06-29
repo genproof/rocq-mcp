@@ -159,13 +159,14 @@ class TestGetState:
         )
         assert before["success"] is True
         assert "forall" in before["goals"][0]["conclusion"]
-        assert before["goals"][0]["hyps"] == []  # no hyps before intros
+        assert before["goals"][0]["hyps"] == {}  # no hyps before intros
 
         after = await run_get_state(
             file_path="t.v", line=3, character=2, workspace=str(proof_ws),
             lifespan_state=lstate, before=False,
         )
-        assert {"names": ["n", "m"], "type": "nat"} in after["goals"][0]["hyps"]
+        # hyps is a dict keyed by space-joined names: n, m : nat.
+        assert after["goals"][0]["hyps"]["n m"] == "nat"
 
     @pytest.mark.asyncio
     async def test_pivot_sentence_before_and_after(self, proof_ws, lstate):

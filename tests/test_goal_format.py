@@ -15,6 +15,7 @@ def test_default_cap_is_8000():
 
 
 def test_shape():
+    # hyps is a dict keyed by space-joined names, value = type; order preserved.
     raw = [{
         "hyps": [
             {"names": ["n", "m"], "def": None, "ty": "nat"},
@@ -23,27 +24,23 @@ def test_shape():
         "ty": "n + 0 = m",
     }]
     assert _structure_goal_list(raw) == [{
-        "hyps": [
-            {"names": ["n", "m"], "type": "nat"},
-            {"names": ["H"], "type": "n = m"},
-        ],
+        "hyps": {"n m": "nat", "H": "n = m"},
         "conclusion": "n + 0 = m",
     }]
 
 
-def test_def_kept_only_when_present():
+def test_def_inlined_into_value():
+    # A let-bound hypothesis carries its body inline as "<type> := <def>".
     raw = [{"hyps": [{"names": ["k"], "def": "n + 0", "ty": "nat"}], "ty": "k = n"}]
-    assert _structure_goal_list(raw)[0]["hyps"][0] == {
-        "names": ["k"], "type": "nat", "def": "n + 0",
-    }
+    assert _structure_goal_list(raw)[0]["hyps"] == {"k": "nat := n + 0"}
 
 
 def test_per_term_cap_truncates_each_field(monkeypatch):
     monkeypatch.setattr(_server, "ROCQ_MAX_GOAL_CHARS", 100)
     raw = [{"hyps": [{"names": ["H"], "def": None, "ty": "x" * 500}], "ty": "y" * 500}]
     g = _structure_goal_list(raw)[0]
-    assert g["hyps"][0]["type"].startswith("x" * 100)
-    assert "truncated" in g["hyps"][0]["type"]
+    assert g["hyps"]["H"].startswith("x" * 100)
+    assert "truncated" in g["hyps"]["H"]
     assert g["conclusion"].startswith("y" * 100)
     assert "truncated" in g["conclusion"]
 
@@ -55,7 +52,7 @@ def test_conclusion_survives_huge_hyps(monkeypatch):
     raw = [{"hyps": [{"names": ["H"], "def": None, "ty": "z" * 50000}], "ty": "done"}]
     g = _structure_goal_list(raw)[0]
     assert g["conclusion"] == "done"
-    assert len(g["hyps"][0]["type"]) == 50000
+    assert len(g["hyps"]["H"]) == 50000
 
 
 def test_goal_count_capped_at_max_shown():

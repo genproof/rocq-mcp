@@ -1984,10 +1984,13 @@ async def rocq_get_state(
     sentence.  Use it to inspect a proof mid-way, or to see the goals at
     an error position reported by ``rocq_compile``.
 
-    Returns ``goals`` -- a list of ``{hyps: [{names, type, def?}],
-    conclusion}`` objects, empty when no foreground goals remain -- and
-    ``in_proof`` (False when the position is not inside any proof).  There is no ``state_id`` — run tactics from here with
-    ``rocq_step`` / ``rocq_step_multi`` by passing the same position.
+    Returns ``goals`` -- a list of ``{hyps, conclusion}`` objects, empty when
+    no foreground goals remain -- and ``in_proof`` (False when the position is
+    not inside any proof).  ``hyps`` is a dict keyed by each hypothesis group's
+    space-joined names with the type as the value (``{"n m": "nat"}``); a
+    let-bound hypothesis carries its body inline (``"nat := 0"``).  There is no
+    ``state_id`` — run tactics from here with ``rocq_step`` / ``rocq_step_multi``
+    by passing the same position.
 
     To pin down *where* the state sits, the result also carries the pivot
     sentence at the point: ``before_sentence`` when ``before=True`` (the goals
