@@ -1171,6 +1171,55 @@ def _goals_mode(before: bool) -> str:
     return "Prev" if before else "After"
 
 
+def _sentence_at_range(content: str, rng: Any) -> str | None:
+    """Return the source text spanned by an LSP *range*, whitespace-collapsed.
+
+    *rng* is a coq-lsp ``{"start": {line, character}, "end": {...}}`` dict
+    (0-indexed, the ``range`` field of a ``proof/goals`` answer -- the
+    sentence at the point in both ``Prev`` and ``After`` mode).  Returns
+    ``None`` when the range is missing/unusable or spans no text -- e.g. the
+    point sits at a sentence boundary / EOF, where coq-lsp reports no node.
+    Internal runs of whitespace (including the newlines of a multi-line
+    sentence) are collapsed to single spaces so the result is a tidy
+    one-liner.
+    """
+    if not isinstance(rng, dict):
+        return None
+    start, end = rng.get("start") or {}, rng.get("end") or {}
+    sl, sc = start.get("line"), start.get("character")
+    el, ec = end.get("line"), end.get("character")
+    if not all(isinstance(v, int) for v in (sl, sc, el, ec)):
+        return None
+    lines = content.split("\n")
+    if not (0 <= sl < len(lines)) or not (0 <= el < len(lines)):
+        return None
+    if sl == el:
+        seg = lines[sl][sc:ec]
+    else:
+        seg = "\n".join([lines[sl][sc:], *lines[sl + 1 : el], lines[el][:ec]])
+    return " ".join(seg.split()) or None
+
+
+def _pivot_field(content: str | None, rng: Any, before: bool) -> dict[str, str]:
+    """Map a goals-answer ``range`` to the pivot-sentence anchor field.
+
+    Returns ``{"before_sentence": <text>}`` (``before=True``) or
+    ``{"after_sentence": <text>}`` (``before=False``) naming the sentence at
+    the point, or ``{}`` when there is no resolvable sentence (the point is at
+    a sentence boundary / EOF, or *content* is None / the range is unusable).
+    The anchor pins where the reported state sits relative to that sentence:
+    the goals are taken *before* it runs (``before_sentence``) or *after* it
+    (``after_sentence``).  Shared by ``rocq_get_state`` / ``rocq_step`` /
+    ``rocq_step_multi`` so the anchor shape is identical across them.
+    """
+    if content is None:
+        return {}
+    pivot = _sentence_at_range(content, rng)
+    if not pivot:
+        return {}
+    return {("before_sentence" if before else "after_sentence"): pivot}
+
+
 @dlog.logged("tool", "rocq_get_state")
 async def run_get_state(
     file_path: str,
@@ -1193,6 +1242,13 @@ async def run_get_state(
     inside a proof; when inside a proof, an empty ``goals`` means no
     foreground goals remain.  No ``state_id`` -- subsequent calls just
     re-address by position.
+
+    To anchor *where* the reported state sits, the result carries the pivot
+    sentence (the sentence at the point): ``before_sentence`` when
+    ``before=True`` (the goals are the state right *before* it runs) or
+    ``after_sentence`` when ``before=False`` (the state right *after* it).
+    The field is omitted when there is no such sentence -- the point is at a
+    sentence boundary or EOF (coq-lsp reports no node there).
     """
     err = _validate_position(line, character, lifespan_state, "rocq_get_state")
     if err:
@@ -1209,11 +1265,20 @@ async def run_get_state(
     # abandoned.  An explicit *timeout* > 0 still imposes a client-side wait.
     _t = float(timeout) if timeout and timeout > 0 else 0.0
 
+    # Read the live file once so the pivot-sentence slice below uses exactly
+    # the text coq-lsp checks (passed through as ``content``).  Best-effort:
+    # an unreadable file just means no pivot sentence (the goals still report).
+    try:
+        content = Path(resolved).read_text()
+    except (OSError, PermissionError):
+        content = None
+
     def _do(checker: Any) -> dict[str, Any]:
         answer = checker.goals(
             resolved,
             line,
             character,
+            content=content,
             mode=_goals_mode(before),
             timeout=_t,
             # Bound each sentence on the way to the point coq-lsp-side (global
@@ -1247,6 +1312,13 @@ async def run_get_state(
                 )
             return _server._fail(lifespan_state, "rocq_get_state", payload, "crashed")
         rendered = _render_goals_answer(payload, include_warnings=include_warnings)
+        # Anchor the reported state to its pivot sentence so the caller knows
+        # *where* these goals are: ``before=True`` reports the state right
+        # before that sentence runs (``before_sentence``), ``before=False`` the
+        # state right after it (``after_sentence``).  coq-lsp's ``range`` is the
+        # sentence at the point in both modes; omitted when undefined (the point
+        # is at a sentence boundary / EOF, or the file was unreadable).
+        rendered.update(_pivot_field(content, payload.get("range"), before))
         return {
             "success": True,
             "file_path": file_path,
@@ -1453,6 +1525,11 @@ async def run_step(
     block against the warm live document, LSP transport included -- so a
     slow *failing* tactic is as measurable as a slow succeeding one.  The
     block may contain multiple sentences / bullets.
+
+    A successful result also carries the pivot sentence anchoring the *base*
+    state the block ran against: ``before_sentence`` (``before=True`` -- the
+    block was applied to the state before that sentence) or ``after_sentence``
+    (``before=False``).  Omitted when the point is at a sentence boundary / EOF.
     """
     err = _validate_position(line, character, lifespan_state, "rocq_step")
     if err:
@@ -1469,6 +1546,13 @@ async def run_step(
 
     _t = _position_timeout(lifespan_state, timeout)
 
+    # Read the live file once so the pivot-sentence anchor below slices exactly
+    # the text coq-lsp checks; best-effort (unreadable -> no anchor).
+    try:
+        content = Path(resolved).read_text()
+    except (OSError, PermissionError):
+        content = None
+
     def _do(checker: Any) -> dict[str, Any]:
         _start = time.monotonic()
         # Coq bounds the speculative block with a wall-clock budget (*_t*) and
@@ -1478,7 +1562,7 @@ async def run_step(
         # watchdog's command phase in _run_with_lsp (_t + grace) instead of
         # being abandoned as a background zombie.
         answer = checker.goals(
-            resolved, line, character, command=tactics,
+            resolved, line, character, command=tactics, content=content,
             command_timeout=_t, mode=_goals_mode(before),
             timeout=0,
             sentence_timeout=_server.ROCQ_SENTENCE_TIMEOUT,
@@ -1527,6 +1611,14 @@ async def run_step(
             "elapsed_s": elapsed_s,
             **rendered,
         }
+        # Anchor present on success only: the pivot range rides on coq-lsp's ok
+        # answer, but a rejected block returns {"_lsp_error": ...} with no range.
+        # TODO: carry the anchor on the failure paths too (tactic_failed /
+        # timeout / transport) for parity with rocq_step_multi -- compute
+        # pivot_range once after the goals call and fall back to a no-command
+        # probe when it's None (same pattern as run_step_multi), then merge the
+        # anchor into every return envelope.
+        result.update(_pivot_field(content, payload.get("range"), before))
         if messages:
             result["feedback"] = messages
         return result
@@ -1566,6 +1658,11 @@ async def run_step_multi(
     seconds) of that block's ``proof/goals`` round-trip (present even on
     failure / timeout), so an automation battery can be compared
     block-by-block without committing any of it.
+
+    Every block runs from the same base state, so the pivot sentence anchoring
+    it is reported once at the top level: ``before_sentence`` (``before=True``)
+    or ``after_sentence`` (``before=False``).  Omitted only when the point is at
+    a sentence boundary / EOF (no sentence there).
     """
     err = _validate_position(line, character, lifespan_state, "rocq_step_multi")
     if err:
@@ -1591,8 +1688,18 @@ async def run_step_multi(
 
     _t = _position_timeout(lifespan_state, timeout)
 
+    # Read the live file once for the pivot-sentence anchor (best-effort).
+    try:
+        content = Path(resolved).read_text()
+    except (OSError, PermissionError):
+        content = None
+
     def _do(checker: Any) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
+        # All blocks share one base state (same point/mode/doc), so the pivot
+        # sentence is shared too -- captured from the first answer that carries
+        # a range (error answers do not) and reported once at the top level.
+        pivot_range: Any = None
         for tac in tactics:
             entry: dict[str, Any] = {"tactics": tac}
             _start = time.monotonic()
@@ -1603,12 +1710,14 @@ async def run_step_multi(
             # watchdog's command phase in _run_with_lsp, whose window scales with
             # the batch (command_count * _t + grace).
             answer = checker.goals(
-                resolved, line, character, command=tac,
+                resolved, line, character, command=tac, content=content,
                 command_timeout=_t, mode=_goals_mode(before),
                 timeout=0,
                 sentence_timeout=_server.ROCQ_SENTENCE_TIMEOUT,
             )
             entry["elapsed_s"] = round(time.monotonic() - _start, 3)
+            if pivot_range is None and isinstance(answer, dict):
+                pivot_range = answer.get("range")
             kind, payload = _classify_goals_answer(answer)
             if kind == "transport":
                 # coq-lsp died -- abort the whole batch with a hard failure.
@@ -1639,11 +1748,23 @@ async def run_step_multi(
                 if feedback:
                     entry["feedback"] = feedback
             results.append(entry)
+        # Every block failed (error answers carry no range), so probe the base
+        # state once with a no-command goals call to recover the anchor -- cheap
+        # on the now-warm document, and only when needed.
+        if pivot_range is None and content is not None:
+            base = checker.goals(
+                resolved, line, character, content=content,
+                mode=_goals_mode(before), timeout=0,
+                sentence_timeout=_server.ROCQ_SENTENCE_TIMEOUT,
+            )
+            if isinstance(base, dict):
+                pivot_range = base.get("range")
         return {
             "success": True,
             "file_path": file_path,
             "line": line,
             "character": character,
+            **_pivot_field(content, pivot_range, before),
             "results": results,
         }
 

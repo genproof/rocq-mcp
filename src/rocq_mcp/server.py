@@ -1943,6 +1943,12 @@ async def rocq_get_state(
     ``in_proof`` (False when the position is not inside any proof).  There is no ``state_id`` — run tactics from here with
     ``rocq_step`` / ``rocq_step_multi`` by passing the same position.
 
+    To pin down *where* the state sits, the result also carries the pivot
+    sentence at the point: ``before_sentence`` when ``before=True`` (the goals
+    are the state right before that sentence runs) or ``after_sentence`` when
+    ``before=False`` (the state right after it).  Omitted when the point is at
+    a sentence boundary or EOF (no sentence there).
+
     Args:
         file_path: Path to the .v file (relative to workspace).
         line: 0-based line number.
@@ -2086,7 +2092,10 @@ async def rocq_step(
     step, write it into the file yourself, then re-query by position.
 
     On success returns ``goals`` -- a list of ``{hyps, conclusion}``
-    objects, empty when no foreground goals remain.
+    objects, empty when no foreground goals remain -- plus the pivot sentence
+    anchoring the base state the block ran from: ``before_sentence``
+    (``before=True``) or ``after_sentence`` (``before=False``), omitted at a
+    sentence boundary / EOF.
     If Coq rejects the block, returns ``{success: False, reason:
     "tactic_failed", error: <coq message>}``.  A *cooperative* slow block is
     aborted coq-side at ``timeout`` and returns ``{success: False, reason:
@@ -2169,6 +2178,11 @@ async def rocq_step_multi(
     batch's wall-clock budget (``len(tactics) * timeout + ROCQ_PROGRESS_GRACE``)
     and the whole call returns ``{success: False, reason: "command_timeout",
     lsp_restarted: True}``.
+
+    All blocks share one base state, so its pivot sentence is reported once at
+    the top level: ``before_sentence`` (``before=True``) or ``after_sentence``
+    (``before=False``) -- present even when every block fails, omitted only at a
+    sentence boundary / EOF.
 
     Useful for an automation battery without committing any of it::
 

@@ -168,6 +168,40 @@ class TestGetState:
         assert {"names": ["n", "m"], "type": "nat"} in after["goals"][0]["hyps"]
 
     @pytest.mark.asyncio
+    async def test_pivot_sentence_before_and_after(self, proof_ws, lstate):
+        # Pointing at "induction n." (line 4): the pivot sentence anchors
+        # where the reported state sits.
+        before = await run_get_state(
+            file_path="t.v", line=4, character=2, workspace=str(proof_ws),
+            lifespan_state=lstate,
+        )
+        assert before["before_sentence"] == "induction n."
+        assert "after_sentence" not in before
+        # before=True reports the state the sentence operates on (1 goal).
+        assert len(before["goals"]) == 1
+
+        after = await run_get_state(
+            file_path="t.v", line=4, character=2, workspace=str(proof_ws),
+            lifespan_state=lstate, before=False,
+        )
+        assert after["after_sentence"] == "induction n."
+        assert "before_sentence" not in after
+        # before=False reports the state after it (induction -> 2 subgoals).
+        assert len(after["goals"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_pivot_sentence_omitted_at_boundary(self, proof_ws, lstate):
+        # At the exact end of a sentence (char 14 == end of "induction n."),
+        # coq-lsp reports no node, so neither pivot field is present.
+        r = await run_get_state(
+            file_path="t.v", line=4, character=14, workspace=str(proof_ws),
+            lifespan_state=lstate,
+        )
+        assert r["success"] is True
+        assert "before_sentence" not in r
+        assert "after_sentence" not in r
+
+    @pytest.mark.asyncio
     async def test_not_in_proof(self, proof_ws, lstate):
         # The Require line is not inside any proof.
         r = await run_get_state(
@@ -259,6 +293,27 @@ class TestStep:
         assert r["success"] is True
         assert isinstance(r["elapsed_s"], (int, float))
         assert r["elapsed_s"] >= 0.0
+
+    @pytest.mark.asyncio
+    async def test_step_reports_pivot_sentence(self, proof_ws, lstate):
+        # Running from line 4 ("induction n.") anchors the base state to that
+        # pivot sentence: before=True -> before_sentence, before=False ->
+        # after_sentence.
+        # idtac succeeds from either base state, so the success result (which
+        # carries the anchor) is produced in both directions.
+        before = await run_step(
+            file_path="t.v", line=4, character=2, tactics="idtac.",
+            workspace=str(proof_ws), lifespan_state=lstate,
+        )
+        assert before["before_sentence"] == "induction n."
+        assert "after_sentence" not in before
+
+        after = await run_step(
+            file_path="t.v", line=4, character=2, tactics="idtac.",
+            workspace=str(proof_ws), lifespan_state=lstate, before=False,
+        )
+        assert after["after_sentence"] == "induction n."
+        assert "before_sentence" not in after
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +412,24 @@ class TestStepMulti:
         for entry in r["results"]:
             assert isinstance(entry["elapsed_s"], (int, float))
             assert entry["elapsed_s"] >= 0.0
+        # The shared base state's pivot sentence is reported once at the top
+        # level (line 3 == "intros n m."), not per-block.
+        assert r["before_sentence"] == "intros n m."
+        assert all("before_sentence" not in e for e in r["results"])
+
+    @pytest.mark.asyncio
+    async def test_multi_pivot_present_even_when_all_blocks_fail(
+        self, proof_ws, lstate
+    ):
+        # The anchor comes from the (ok) base-state node, so it is reported
+        # even when every block is rejected by Coq.
+        r = await run_step_multi(
+            file_path="t.v", line=3, character=2,
+            tactics=["reflexivity.", "assumption."],
+            workspace=str(proof_ws), lifespan_state=lstate,
+        )
+        assert all(e["success"] is False for e in r["results"])
+        assert r["before_sentence"] == "intros n m."
 
 
 # ---------------------------------------------------------------------------
