@@ -1122,6 +1122,7 @@ class LspChecker:
         *,
         content: str | None = None,
         timeout: float = _DEFAULT_REQUEST_TIMEOUT,
+        sentence_timeout: float = 0.0,
     ) -> Any:
         """Run ``coq/extract`` at a point in an open proof.
 
@@ -1138,6 +1139,11 @@ class LspChecker:
         session that has already checked past it replies immediately.  The
         server refuses (an error reply) when any sentence *before* the
         point is broken — the extracted goal would be unsound.
+
+        *sentence_timeout* > 0 bounds each sentence on the way to the point
+        coq-lsp-side (seconds), matching ``goals``: a cooperative slow sentence
+        before the point is aborted in Coq (and surfaces as an upstream error)
+        instead of blocking the request; proof-closing commands are exempt.
 
         Returns the raw result dict (keys include ``goal_file``,
         ``proof_file``, ``goal_module``, ``apply_with``, ``hash``,
@@ -1158,7 +1164,10 @@ class LspChecker:
             # The server must reach the point (recovering from upstream
             # errors) to extract / report errors-before; keep max_errors at
             # the default in case a stop-at-first-error check lowered it.
-            self._set_max_errors_locked(_MAX_ERRORS_FULL)
+            # *sentence_timeout* (> 0) bounds each sentence on the way to the
+            # point coq-lsp-side, so a slow/diverging prefix sentence is aborted
+            # in Coq instead of blocking the extraction request.
+            self._set_max_errors_locked(_MAX_ERRORS_FULL, sentence_timeout)
             return self._request(
                 "coq/extract",
                 {

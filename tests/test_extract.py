@@ -162,6 +162,74 @@ def lstate():
     stop_all_checkers(state)
 
 
+# ---------------------------------------------------------------------------
+# Timeout wiring (no coq-lsp: _run_with_lsp is stubbed to a recording checker)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractTimeouts:
+    @pytest.mark.asyncio
+    async def test_blocks_by_default_and_applies_sentence_timeout(
+        self, monkeypatch, tmp_path
+    ):
+        """run_extract reaches the point like the other position tools: block
+        client-side (timeout=0) and bound each sentence coq-lsp-side with
+        ROCQ_SENTENCE_TIMEOUT -- no hardcoded client deadline."""
+        import rocq_mcp.server as _server
+
+        f = tmp_path / "x.v"
+        f.write_text("Lemma l : True.\nProof.\n  admit.\nAdmitted.\n")
+        calls: dict = {}
+
+        class _Rec:
+            def extract(self, path, line, character, name, *, content=None,
+                        timeout=None, sentence_timeout=0.0):
+                calls.update(timeout=timeout, sentence_timeout=sentence_timeout)
+                return {"goal_module": f"{name}_goal", "hash": "h"}
+
+        async def fake_run(fn, lifespan_state, tool, *, workspace, key=None, **kw):
+            return fn(_Rec())
+
+        monkeypatch.setattr(_server, "_run_with_lsp", fake_run)
+        monkeypatch.setattr(_server, "ROCQ_SENTENCE_TIMEOUT", 42.0)
+
+        r = await run_extract(
+            file_path=str(f), line=2, character=2, name="Foo",
+            workspace=str(tmp_path), lifespan_state=make_lifespan_state(),
+            annotate=False,
+        )
+        assert r["success"] is True
+        assert calls["timeout"] == 0.0          # block: no client-side deadline
+        assert calls["sentence_timeout"] == 42.0  # per-sentence bound applied
+
+    @pytest.mark.asyncio
+    async def test_explicit_timeout_is_honored(self, monkeypatch, tmp_path):
+        """A caller-supplied timeout > 0 still imposes a client-side wait."""
+        import rocq_mcp.server as _server
+
+        f = tmp_path / "x.v"
+        f.write_text("Lemma l : True.\nProof.\n  admit.\nAdmitted.\n")
+        calls: dict = {}
+
+        class _Rec:
+            def extract(self, path, line, character, name, *, content=None,
+                        timeout=None, sentence_timeout=0.0):
+                calls.update(timeout=timeout)
+                return {"goal_module": f"{name}_goal", "hash": "h"}
+
+        async def fake_run(fn, lifespan_state, tool, *, workspace, key=None, **kw):
+            return fn(_Rec())
+
+        monkeypatch.setattr(_server, "_run_with_lsp", fake_run)
+
+        await run_extract(
+            file_path=str(f), line=2, character=2, name="Foo",
+            workspace=str(tmp_path), lifespan_state=make_lifespan_state(),
+            annotate=False, timeout=30.0,
+        )
+        assert calls["timeout"] == 30.0
+
+
 @_lsp_only
 class TestExtractEndToEnd:
     async def test_extract_creates_files_and_annotates(self, tmp_path, lstate):

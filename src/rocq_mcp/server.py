@@ -2089,8 +2089,11 @@ async def rocq_extract(
             project markers near *file_path*; falls back to ``ROCQ_WORKSPACE``.
         annotate: Wire the ``confirm_extraction`` tripwire into the source
             (default True); False leaves the source untouched.
-        timeout: Seconds to wait for the extraction point to be checked
-            (0 = a generous default; raise it for a cold, big file).
+        timeout: Client-side seconds to wait for the extraction point to be
+            checked.  0 (default) blocks with no client deadline -- reaching the
+            point is bounded coq-lsp-side (``ROCQ_SENTENCE_TIMEOUT`` per
+            sentence) and by the stall / hard-timeout watchdogs; pass a value to
+            impose an explicit client wait instead.
     """
     workspace = workspace or _find_project_root_from_file(file_path) or ROCQ_WORKSPACE
     err = _validate_workspace(workspace)

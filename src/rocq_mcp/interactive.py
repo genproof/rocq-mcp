@@ -1446,12 +1446,18 @@ async def run_extract(
     except (ValueError, FileNotFoundError) as e:
         return _server._fail(lifespan_state, "rocq_extract", str(e))
 
-    # Extraction needs the document checked up to the point, which on a cold
-    # session can take a while; default generous, allow override.
-    _t = float(timeout) if timeout and timeout > 0 else 600.0
+    # Block (timeout=0) by default, like the other position tools: reaching the
+    # extraction point is bounded coq-lsp-side by ROCQ_SENTENCE_TIMEOUT (each
+    # sentence on the way) and, as backstops, by the stall / hard-timeout
+    # watchdogs in _run_with_lsp -- not by a client-side deadline.  An explicit
+    # *timeout* > 0 still imposes a client-side wait.
+    _t = float(timeout) if timeout and timeout > 0 else 0.0
 
     def _do(checker: Any) -> dict[str, Any]:
-        res = checker.extract(resolved, line, character, name, timeout=_t)
+        res = checker.extract(
+            resolved, line, character, name, timeout=_t,
+            sentence_timeout=_server.ROCQ_SENTENCE_TIMEOUT,
+        )
         if isinstance(res, dict) and "_lsp_error" in res:
             lerr = res["_lsp_error"]
             if res.get("_lsp_timeout"):
