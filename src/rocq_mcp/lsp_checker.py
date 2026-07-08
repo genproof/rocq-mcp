@@ -160,6 +160,18 @@ def _split_by_severity(
     return errors, warnings, info
 
 
+def _barrier_end_line(barrier: dict[str, Any] | None) -> int:
+    """End line of the sentence covering the barrier point, from a
+    ``GoalsAnswer`` payload; ``-1`` when unavailable (no answer arrived, or
+    the point sits between sentences and ``range`` is null).
+    """
+    if not isinstance(barrier, dict):
+        return -1
+    end = (barrier.get("range") or {}).get("end") or {}
+    end_line = end.get("line")
+    return end_line if isinstance(end_line, int) else -1
+
+
 # coq-lsp fileProgress "kind": 1 = Processing (being checked), 2 = FatalError.
 _PROGRESS_PROCESSING = 1
 
@@ -785,7 +797,7 @@ class LspChecker:
         uri = Path(resolved).as_uri()
         start_time = time.monotonic()
         self._sync_document(uri, content)
-        settled = self._drive_barrier_locked(
+        settled, _ = self._drive_barrier_locked(
             uri,
             len(content.splitlines()),
             0,
@@ -812,9 +824,10 @@ class LspChecker:
         (the file outline) and the append-a-query path.  Thin wrapper over
         :meth:`_drive_barrier_locked` with the EOF target and no early stop.
         """
-        return self._drive_barrier_locked(
+        settled, _ = self._drive_barrier_locked(
             uri, len(content.splitlines()), 0, timeout, stop_at_first_error=False
         )
+        return settled
 
     def _set_max_errors_locked(
         self, n: int, sentence_timeout: float = 0.0
@@ -855,20 +868,34 @@ class LspChecker:
         *,
         stop_at_first_error: bool,
         sentence_timeout: float = 0.0,
-    ) -> bool:
-        """Drive checking toward ``(line, character)``; report whether it settled.
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Drive checking toward ``(line, character)``; return ``(settled,
+        barrier_answer)``.
 
         Issues a ``proof/goals`` barrier at the target -- in
         ``check_only_on_request`` mode this is what makes coq-lsp check up to
         that point.  ``max_errors`` is set to ``0`` (halt at the first error)
         or the default (run through, report all) per *stop_at_first_error*.
 
-        Returns ``True`` when checking settled -- the target was reached
+        *settled* is ``True`` when checking settled -- the target was reached
         (barrier answered), or, when *stop_at_first_error*, coq-lsp halted at
         the first error (which it publishes but then stops, so an expensive
-        tail below it is never run).  Returns ``False`` on timeout / dead
-        process -- the document is then only partially checked.  Caller holds
-        ``self._lock`` and the document is already synced/open.
+        tail below it is never run).  ``False`` on timeout / dead process --
+        the document is then only partially checked.
+
+        *barrier_answer* is the ``GoalsAnswer`` payload of the barrier
+        response when one arrived, else ``None``.  Its ``range`` field is the
+        extent of the sentence *covering* the point (Exact match server-side;
+        ``null`` when the point sits between sentences) -- positional callers
+        use it to keep diagnostics that a multi-line sentence reports below
+        the point (see :meth:`check_up_to`).  On the halt-at-first-error
+        settle the answer usually trails the error publish (coq-lsp serves
+        the request only after the check stops), so we grant it a short grace
+        instead of returning at once; when the halt happens *before* the
+        point is reached the request stays postponed and no answer ever
+        comes -- the grace expires and *barrier_answer* is ``None``.
+
+        Caller holds ``self._lock`` and the document is already synced/open.
         """
         self._set_max_errors_locked(
             _MAX_ERRORS_FIRST if stop_at_first_error else _MAX_ERRORS_FULL,
@@ -893,7 +920,7 @@ class LspChecker:
         try:
             self._send_message(msg)
         except (BrokenPipeError, OSError, ValueError):
-            return False
+            return False, None
         deadline = time.monotonic() + timeout if timeout > 0 else None
         settled = False
         with self._cv:
@@ -917,9 +944,22 @@ class LspChecker:
                     self._cv.wait(min(remaining, 0.5))
                 else:
                     self._cv.wait(0.5)
-            # Drop the response (present or late) so it cannot orphan.
-            self._responses.pop(req_id, None)
-        return settled
+            # On the halt settle the barrier answer trails the error publish
+            # (it is served, with the covering sentence's range, right after
+            # the check stops -- but only if the halting sentence reached the
+            # point).  Grace-wait for it; expire quietly when the halt was
+            # before the point and no answer is coming.
+            if settled and req_id not in self._responses and not self._dead:
+                grace = time.monotonic() + _DIAG_TRAILING_GRACE
+                while req_id not in self._responses and not self._dead:
+                    remaining = grace - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._cv.wait(remaining)
+            # Take the response (present or late) so it cannot orphan.
+            resp = self._responses.pop(req_id, None)
+        result = resp.get("result") if isinstance(resp, dict) else None
+        return settled, result if isinstance(result, dict) else None
 
     def check_up_to(
         self,
@@ -943,10 +983,13 @@ class LspChecker:
         ``check_only_on_request`` mode (see :meth:`_start`), it then STOPS
         -- it does not run the rest of the document -- so the session stays
         responsive and an expensive tail (e.g. a slow/diverging tactic
-        further down) is never started by a query before it.  The goals
-        payload is ignored; the request is purely a "checked up to here"
-        signal.  We then return the diagnostics published for the prefix
-        (start line ``<= line``) in the same shape as :meth:`check_file`.
+        further down) is never started by a query before it.  Besides being
+        the "checked up to here" signal, the response's ``range`` field (the
+        extent of the sentence covering the point) widens the prefix filter:
+        we return the diagnostics published for the prefix -- start line at
+        or before *line*, extended through the end of the covering sentence,
+        so an error a multi-line sentence reports below the point is not
+        dropped -- in the same shape as :meth:`check_file`.
 
         *character* ``None`` means "through the end of *line*": the point
         is placed just after that line's last character, so the line's
@@ -991,12 +1034,23 @@ class LspChecker:
             # timeout / dead process (the check never reached the point and
             # found no error on the way); the prefix diagnostics are then
             # best-effort.
-            settled = self._drive_barrier_locked(
+            settled, barrier = self._drive_barrier_locked(
                 uri, line, b_char, timeout,
                 stop_at_first_error=stop_at_first_error,
                 sentence_timeout=sentence_timeout,
             )
-            diags = self._collect_prefix_diags(uri, line)
+            # The prefix cutoff is the requested line, extended to the end of
+            # the sentence COVERING the point (the barrier answer's ``range``).
+            # A multi-line sentence reports its error at the offending
+            # subterm's line, which can be below the point; a cutoff at the
+            # raw line would drop that error as if it belonged to a sentence
+            # past the point -- a false green for the very sentence the caller
+            # asked about.  Sentences genuinely past the point stay excluded:
+            # the covering sentence ends before they start, and when the point
+            # sits between sentences the answer's range is null (Exact match).
+            diags = self._collect_prefix_diags(
+                uri, max(line, _barrier_end_line(barrier))
+            )
             elapsed = time.monotonic() - start_time
 
         return self._result_from_diags(
@@ -1026,6 +1080,9 @@ class LspChecker:
     def _collect_prefix_diags(self, uri: str, line: int) -> list[dict[str, Any]]:
         """Diagnostics for *uri* with start line ``<= line`` (the barrier
         prefix).  Tail diagnostics past the point are dropped by the filter.
+        *line* is the caller's cutoff -- :meth:`check_up_to` passes the
+        requested line already extended through the sentence covering the
+        point, so a multi-line sentence's below-the-point error survives.
         """
         return [d for d in self._diags_after_grace(uri) if d["line"] <= line]
 
