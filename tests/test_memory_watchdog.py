@@ -872,6 +872,76 @@ def test_extract_sentence(tmp_path):
     assert _extract_sentence(str(f), 99, 0) is None
 
 
+def test_extract_sentence_skips_leading_comments(tmp_path):
+    """Comments between the frontier and the running sentence are skipped.
+
+    The frontier sits at the end of the last finished sentence; anything
+    Coq's lexer skips before the next sentence -- whitespace and (nested)
+    comments, even ones containing periods or a quoted ``*)`` -- must not
+    masquerade as that sentence.  This is what the Qed exemption reads:
+    a comment before a slow Qed used to defeat it (the watchdog killed an
+    honest kernel check as "diverging", naming the comment).
+    """
+    from rocq_mcp.server import _extract_sentence, _is_proof_closing_sentence
+
+    cases = [
+        "(* checked by the kernel *)\nQed.\n",
+        "(* outer (* nested *) still outer *)\nQed.\n",
+        "(* contains a period. and more. *)\nQed.\n",
+        '(* a string with a fake closer: "*)" *)\nQed.\n',
+        "(* one *) (* two *)\n  Qed.\n",
+    ]
+    f = tmp_path / "x.v"
+    for tail in cases:
+        f.write_text("exact_no_check (eq_refl 0).\n" + tail)
+        # Point = frontier = just after the previous sentence's period.
+        got = _extract_sentence(str(f), 0, 27)
+        assert got == "Qed.", (tail, got)
+        assert _is_proof_closing_sentence(got)
+
+
+def test_extract_sentence_strict_on_malformed_input(tmp_path):
+    """Fail-closed: malformed input must never widen the Qed exemption.
+
+    An unterminated comment scans to EOF and yields NO sentence -- the
+    frontier stays killable.  This strictness is load-bearing: the stall
+    watchdog is the only bound on non-cooperative divergence, so the
+    exemption may only fire on a positively identified proof closer.
+    """
+    from rocq_mcp.server import _extract_sentence, _is_proof_closing_sentence
+
+    f = tmp_path / "x.v"
+    f.write_text("exact I.\n(* never closed...\nQed.\n")
+    got = _extract_sentence(str(f), 0, 8)
+    assert got is None
+    assert not _is_proof_closing_sentence(got)
+
+
+def test_extract_sentence_names_real_sentence_behind_comment(tmp_path):
+    """A comment before a NON-closing sentence: still killable, now named
+    correctly (the sentence, not the comment) -- accuracy in both
+    directions."""
+    from rocq_mcp.server import _extract_sentence, _is_proof_closing_sentence
+
+    f = tmp_path / "x.v"
+    f.write_text("Definition ok : nat := 0.\n(* boom *)\ndo 9 idtac.\n")
+    got = _extract_sentence(str(f), 0, 25)
+    assert got == "do 9 idtac."
+    assert not _is_proof_closing_sentence(got)
+
+
+def test_extract_sentence_period_inside_midsentence_syntax(tmp_path):
+    """Periods inside inline comments or string literals do not truncate
+    the sentence text (the terminator scan skips both)."""
+    from rocq_mcp.server import _extract_sentence
+
+    f = tmp_path / "x.v"
+    f.write_text('apply (* uses foo. *) bar.\n')
+    assert _extract_sentence(str(f), 0, 0) == "apply (* uses foo. *) bar."
+    f.write_text('Definition s := "dot. inside" .\n')
+    assert _extract_sentence(str(f), 0, 0) == 'Definition s := "dot. inside" .'
+
+
 def test_force_kill_kills_process_and_wakes_waiters():
     """force_kill SIGKILLs the subprocess and flips _dead (waking _cv waiters)
     without taking self._lock."""

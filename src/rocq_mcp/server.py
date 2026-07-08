@@ -990,17 +990,67 @@ def _build_lsp_hard_timeout_response(
     }
 
 
+def _skip_ws_and_comments(text: str, i: int) -> int:
+    """Index after any whitespace / nested ``(* ... *)`` runs at *i*.
+
+    Mirrors what Coq's lexer skips before a sentence, so the stall
+    watchdog's sentence extraction sees the same first token the parser
+    sees: a comment between two sentences must neither masquerade as the
+    running sentence (it defeated the Qed exemption, killing honest slow
+    kernel checks as "diverging") nor truncate its text.  Coq comments
+    nest, and a double-quoted string inside a comment may contain ``*)``
+    -- both are honored.
+
+    STRICT / fail-closed: an unterminated comment (or a comment whose
+    closer is hidden by an unterminated string) scans to end-of-text, so
+    the caller extracts NO sentence and the frontier stays KILLABLE --
+    the exemption can only widen through text the lexer provably skips,
+    never through malformed input.
+    """
+    n = len(text)
+    while i < n:
+        if text[i].isspace():
+            i += 1
+        elif text.startswith("(*", i):
+            depth = 1
+            i += 2
+            while i < n and depth > 0:
+                if text.startswith("(*", i):
+                    depth += 1
+                    i += 2
+                elif text.startswith("*)", i):
+                    depth -= 1
+                    i += 2
+                elif text[i] == '"':
+                    j = text.find('"', i + 1)
+                    i = n if j == -1 else j + 1
+                else:
+                    i += 1
+        else:
+            break
+    return i
+
+
 def _extract_sentence(
     path: str, line: int, character: int, max_len: int = 300
 ) -> str | None:
     """Best-effort text of the sentence beginning at *(line, character)*.
 
-    For the stall-timeout diagnostic: skips leading whitespace from the point
-    and returns text up to the next sentence terminator (``.`` followed by
-    whitespace or EOF), whitespace collapsed and capped at *max_len*.  A
-    heuristic, not a full Coq lexer (it may run through a ``.`` inside a comment
-    or string), but enough to name the diverging sentence.  Returns ``None`` if
-    the file cannot be read or the point is out of range.
+    Serves both stall-watchdog consumers: the ``diverging_sentence``
+    naming and the proof-closing (Qed) exemption.  The point is the
+    checking frontier -- the end of the last finished sentence -- so the
+    text that follows, after the whitespace and comments Coq's lexer
+    would skip (:func:`_skip_ws_and_comments`), is the sentence currently
+    elaborating.  The terminator scan (``.`` followed by whitespace or
+    EOF) likewise skips comment blocks and string literals, so a period
+    inside either cannot truncate the sentence.
+
+    Still a heuristic, not a full lexer, and deliberately STRICT: an
+    unreadable file, an out-of-range point, or malformed input (e.g. an
+    unterminated comment) returns ``None``, which
+    :func:`_is_proof_closing_sentence` treats as NOT proof-closing -- the
+    watchdog must keep killing everything that cannot be positively
+    identified as an honest ``Qed``-family sentence.
     """
     try:
         text = Path(path).read_text()
@@ -1010,10 +1060,26 @@ def _extract_sentence(
     if line < 0 or line >= len(file_lines):
         return None
     offset = sum(len(s) for s in file_lines[:line]) + character
-    rest = text[offset:].lstrip()
-    m = re.search(r"\.(?:\s|$)", rest)
-    end = m.end() if m else min(len(rest), max_len)
-    sentence = " ".join(rest[:end].split())
+    start = _skip_ws_and_comments(text, offset)
+    n = len(text)
+    i, end = start, None
+    # Bound the scan: mid-sentence comments are skipped for free, but a
+    # pathological terminator-less blob must not walk an entire huge file.
+    scan_limit = start + 20 * max_len
+    while i < n and i <= scan_limit:
+        if text.startswith("(*", i):
+            i = _skip_ws_and_comments(text, i)
+        elif text[i] == '"':
+            j = text.find('"', i + 1)
+            i = n if j == -1 else j + 1
+        elif text[i] == "." and (i + 1 >= n or text[i + 1].isspace()):
+            end = i + 1
+            break
+        else:
+            i += 1
+    if end is None:
+        end = min(n, start + max_len)
+    sentence = " ".join(text[start:end].split())
     if len(sentence) > max_len:
         sentence = sentence[:max_len] + " …"
     return sentence or None
