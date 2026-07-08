@@ -20,6 +20,7 @@ Tools:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -967,6 +968,213 @@ async def run_toc(
         "rocq_toc",
         workspace=workspace,
         key=_server._session_key(workspace, file_path),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: rocq_profile (per-sentence timing / memory via $/coq/filePerfData)
+# ---------------------------------------------------------------------------
+
+# How many hottest sentences to surface inline in the tool response by default
+# (the full per-sentence table always goes to the output file).
+_PROFILE_TOP_DEFAULT: int = 15
+_PROFILE_TOP_MAX: int = 200
+# Per-sentence text caps: generous in the saved file (enough to identify a
+# sentence), tight for the inline hotspot list (keeps the response compact).
+_PROFILE_FILE_TEXT_CAP: int = 300
+_PROFILE_HOTSPOT_TEXT_CAP: int = 100
+
+
+def _normalize_sentence_text(text: str, cap: int) -> str:
+    """Collapse a (possibly multi-line) sentence to one capped display line."""
+    one_line = " ".join(text.split())
+    if len(one_line) > cap:
+        return one_line[:cap] + f"… ({len(one_line)} chars)"
+    return one_line
+
+
+def _slice_range(
+    lines: list[str], sl: int, sc: int, el: int, ec: int
+) -> str:
+    """Return the source text spanned by an LSP range over *lines*.
+
+    Best-effort: coq-lsp reports UTF-16 character offsets, which match Python
+    string indices for ASCII (the overwhelming majority of Coq source); a rare
+    non-ASCII notation may shift the slice slightly, but the text is only for
+    display/identification.  Out-of-range indices are clamped.
+    """
+    if not lines or sl < 0 or sl >= len(lines):
+        return ""
+    if el >= len(lines):
+        el = len(lines) - 1
+        ec = len(lines[el])
+    if sl == el:
+        return lines[sl][sc:ec]
+    parts = [lines[sl][sc:], *lines[sl + 1 : el], lines[el][:ec]]
+    return "\n".join(parts)
+
+
+def _build_profile_sentences(
+    timings: list[dict[str, Any]], content_lines: list[str]
+) -> list[dict[str, Any]]:
+    """Turn coq-lsp perf ``timings`` into enriched per-sentence records.
+
+    Each record carries the sentence's position, the source text sliced from
+    its range, and the timing / memory fields from ``$/coq/filePerfData``,
+    preserving coq-lsp's document order.
+    """
+    sentences: list[dict[str, Any]] = []
+    for i, t in enumerate(timings):
+        rng = t.get("range") or {}
+        start = rng.get("start") or {}
+        end = rng.get("end") or {}
+        sl = int(start.get("line", 0))
+        sc = int(start.get("character", 0))
+        el = int(end.get("line", sl))
+        ec = int(end.get("character", sc))
+        info = t.get("info") or {}
+        text = _slice_range(content_lines, sl, sc, el, ec)
+        sentences.append(
+            {
+                "index": i,
+                "line": sl,
+                "character": sc,
+                "end_line": el,
+                "end_character": ec,
+                "text": _normalize_sentence_text(text, _PROFILE_FILE_TEXT_CAP),
+                "time_s": round(float(info.get("time", 0.0)), 6),
+                "memory_words": float(info.get("memory", 0.0)),
+                "cache_hit": bool(info.get("cache_hit", False)),
+                "time_hash_s": round(float(info.get("time_hash", 0.0)), 6),
+            }
+        )
+    return sentences
+
+
+def _hotspot_view(s: dict[str, Any]) -> dict[str, Any]:
+    """Compact inline view of one sentence for the tool response."""
+    return {
+        "line": s["line"],
+        "time_s": s["time_s"],
+        "cache_hit": s["cache_hit"],
+        "text": _normalize_sentence_text(s["text"], _PROFILE_HOTSPOT_TEXT_CAP),
+    }
+
+
+def _resolve_profile_output(
+    resolved_v: str, workspace: str, output: str | None
+) -> Path | str:
+    """Resolve the profile JSON output path, constrained to the workspace.
+
+    Returns a ``Path`` on success or an error-message ``str`` on rejection.
+    ``output`` is relative to *workspace* (default: ``<stem>.profile.json``
+    next to the ``.v`` file).
+    """
+    ws = Path(workspace).resolve()
+    if not output:
+        base = Path(resolved_v)
+        return base.with_name(base.stem + ".profile.json")
+    cand = (ws / output).resolve()
+    if not _server._path_within(cand, ws):
+        return "output path must be within the workspace."
+    if cand.is_dir():
+        return f"output path is a directory: {output}"
+    return cand
+
+
+async def run_profile(
+    file_path: str,
+    workspace: str,
+    lifespan_state: dict[str, Any],
+    *,
+    output: str | None = None,
+    top: int = _PROFILE_TOP_DEFAULT,
+) -> dict[str, Any]:
+    """Core implementation of rocq_profile (testable without FastMCP Context).
+
+    Drives a full check and collects coq-lsp's ``$/coq/filePerfData``
+    (per-sentence ``time`` / ``memory``), writes the full per-sentence table
+    to a JSON file for later inspection, and returns a compact summary with
+    the hottest sentences inline.
+    """
+    try:
+        resolved = _server._resolve_file_in_workspace(file_path, workspace)
+    except (ValueError, FileNotFoundError) as e:
+        return _server._fail(lifespan_state, "rocq_profile", str(e))
+
+    top = max(1, min(int(top), _PROFILE_TOP_MAX))
+
+    out_path = _resolve_profile_output(resolved, workspace, output)
+    if isinstance(out_path, str):  # rejection message
+        return _server._fail(
+            lifespan_state, "rocq_profile", out_path, "validation"
+        )
+
+    def _do(checker: Any) -> dict[str, Any]:
+        # No client-side deadline (timeout=0): the check blocks until coq-lsp
+        # settles, bounded process-side by the memory + hard-timeout watchdogs
+        # in _run_with_lsp.  We deliberately do NOT arm a per-sentence stall
+        # timeout here (sentence_timeout=0 below): profiling exists to measure
+        # slow sentences, so an honestly slow tactic must run to completion
+        # rather than be aborted as if it were diverging.
+        res = checker.profile(resolved, workspace=workspace, timeout=0.0)
+        if isinstance(res, dict) and "_lsp_error" in res:
+            lerr = res["_lsp_error"]
+            reason = "timeout" if res.get("_lsp_timeout") else "crashed"
+            msg = lerr.get("message") if isinstance(lerr, dict) else str(lerr)
+            return _server._fail(
+                lifespan_state,
+                "rocq_profile",
+                f"coq-lsp profiling failed: {msg}",
+                reason,
+            )
+
+        try:
+            content_lines = Path(resolved).read_text().splitlines()
+        except (OSError, PermissionError) as e:
+            return _server._fail(lifespan_state, "rocq_profile", str(e), "crashed")
+
+        sentences = _build_profile_sentences(res.get("timings") or [], content_lines)
+        total_time_s = round(sum(s["time_s"] for s in sentences), 6)
+        total_memory_words = sum(s["memory_words"] for s in sentences)
+
+        document = {
+            "file": resolved,
+            "workspace": str(Path(workspace).resolve()),
+            "coq_lsp_summary": res.get("summary", ""),
+            "n_sentences": len(sentences),
+            "total_time_s": total_time_s,
+            "total_memory_words": total_memory_words,
+            "sentences": sentences,
+        }
+        try:
+            out_path.write_text(json.dumps(document, indent=2))
+        except OSError as e:
+            return _server._fail(
+                lifespan_state,
+                "rocq_profile",
+                f"could not write profile to {out_path}: {e}",
+                "crashed",
+            )
+
+        hotspots = sorted(sentences, key=lambda s: s["time_s"], reverse=True)[:top]
+        return {
+            "success": True,
+            "file": file_path,
+            "output_file": os.path.relpath(out_path, Path(workspace).resolve()),
+            "n_sentences": len(sentences),
+            "total_time_s": total_time_s,
+            "summary": res.get("summary", ""),
+            "hotspots": [_hotspot_view(s) for s in hotspots],
+        }
+
+    return await _server._run_with_lsp(
+        _do,
+        lifespan_state,
+        "rocq_profile",
+        workspace=workspace,
+        key=_server._session_key(workspace, file_path),
+        sentence_timeout=0.0,
     )
 
 

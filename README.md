@@ -9,7 +9,7 @@ An [MCP](https://modelcontextprotocol.io/) server for [Rocq](https://rocq-prover
 ## Prerequisites
 
 - **Rocq / Coq** -- `coqc` must be on your `PATH` (needed by all tools). If the workspace contains a `_RocqProject` or `_CoqProject` file, the server parses it for load-path flags (`-Q`, `-R`, `-I`). For **dune projects** (no `_CoqProject` but a `dune-project` file present), the server auto-detects load paths via `dune coq top` (once per `(coq.theory ...)` stanza, so multi-theory workspaces resolve cross-theory imports correctly) and writes a `_RocqProject` file in the workspace so that coq-lsp also picks them up. This generated file stays in the workspace and should be added to `.gitignore`. Otherwise it defaults to `-Q <workspace> Test`.
-- **coq-lsp** -- `coq-lsp` must be on your `PATH` for the interactive and query tools (`rocq_get_state`, `rocq_step`, `rocq_step_multi`, `rocq_query`, `rocq_assumptions`, `rocq_toc`, `rocq_compile_lsp`). If it is not installed, the `coqc`-based tools (`rocq_compile`, `rocq_compile_file`, `rocq_verify`) still work.
+- **coq-lsp** -- `coq-lsp` must be on your `PATH` for the interactive and query tools (`rocq_get_state`, `rocq_step`, `rocq_step_multi`, `rocq_query`, `rocq_assumptions`, `rocq_toc`, `rocq_profile`, `rocq_compile_lsp`). If it is not installed, the `coqc`-based tools (`rocq_compile`, `rocq_compile_file`, `rocq_verify`) still work.
 - **Python 3.11+**
 
 ## Installation
@@ -51,13 +51,14 @@ These are **stateless and position-addressed**: every proof state is referred to
 | **`rocq_query`** | Search the Rocq environment — find lemmas, check types, inspect definitions. Three context modes: **preamble** (import commands as a string), **file** (a `.v` file path whose definitions are in scope), or **position** (`file_path` + `line` + `character` to query at a point in a proof, where local hypotheses are visible). Optional `max_results` limits output. Does not modify anything. |
 | **`rocq_assumptions`** | List the axioms a theorem depends on. Takes a required `file_path` parameter (path to the `.v` file where the theorem is defined) to set up the full environment. Returns `assumptions: list[str]` of `"name : type"` pairs from `Print Assumptions` (empty when the theorem is closed under the global context) plus the full `raw_output`. No classification — pure introspection. Use `rocq_verify` for a sandboxed trust decision. |
 | **`rocq_toc`** | Get the structure of a `.v` file: all definitions, lemmas, theorems, and sections as an outline. Does not require a session. |
+| **`rocq_profile`** | Profile a `.v` file: per-sentence execution `time` (seconds) and `memory` (heap words) from coq-lsp's `$/coq/filePerfData`. Checks the whole file, writes the full per-sentence table to a JSON file (`output`, default `<file>.profile.json`) for later inspection, and returns the `total_time_s` plus the hottest sentences inline (`line` + `text` + `time_s`) so you can act on them at once. Built for a **profile → refactor → re-profile** loop: profile, edit the slow sentence, call again, compare. Each `time` is the sentence's real elaboration time (reported even for a cache hit), so totals stay comparable between calls; there is no built-in diff — save named snapshots (`output="before.json"` / `"after.json"`) and compare yourself. For a fully cold re-measurement (re-exec every sentence, re-load `Require`d libs), call `rocq_restart` first. Honestly slow sentences run to completion — no per-sentence stall abort — bounded only by the memory / hard-timeout watchdogs. Does not require a session. |
 | **`rocq_extract`** | Split the goal at a `(file_path, line, character)` position (0-indexed, on the goal's tactic) into a standalone `<name>_goal.v` (the fully-closed goal as `Definition <name>_Goal`) and `<name>_proof.v` (a `Lemma <name>_proof` skeleton whose proof state equals the state at the extraction point). Re-running rewrites `<name>_goal.v` and refreshes only the first `intros` of an existing `<name>_proof.v`. By default also wires a `confirm_extraction "<hash>"` staleness tripwire into the source (`annotate=false` leaves it untouched). |
 | **`rocq_diag`** | Operational diagnostics: coq-lsp pid / memory headroom and recent errors. Use before a long `vm_compute` to check memory headroom, or after a `memory_exhausted` failure. |
 | **`rocq_restart`** | Restart the underlying coq-lsp subprocess(es). The server keeps one coq-lsp process **per file**; pass `file_path` to restart only that file's session (e.g. after rebuilding a dependency `.vo`, or when a tool reported a stale-import warning), `workspace` for that workspace's shared session, or neither to restart **all** sessions. |
 
 > **Live file:** the interactive tools read the file on disk at call time (coq-lsp re-syncs on each call), so there is no session to go stale — edit the file and re-query. `rocq_step` / `rocq_step_multi` never modify the file; they show what a tactic block *would* do.
 
-> **Workspace auto-detection:** When a file-accepting tool (`rocq_compile_file`, `rocq_compile_lsp`, `rocq_query`, `rocq_assumptions`, `rocq_toc`, `rocq_get_state`, `rocq_step`, `rocq_step_multi`, `rocq_extract`) is called without an explicit `workspace`, the server walks up from the file's directory looking for `_RocqProject`, `_CoqProject`, or `dune-project` markers and uses the directory of the innermost match. Falls back to `ROCQ_WORKSPACE` if no marker is found.
+> **Workspace auto-detection:** When a file-accepting tool (`rocq_compile_file`, `rocq_compile_lsp`, `rocq_query`, `rocq_assumptions`, `rocq_toc`, `rocq_profile`, `rocq_get_state`, `rocq_step`, `rocq_step_multi`, `rocq_extract`) is called without an explicit `workspace`, the server walks up from the file's directory looking for `_RocqProject`, `_CoqProject`, or `dune-project` markers and uses the directory of the innermost match. Falls back to `ROCQ_WORKSPACE` if no marker is found.
 
 ## Recommended usage patterns
 
@@ -290,7 +291,7 @@ Add to your MCP client configuration (e.g., Claude Desktop, Claude Code):
 uv run pytest
 ```
 
-Tests for the coq-lsp-based tools (`rocq_get_state`, `rocq_step`, `rocq_step_multi`, `rocq_query`, `rocq_assumptions`, `rocq_toc`, `rocq_compile_lsp`) require `coq-lsp` to be installed; they are skipped automatically if it is not available.
+Tests for the coq-lsp-based tools (`rocq_get_state`, `rocq_step`, `rocq_step_multi`, `rocq_query`, `rocq_assumptions`, `rocq_toc`, `rocq_profile`, `rocq_compile_lsp`) require `coq-lsp` to be installed; they are skipped automatically if it is not available.
 
 ## Project Structure
 
@@ -313,6 +314,7 @@ tests/
   test_format_error.py    Tests for error formatting
   test_query.py           Tests for rocq_query
   test_toc.py             Tests for rocq_toc
+  test_profile.py         Tests for rocq_profile
   test_lsp_checker.py     Tests for the coq-lsp client
   test_interactive_lsp.py Tests for rocq_get_state / rocq_step / rocq_step_multi
   test_memory_watchdog.py Tests for the coq-lsp memory watchdog

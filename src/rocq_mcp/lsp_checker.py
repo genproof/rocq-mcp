@@ -71,6 +71,13 @@ _VOF_RELOAD_BASE_VERSION: int = 1_000_000
 # behind it.
 _DIAG_TRAILING_GRACE: float = 0.2
 
+# Bounded grace (seconds) to wait for the ``$/coq/filePerfData`` notification
+# after a profiling check settles.  coq-lsp emits it on completion, so it has
+# usually already been dispatched by the time the barrier answers; this only
+# covers the case where it races just behind, and keeps ``profile()`` from
+# blocking forever when the check is driven with no client deadline.
+_PERF_TRAILING_GRACE: float = 10.0
+
 # coq-lsp ``max_errors``: how many errors before it stops checking a document.
 # ``_MAX_ERRORS_FULL`` (its default) lets a check recover from errors and run
 # the whole document -- needed for the append-a-query path and "report all
@@ -231,6 +238,12 @@ class LspChecker:
         self._responses: dict[int, dict[str, Any]] = {}
         # uri -> {"version": int|None, "diags": list[dict]} (latest publish)
         self._doc_state: dict[str, dict[str, Any]] = {}
+        # uri -> {"version": int|None, "summary": str, "timings": list[dict]}
+        # from the latest ``$/coq/filePerfData`` (coq-lsp's per-sentence timing
+        # / memory data, emitted when a check completes -- its send_perf_data
+        # option, on by default).  Captured for :meth:`profile`; cleared per
+        # (re)start alongside _doc_state.
+        self._perf_data: dict[str, dict[str, Any]] = {}
         # Latest $/coq/serverStatus status string ("Busy"/"Idle"/"Stopped").
         self._status: str = "Idle"
         # Latest $/coq/fileProgress frontier: (monotonic_time, line, char) or
@@ -275,6 +288,7 @@ class LspChecker:
         with self._cv:
             self._responses.clear()
             self._doc_state.clear()
+            self._perf_data.clear()
             self._status = "Idle"
             self._last_progress = None
             self._saw_busy = False
@@ -1324,6 +1338,113 @@ class LspChecker:
             )
 
     # ------------------------------------------------------------------
+    # $/coq/filePerfData (per-sentence timing / memory profile)
+    # ------------------------------------------------------------------
+
+    def profile(
+        self,
+        file_path: str,
+        *,
+        content: str | None = None,
+        workspace: str = "",
+        timeout: float = _DEFAULT_REQUEST_TIMEOUT,
+    ) -> dict[str, Any]:
+        """Collect coq-lsp's per-sentence timing / memory data for *file_path*.
+
+        Drives a full check of the document and returns the
+        ``$/coq/filePerfData`` payload coq-lsp emits when checking completes:
+        a ``summary`` line (global hashing / parsing / exec breakdown) and one
+        ``timings`` entry per Flèche node (sentence), each ``{range, info:
+        {time, memory, cache_hit, time_hash}}`` -- ``time`` in seconds,
+        ``memory`` the heap words allocated (``Gc.quick_stat`` delta).
+
+        The check is always re-driven from a fresh document version (a
+        ``didChange`` even when the text is unchanged, via
+        :meth:`_sync_document` rather than :meth:`_ensure_open`): coq-lsp only
+        emits the perf notification on a *completion*, and re-barriering an
+        already-checked document produces none.  Going through
+        ``_sync_document`` also bypasses the ``.vof`` warm-load, so the
+        sentences are really elaborated (a reloaded snapshot can carry no
+        per-sentence stats).  Each reported ``time`` is thus a real elaboration
+        time -- coq-lsp reports the original execution time even for a memo hit
+        -- so summed totals stay comparable across calls without clearing
+        caches.  For a fully cold re-measurement, restart the session first
+        (``rocq_restart``).
+
+        Returns ``{"summary", "timings", "version", "check_time_ms",
+        "settled"}`` or a ``{"_lsp_error": ...}`` dict on transport failure,
+        timeout, or a check that did not complete (no perf data emitted).
+        """
+        with self._lock:
+            self._ensure_started(workspace)
+            resolved = str(Path(file_path).resolve())
+            if content is None:
+                try:
+                    content = Path(resolved).read_text()
+                except (OSError, PermissionError) as e:
+                    return {"_lsp_error": str(e)}
+            uri = Path(resolved).as_uri()
+            # Drop any stale capture so we wait for THIS check's notification.
+            with self._cv:
+                self._perf_data.pop(uri, None)
+            # Force a fresh version (didChange/didOpen) so coq-lsp re-checks to
+            # completion and re-emits $/coq/filePerfData; _ensure_open would
+            # early-return on unchanged content and none would be sent.
+            version = self._sync_document(uri, content)
+            start_time = time.monotonic()
+            settled = self._drive_full_check_locked(uri, content, timeout)
+            # The perf notification can race just behind the completion barrier;
+            # wait a bounded grace for it, never blocking forever (the check may
+            # be driven with no client deadline, timeout == 0).
+            perf_wait = timeout if timeout > 0 else _PERF_TRAILING_GRACE
+            perf = self._await_perf_locked(uri, version, perf_wait)
+            elapsed = time.monotonic() - start_time
+        if perf is None:
+            return {
+                "_lsp_error": (
+                    "profiling data not received"
+                    + ("" if settled else " (check did not complete in time)")
+                ),
+                "_lsp_timeout": not settled,
+            }
+        return {
+            "summary": perf["summary"],
+            "timings": perf["timings"],
+            "version": perf["version"],
+            "check_time_ms": int(elapsed * 1000),
+            "settled": settled,
+        }
+
+    def _await_perf_locked(
+        self, uri: str, version: int, timeout: float
+    ) -> dict[str, Any] | None:
+        """Wait for the ``$/coq/filePerfData`` capture for *uri* at >= *version*.
+
+        The perf notification can land just behind the completion barrier's
+        response, so we wait (bounded by *timeout*) for a capture whose version
+        is at least the one we drove.  Caller holds ``self._lock``.  Returns the
+        stored ``{version, summary, timings}`` dict, or ``None`` on timeout /
+        dead process.
+        """
+        deadline = time.monotonic() + timeout if timeout > 0 else None
+        with self._cv:
+            while True:
+                pd = self._perf_data.get(uri)
+                if pd is not None and (
+                    pd["version"] is None or pd["version"] >= version
+                ):
+                    return pd
+                if self._dead:
+                    return None
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return None
+                    self._cv.wait(min(remaining, 0.5))
+                else:
+                    self._cv.wait(0.5)
+
+    # ------------------------------------------------------------------
     # Generic routed request (coq/getDocument, hover, definition, …)
     # ------------------------------------------------------------------
 
@@ -1423,6 +1544,27 @@ class LspChecker:
                 "lsp", "fileProgress",
                 line=frontier[0] if frontier else None,
                 character=frontier[1] if frontier else None,
+            )
+        elif method == "$/coq/filePerfData":
+            # Per-sentence timing / memory data coq-lsp emits when a document
+            # finishes checking (its send_perf_data option, on by default).
+            # Captured here for profile(); every other path ignores it.
+            params = msg.get("params", {})
+            td = params.get("textDocument") or {}
+            uri = td.get("uri")
+            if uri is None:
+                return
+            timings = params.get("timings") or []
+            with self._cv:
+                self._perf_data[uri] = {
+                    "version": td.get("version"),
+                    "summary": params.get("summary", ""),
+                    "timings": timings,
+                }
+                self._cv.notify_all()
+            dlog.verbose_event(
+                "lsp", "filePerfData", uri=uri, version=td.get("version"),
+                n_sentences=len(timings),
             )
         # Everything else (window/logMessage, …) is intentionally ignored.
 

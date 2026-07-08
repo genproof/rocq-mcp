@@ -1543,6 +1543,7 @@ from rocq_mcp.interactive import (  # noqa: E402
     _MAX_LINE_CHAR_RANGE,
     run_assumptions,
     run_extract,
+    run_profile,
     run_query,
     run_get_state,
     run_step,
@@ -1987,6 +1988,80 @@ async def rocq_toc(
         lifespan_state=ctx.lifespan_context,
     )
     return _attach_stale_warning(result, file_path, workspace, ctx.lifespan_context)
+
+
+# ---------------------------------------------------------------------------
+# Tool: rocq_profile
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+async def rocq_profile(
+    file_path: str,
+    workspace: str = "",
+    output: str = "",
+    top: int = 15,
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Profile a .v file: per-sentence execution time and memory via coq-lsp.
+
+    Checks the whole file and collects coq-lsp's ``$/coq/filePerfData`` — one
+    timing per sentence (``time`` in seconds, ``memory`` in heap words). The
+    full per-sentence table is written to a JSON file for later inspection;
+    the response returns the total time and the hottest sentences inline
+    (line + text + time) so you can act on them immediately.
+
+    Intended for a profile → refactor → re-profile loop: profile, edit the
+    slow sentence in the file, then call again and compare the numbers. Each
+    reported ``time`` is the sentence's real elaboration time (coq-lsp reports
+    the original time even when it serves the sentence from cache), so totals
+    stay comparable between calls without any special handling. There is no
+    built-in diff — save named snapshots via ``output`` (e.g. ``before.json``
+    / ``after.json``) and compare the two responses / files yourself.
+
+    For a fully cold re-measurement (every sentence re-executed from scratch,
+    including re-loading ``Require``-d libraries), call ``rocq_restart`` first
+    to drop the warm session, then profile.
+
+    Does NOT require a rocq_start session. Honestly slow sentences are allowed
+    to run to completion (no per-sentence stall abort) — bounded only by the
+    process-level memory and hard-timeout watchdogs; on a breach the response
+    is a ``{success: False, reason: ..., lsp_restarted: True}`` envelope.
+
+    Args:
+        file_path: Path to the .v file (relative to workspace).
+        workspace: Workspace directory. If omitted, auto-detected by walking
+            up from *file_path* looking for ``_RocqProject`` / ``_CoqProject`` /
+            ``dune-project``; falls back to the ``ROCQ_WORKSPACE`` env var
+            (default: cwd).
+        output: Path (relative to workspace) for the JSON profile file.
+            Default: ``<file>.profile.json`` next to the .v file. Use distinct
+            names to keep baseline snapshots for comparison.
+        top: How many hottest sentences to include inline in the response
+            (default 15; the file always has every sentence).
+    """
+    workspace = workspace or _find_project_root_from_file(file_path) or ROCQ_WORKSPACE
+
+    err = _validate_workspace(workspace)
+    if err:
+        return _fail(
+            ctx.lifespan_context if ctx else None, "rocq_profile", err, "validation"
+        )
+
+    if ctx is None:
+        return {
+            "success": False,
+            "reason": "validation",
+            "error": "Internal error: no MCP context.",
+        }
+
+    return await run_profile(
+        file_path=file_path,
+        workspace=workspace,
+        lifespan_state=ctx.lifespan_context,
+        output=output or None,
+        top=top,
+    )
 
 
 # ---------------------------------------------------------------------------
