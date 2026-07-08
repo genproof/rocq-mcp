@@ -395,11 +395,45 @@ class TestParseProjectFlags:
         flags = _parse_project_flags(tmp_path)
         assert flags == ["-noinit"]
 
-    def test_arg_safe_warning_allowed(self, tmp_path):
-        """-arg -w <warning> is split into two separate coqc arguments."""
-        (tmp_path / "_CoqProject").write_text("-arg -w -notation-overridden\n")
+    def test_arg_warning_pair_one_line(self, tmp_path):
+        """The standard ``-arg -w -arg <spec>`` form yields a -w pair."""
+        (tmp_path / "_CoqProject").write_text(
+            "-arg -w -arg -notation-overridden\n"
+        )
         flags = _parse_project_flags(tmp_path)
         assert flags == ["-w", "-notation-overridden"]
+
+    def test_arg_warning_pair_two_lines(self, tmp_path):
+        """``-arg -w`` / ``-arg <spec>`` on separate lines (the form
+        _parse_dune_args writes into generated _RocqProject files) yields
+        the same -w pair -- tokenization is file-wide, not line-based."""
+        (tmp_path / "_CoqProject").write_text("-arg -w\n-arg +non-recursive\n")
+        flags = _parse_project_flags(tmp_path)
+        assert flags == ["-w", "+non-recursive"]
+
+    def test_arg_warning_quoted_single_token(self, tmp_path):
+        """A quoted ``-arg "-w <spec>"`` is split like the build's shell
+        word-splitting would."""
+        (tmp_path / "_CoqProject").write_text(
+            '-arg "-w -notation-overridden"\n'
+        )
+        flags = _parse_project_flags(tmp_path)
+        assert flags == ["-w", "-notation-overridden"]
+
+    def test_arg_warning_sloppy_form_dropped(self, tmp_path):
+        """``-arg -w -notation-overridden`` (only ONE -arg) officially
+        passes just ``-w``: the spec is a stray token neither coq_makefile
+        nor coq-lsp applies.  The dangling ``-w`` is dropped for parity
+        (coqc would refuse it with no argument)."""
+        (tmp_path / "_CoqProject").write_text("-arg -w -notation-overridden\n")
+        flags = _parse_project_flags(tmp_path)
+        assert flags == []
+
+    def test_arg_type_in_type_allowed(self, tmp_path):
+        """-arg -type-in-type is in the allowlist (coq-lsp applies it)."""
+        (tmp_path / "_CoqProject").write_text("-arg -type-in-type\n")
+        flags = _parse_project_flags(tmp_path)
+        assert flags == ["-type-in-type"]
 
     def test_arg_unknown_rejected(self, tmp_path):
         """Unknown -arg values are silently dropped."""

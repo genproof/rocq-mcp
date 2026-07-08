@@ -217,26 +217,89 @@ def _cleanup_coqc_artifacts(tmp_path: str) -> None:
 
 
 # Allowlisted -arg values for _CoqProject / _RocqProject parsing.
-# Only exact matches or prefix matches are allowed; everything else is
-# silently dropped to prevent coqc flag injection (e.g. -load-vernac-source).
+# Everything else is silently dropped to prevent coqc flag injection
+# (e.g. -load-vernac-source).  Kept in sync with what coq-lsp's
+# ``Coq.Workspace.parse_args`` honors, so the coqc tools and
+# rocq_compile_lsp judge a workspace under the same flags.
 _SAFE_COQC_ARGS: frozenset[str] = frozenset(
     {
         "-noinit",
         "-indices-matter",
         "-impredicative-set",
+        "-type-in-type",
         "-allow-rewrite-rules",
         "-allow-sprop",
         "-cumulative-sprop",
     }
 )
-_SAFE_COQC_ARG_PREFIXES: tuple[str, ...] = ("-w ",)
 
 
-def _is_safe_arg(value: str) -> bool:
-    """Check if an -arg value is in the allowlist."""
-    return value in _SAFE_COQC_ARGS or any(
-        value.startswith(p) for p in _SAFE_COQC_ARG_PREFIXES
-    )
+def _filter_safe_args(args: list[str]) -> list[str]:
+    """Filter a reassembled ``-arg`` token stream against the allowlist.
+
+    ``-w`` consumes the following token as its warning spec -- specs are
+    inert (coqc parses them as warning names, and the value is bound as
+    ``-w``'s argument, never a free flag), so any spec passes.  A quoted
+    single-token ``"-w <spec>"`` is split the way a real build's shell
+    word-splitting would.  A dangling ``-w`` with no spec is dropped
+    (coqc would refuse it).  Every other token must be in
+    ``_SAFE_COQC_ARGS``; unknown flags are silently dropped, preserving
+    the injection barrier (``-load-vernac-source``, ``-init-file``, ...).
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "-w" and i + 1 < len(args):
+            out.extend(["-w", args[i + 1]])
+            i += 2
+        elif a.startswith("-w ") and len(a.split(None, 1)) == 2:
+            out.extend(a.split(None, 1))
+            i += 1
+        elif a in _SAFE_COQC_ARGS:
+            out.append(a)
+            i += 1
+        else:
+            i += 1
+    return out
+
+
+def _lex_project_tokens(text: str) -> list[str]:
+    """Tokenize a ``_CoqProject`` / ``_RocqProject`` with the official rules.
+
+    Mirrors Coq's ``coqProject_file.ml`` lexer, which both coq_makefile and
+    coq-lsp use: whitespace-separated tokens across the WHOLE file (a
+    directive's arguments may sit on the next line), ``#`` at a token start
+    comments to end of line, and a double-quoted string collapses to one
+    token (quotes stripped, inner whitespace preserved).  Line-based
+    parsing diverges from this grammar -- it mis-tokenized the standard
+    ``-arg -w -arg <spec>`` forms, so the coqc tools judged a workspace
+    under different flags than rocq_compile_lsp and the real build.
+    """
+    tokens: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c.isspace():
+            i += 1
+        elif c == "#":
+            nl = text.find("\n", i)
+            i = n if nl == -1 else nl + 1
+        elif c == '"':
+            j = text.find('"', i + 1)
+            if j == -1:
+                tokens.append(text[i + 1 :])
+                i = n
+            else:
+                tokens.append(text[i + 1 : j])
+                i = j + 1
+        else:
+            j = i
+            while j < n and not text[j].isspace() and text[j] != '"':
+                j += 1
+            tokens.append(text[i:j])
+            i = j
+    return tokens
 
 
 def _check_path_containment(ws: Path, dir_arg: str) -> str | None:
@@ -559,13 +622,18 @@ def _parse_project_flags(ws: Path) -> list[str]:
     ``dune coq top``.  If that also fails, returns
     ``["-Q", str(ws), "Test"]`` as a last resort.
 
-    Recognised directives: ``-Q``, ``-R``, ``-I``, ``-arg``.
-    Comment lines (starting with ``#``), ``.v`` file entries, and bare
-    directory names are silently skipped.
+    The file is tokenized with the official grammar (see
+    :func:`_lex_project_tokens`) so the coqc tools read exactly what
+    coq-lsp and a real build read: each ``-arg`` contributes ONE token to
+    an argument stream, which is then filtered as a stream (``-w`` paired
+    with its following spec) -- the standard ``-arg -w -arg <spec>``
+    forms, one-line or spread across lines, all work.  Recognised
+    directives: ``-Q``, ``-R``, ``-I``, ``-arg``; ``.v`` file entries and
+    unknown directives are silently skipped.
 
     Security:
     - ``-arg`` values are checked against an allowlist to prevent
-      coqc flag injection (e.g. ``-load-vernac-source``).
+      coqc flag injection (see :func:`_filter_safe_args`).
     - Directory paths in ``-Q``/``-R``/``-I`` are validated to stay
       within the workspace (absolute paths and ``../`` escapes rejected).
     """
@@ -581,36 +649,25 @@ def _parse_project_flags(ws: Path) -> list[str]:
         return ["-Q", str(ws), "Test"]
 
     flags: list[str] = []
-    lines = proj.read_text().splitlines()
+    args: list[str] = []
+    tokens = _lex_project_tokens(proj.read_text())
     i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if not line or line.startswith("#"):
-            i += 1
-            continue
-        if line == "-arg" and i + 1 < len(lines):
-            value = lines[i + 1].strip()
-            if _is_safe_arg(value):
-                flags.extend(value.split(None, 1))
+    while i < len(tokens):
+        t = tokens[i]
+        if t == "-arg" and i + 1 < len(tokens):
+            args.append(tokens[i + 1])
             i += 2
-        elif line.startswith("-arg "):
-            value = line[len("-arg ") :].strip()
-            if _is_safe_arg(value):
-                flags.extend(value.split(None, 1))
-            i += 1
-        elif line.startswith(("-R ", "-Q ")):
-            parts = line.split(None, 2)
-            if len(parts) == 3 and _check_path_containment(ws, parts[1]) is not None:
-                flags.extend(parts)
-            i += 1
-        elif line.startswith("-I "):
-            parts = line.split(None, 1)
-            if len(parts) == 2 and _check_path_containment(ws, parts[1]) is not None:
-                flags.extend(parts)
-            i += 1
+        elif t in ("-R", "-Q") and i + 2 < len(tokens):
+            if _check_path_containment(ws, tokens[i + 1]) is not None:
+                flags.extend([t, tokens[i + 1], tokens[i + 2]])
+            i += 3
+        elif t == "-I" and i + 1 < len(tokens):
+            if _check_path_containment(ws, tokens[i + 1]) is not None:
+                flags.extend([t, tokens[i + 1]])
+            i += 2
         else:
             i += 1
-    return flags
+    return flags + _filter_safe_args(args)
 
 
 # ---------------------------------------------------------------------------
