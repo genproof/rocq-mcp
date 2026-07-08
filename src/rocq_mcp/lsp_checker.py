@@ -579,10 +579,21 @@ class LspChecker:
     ) -> bool:
         """Reload ``<file>.vof`` for a fresh doc when the cache is valid.
 
-        Sends the ``coq/loadVof`` notification and marks the document open
-        (so subsequent requests reuse the warm state and a later edit
-        ``didChange``-s incrementally).  Returns ``True`` if it loaded.
-        Caller holds ``self._lock`` and has verified the doc is not open.
+        Sends the ``coq/loadVof`` *request* and, on an acked load, marks the
+        document open (so subsequent requests reuse the warm state and a
+        later edit ``didChange``-s incrementally).  Returns ``True`` if it
+        loaded.  Caller holds ``self._lock`` and has verified the doc is not
+        open.
+
+        The ack matters: a snapshot can validate but still fail to unmarshal
+        -- e.g. written by a differently-built coq-lsp binary, or truncated
+        (``vof_cache.is_valid`` fingerprints the source file, toolchain, and
+        deps, not the snapshot bytes).  The server then has NO document for
+        the uri; marking it open anyway left every later request answered
+        "Document is not ready" and a position check reporting a false
+        success.  On any error (including an old server that only knows the
+        notification form) we return ``False`` and the caller falls back to
+        a cold ``didOpen``.
 
         Only fires when *content* matches the on-disk file the snapshot was
         taken from (``vof_cache.is_valid`` hashes that file), so the warm
@@ -598,7 +609,19 @@ class LspChecker:
             return False
         with self._cv:
             self._saw_busy = False
-        self._notify("coq/loadVof", {"textDocument": {"uri": uri}})
+        # Unmarshaling a large snapshot is the read-side of coq/saveVof's
+        # marshal, so it shares the save timeout budget.
+        resp = self._request(
+            "coq/loadVof",
+            {"textDocument": {"uri": uri}},
+            timeout=_VOF_SAVE_TIMEOUT,
+        )
+        if isinstance(resp, dict) and "_lsp_error" in resp:
+            dlog.event(
+                "vof", "load.failed", file=resolved,
+                error=dlog.blob(str(resp["_lsp_error"])),
+            )
+            return False
         # coq-lsp restores the snapshot at the version it was marshaled at and
         # then drops any didChange not strictly greater (Fleche.Theory.change).
         # Resume our counter at that saved version so the first edit's
@@ -943,8 +966,14 @@ class LspChecker:
         settled = False
         with self._cv:
             while True:
-                if req_id in self._responses:
-                    settled = True  # target reached
+                resp_seen = self._responses.get(req_id)
+                if resp_seen is not None:
+                    # A result means the target was reached.  An error reply
+                    # (e.g. -32802 "Document is not ready" when the uri has no
+                    # server-side document) means it never can be: counting it
+                    # as settled turned an unopened/broken document into a
+                    # clean success with zero diagnostics.
+                    settled = "error" not in resp_seen
                     break
                 if self._dead:
                     break

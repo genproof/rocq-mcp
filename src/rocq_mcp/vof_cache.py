@@ -44,24 +44,24 @@ def _meta_path(resolved_file: str) -> str:
     return os.path.splitext(resolved_file)[0] + ".vof.meta"
 
 
-_toolchain_id: str | None = None
-
-
 def toolchain_id() -> str:
     """Identity of the coq-lsp binary; a ``.vof`` is invalid across rebuilds.
 
-    Uses the binary's path + mtime + size (cheap, no subprocess); any
-    reinstall changes it, invalidating every cached snapshot.
+    Uses the binary's path + mtime + size (one ``stat``, cheap; any
+    reinstall changes it, invalidating every cached snapshot).  Deliberately
+    NOT memoized: the MCP server outlives coq-lsp rebuilds, and a memoized
+    id kept snapshots from before a rebuild "valid" for sessions spawning
+    the new binary -- which cannot unmarshal them.  Best-effort either way
+    (a session started before the rebuild still runs the old binary while
+    the stat sees the new one); ``_try_load_vof`` treats any reload failure
+    as a cache miss, so a wrong id costs a cold check, never correctness.
     """
-    global _toolchain_id
-    if _toolchain_id is None:
-        binp = shutil.which(os.environ.get("ROCQ_COQLSP_BINARY", "coq-lsp")) or "coq-lsp"
-        try:
-            st = os.stat(binp)
-            _toolchain_id = f"{binp}:{st.st_mtime_ns}:{st.st_size}"
-        except OSError:
-            _toolchain_id = binp
-    return _toolchain_id
+    binp = shutil.which(os.environ.get("ROCQ_COQLSP_BINARY", "coq-lsp")) or "coq-lsp"
+    try:
+        st = os.stat(binp)
+        return f"{binp}:{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        return binp
 
 
 def _file_sha(path: str) -> str | None:

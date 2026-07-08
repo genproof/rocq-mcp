@@ -20,11 +20,9 @@ COQLSP_AVAILABLE = shutil.which("coq-lsp") is not None
 _lsp_only = pytest.mark.skipif(not COQLSP_AVAILABLE, reason="coq-lsp not available")
 
 
-@pytest.fixture(autouse=True)
-def _reset_toolchain_cache(monkeypatch):
-    # toolchain_id() memoizes in a module global; clear it per test.
-    monkeypatch.setattr(vc, "_toolchain_id", None)
-
+# toolchain_id() is deliberately unmemoized (a stale memo kept .vof
+# snapshots "valid" across a coq-lsp rebuild), so there is no per-test
+# cache to reset.
 
 # ---------------------------------------------------------------------------
 # Validity logic (dependencies mocked)
