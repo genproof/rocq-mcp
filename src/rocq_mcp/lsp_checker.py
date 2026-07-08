@@ -853,7 +853,7 @@ class LspChecker:
         uri = Path(resolved).as_uri()
         start_time = time.monotonic()
         self._sync_document(uri, content)
-        settled, _ = self._drive_barrier_locked(
+        settled, _, budget_hit = self._drive_barrier_locked(
             uri,
             len(content.splitlines()),
             0,
@@ -873,6 +873,10 @@ class LspChecker:
             timed_out=not settled,
             ok=settled,
         )
+        if budget_hit:
+            # The check halted at the max_errors budget: the document carries
+            # more errors than reported (the sentinel itself is filtered).
+            result["errors_truncated"] = True
         return self._flag_death(result)
 
     def _drive_full_check_locked(
@@ -884,7 +888,7 @@ class LspChecker:
         (the file outline) and the append-a-query path.  Thin wrapper over
         :meth:`_drive_barrier_locked` with the EOF target and no early stop.
         """
-        settled, _ = self._drive_barrier_locked(
+        settled, _, _ = self._drive_barrier_locked(
             uri, len(content.splitlines()), 0, timeout, stop_at_first_error=False
         )
         return settled
@@ -928,9 +932,9 @@ class LspChecker:
         *,
         stop_at_first_error: bool,
         sentence_timeout: float = 0.0,
-    ) -> tuple[bool, dict[str, Any] | None]:
+    ) -> tuple[bool, dict[str, Any] | None, bool]:
         """Drive checking toward ``(line, character)``; return ``(settled,
-        barrier_answer)``.
+        barrier_answer, budget_hit)``.
 
         Issues a ``proof/goals`` barrier at the target -- in
         ``check_only_on_request`` mode this is what makes coq-lsp check up to
@@ -938,10 +942,19 @@ class LspChecker:
         or the default (run through, report all) per *stop_at_first_error*.
 
         *settled* is ``True`` when checking settled -- the target was reached
-        (barrier answered), or, when *stop_at_first_error*, coq-lsp halted at
+        (barrier answered); or, when *stop_at_first_error*, coq-lsp halted at
         the first error (which it publishes but then stops, so an expensive
-        tail below it is never run).  ``False`` on timeout / dead process --
-        the document is then only partially checked.
+        tail below it is never run); or, in report-all mode, coq-lsp halted
+        at the ``max_errors`` budget -- its sentinel diagnostic ("Maximum
+        number of errors reached") is published exactly then, and a barrier
+        past the halt can never be answered afterwards (the over-budget doc
+        is never re-scheduled), so the sentinel IS the completion signal.
+        ``False`` on timeout / dead process -- the document is then only
+        partially checked.
+
+        *budget_hit* is ``True`` when the settle came from that sentinel: the
+        document carries more errors than the budget, so the reported error
+        set is capped.  Callers surface it as ``errors_truncated``.
 
         *barrier_answer* is the ``GoalsAnswer`` payload of the barrier
         response when one arrived, else ``None``.  Its ``range`` field is the
@@ -980,9 +993,10 @@ class LspChecker:
         try:
             self._send_message(msg)
         except (BrokenPipeError, OSError, ValueError):
-            return False, None
+            return False, None, False
         deadline = time.monotonic() + timeout if timeout > 0 else None
         settled = False
+        budget_hit = False
         with self._cv:
             while True:
                 resp_seen = self._responses.get(req_id)
@@ -1002,6 +1016,21 @@ class LspChecker:
                         d["severity"] == SEVERITY_ERROR for d in st["diags"]
                     ):
                         settled = True  # coq-lsp halted at the first error
+                        break
+                else:
+                    # Report-all mode: the max_errors budget halt is the one
+                    # way the check can end without the barrier ever being
+                    # answered (the over-budget doc is never re-scheduled).
+                    # Its sentinel diagnostic is the completion signal --
+                    # published together with the full, capped error set --
+                    # so waiting longer only hands an idle session to a
+                    # watchdog.
+                    st = self._doc_state.get(uri)
+                    if st and any(
+                        d["message"] == _MAX_ERRORS_SENTINEL for d in st["diags"]
+                    ):
+                        settled = True
+                        budget_hit = True
                         break
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
@@ -1044,7 +1073,7 @@ class LspChecker:
             except (BrokenPipeError, OSError, ValueError):
                 pass
         result = resp.get("result") if isinstance(resp, dict) else None
-        return settled, result if isinstance(result, dict) else None
+        return settled, result if isinstance(result, dict) else None, budget_hit
 
     def check_up_to(
         self,
@@ -1119,7 +1148,7 @@ class LspChecker:
             # timeout / dead process (the check never reached the point and
             # found no error on the way); the prefix diagnostics are then
             # best-effort.
-            settled, barrier = self._drive_barrier_locked(
+            settled, barrier, budget_hit = self._drive_barrier_locked(
                 uri, line, b_char, timeout,
                 stop_at_first_error=stop_at_first_error,
                 sentence_timeout=sentence_timeout,
@@ -1138,14 +1167,18 @@ class LspChecker:
             )
             elapsed = time.monotonic() - start_time
 
-        return self._flag_death(
-            self._result_from_diags(
-                diags,
-                check_time_ms=int(elapsed * 1000),
-                timed_out=not settled,
-                ok=settled,
-            )
+        result = self._result_from_diags(
+            diags,
+            check_time_ms=int(elapsed * 1000),
+            timed_out=not settled,
+            ok=settled,
         )
+        if budget_hit:
+            # The check halted at the max_errors budget: the document carries
+            # more errors than the budget, so the reported (prefix) set may
+            # be incomplete past the halt.
+            result["errors_truncated"] = True
+        return self._flag_death(result)
 
     def _diags_after_grace(self, uri: str) -> list[dict[str, Any]]:
         """All published diagnostics for *uri*, after a brief settle grace.

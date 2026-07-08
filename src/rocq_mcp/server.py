@@ -2599,7 +2599,10 @@ async def rocq_compile_lsp(
             fast feedback on a broken file, and an expensive/slow tactic
             below the error is never run.  Set to False to check through to
             the end (or *line*) and report every error.  Applies to both the
-            whole-file and position-limited checks.
+            whole-file and position-limited checks.  "Every error" is capped
+            by coq-lsp's error budget (150): a document with more errors
+            halts there and the result carries ``errors_truncated: True`` --
+            the reported set is the budget's worth, not exhaustive.
         save_vof_with_errors: Persist the ``.vof`` warm-start snapshot even when
             the file has errors (default: False).  By default a snapshot is
             saved only for a clean full check; set this to cache a
