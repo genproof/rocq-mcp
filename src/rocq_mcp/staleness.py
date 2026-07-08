@@ -15,9 +15,12 @@ module flags two situations a tool result should warn about:
   Fix by calling ``rocq_restart`` to drop and reload the session.
 
 Dependencies are discovered with ``coqdep`` (run with the same load-path
-flags coq-lsp uses), cached per ``(file, mtime)``.  Everything here is
-best-effort: any failure (no coqdep, parse error, missing file, …)
-yields no warning rather than breaking the calling tool.
+flags coq-lsp uses), cached per ``(file, mtime)``.  ``coqdep`` reports only
+*direct* dependencies, but coq-lsp loads the whole ``Require`` closure, so a
+rebuilt *transitive* dependency is just as stale-making; we walk the closure
+ourselves (:func:`_transitive_dependency_vo_files`) and check every ``.vo`` in
+it.  Everything here is best-effort: any failure (no coqdep, parse error,
+missing file, …) yields no warning rather than breaking the calling tool.
 """
 
 from __future__ import annotations
@@ -120,6 +123,36 @@ def _dependency_vo_files(resolved_file: str, workspace: str) -> list[str]:
     return deps
 
 
+def _transitive_dependency_vo_files(resolved_file: str, workspace: str) -> list[str]:
+    """The full transitive ``.vo`` closure *resolved_file* loads (absolute paths).
+
+    ``coqdep`` reports only *direct* dependencies (there is no transitive
+    flag), but coq-lsp loads the whole ``Require`` closure into a session --
+    so a rebuilt *transitive* dependency can silently invalidate a result
+    (its embedded digest no longer matches disk) while a direct-only check
+    sees nothing.  We walk the closure ourselves, running the (memoized)
+    direct :func:`_dependency_vo_files` at each node: map each ``.vo`` back to
+    its ``.v`` beside it and recurse when that source exists (a workspace
+    module).  Nodes with no local source (stdlib / precompiled libraries) are
+    leaves -- they are not rebuilt under a session, so their closure is
+    irrelevant to staleness.  Cycle-safe (Coq's ``Require`` graph is a DAG,
+    but the ``seen`` set guards anyway); returns ``[]`` on any failure.
+    """
+    seen: set[str] = set()
+    stack = list(_dependency_vo_files(resolved_file, workspace))
+    while stack:
+        vo = stack.pop()
+        if vo in seen:
+            continue
+        seen.add(vo)
+        src = os.path.splitext(vo)[0] + ".v"
+        if os.path.isfile(src):
+            for dep in _dependency_vo_files(src, workspace):
+                if dep not in seen:
+                    stack.append(dep)
+    return sorted(seen)
+
+
 def stale_warning(
     file_path: str, workspace: str, *, session_started_at: float | None = None
 ) -> str | None:
@@ -140,7 +173,10 @@ def stale_warning(
     except (OSError, ValueError):
         return None
 
-    deps = _dependency_vo_files(resolved, workspace)
+    # Walk the *transitive* .vo closure, not just direct deps: coq-lsp loads
+    # the whole Require closure, so a rebuilt transitive dependency is just as
+    # stale-making as a direct one (and coqdep alone would miss it).
+    deps = _transitive_dependency_vo_files(resolved, workspace)
     if not deps:
         return None
 
