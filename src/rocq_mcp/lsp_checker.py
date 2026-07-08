@@ -236,6 +236,10 @@ class LspChecker:
         self._cv = threading.Condition()
         # JSON-RPC id -> response message
         self._responses: dict[int, dict[str, Any]] = {}
+        # Request ids abandoned by their waiter (a barrier that settled on a
+        # published error and was cancelled server-side): the reader drops
+        # their late responses instead of stashing them forever.
+        self._abandoned: set[int] = set()
         # uri -> {"version": int|None, "diags": list[dict]} (latest publish)
         self._doc_state: dict[str, dict[str, Any]] = {}
         # uri -> {"version": int|None, "summary": str, "timings": list[dict]}
@@ -287,6 +291,7 @@ class LspChecker:
         self._last_content.clear()
         with self._cv:
             self._responses.clear()
+            self._abandoned.clear()
             self._doc_state.clear()
             self._perf_data.clear()
             self._status = "Idle"
@@ -1019,6 +1024,25 @@ class LspChecker:
                     self._cv.wait(remaining)
             # Take the response (present or late) so it cannot orphan.
             resp = self._responses.pop(req_id, None)
+            # No response is coming (halt-settle before the point, or a
+            # client-side deadline): mark the id abandoned so the reader
+            # drops the eventual reply instead of stashing it forever.
+            abandoned = resp is None and not self._dead
+            if abandoned:
+                self._abandoned.add(req_id)
+        if abandoned:
+            # Cancel the barrier server-side.  This matters beyond hygiene:
+            # a max_errors halt now completes the document as Stopped
+            # (resumable), so an abandoned still-pending target would
+            # re-schedule the check and creep past the halt one error-region
+            # per pass -- running exactly the tail stop_at_first_error exists
+            # to avoid.  $/cancelRequest detaches the postponed request
+            # (Theory.Request.remove) and answers it with an error, which
+            # the reader drops via the abandoned set.
+            try:
+                self._notify("$/cancelRequest", {"id": req_id})
+            except (BrokenPipeError, OSError, ValueError):
+                pass
         result = resp.get("result") if isinstance(resp, dict) else None
         return settled, result if isinstance(result, dict) else None
 
@@ -1499,6 +1523,12 @@ class LspChecker:
         # operations we use, so they are ignored.)
         if "id" in msg and "method" not in msg:
             with self._cv:
+                if msg["id"] in self._abandoned:
+                    # Late reply to an abandoned/cancelled request (typically
+                    # the error answering our $/cancelRequest) -- nobody is
+                    # waiting; drop it instead of stashing it forever.
+                    self._abandoned.discard(msg["id"])
+                    return
                 self._responses[msg["id"]] = msg
                 self._cv.notify_all()
             return
