@@ -742,6 +742,20 @@ class LspChecker:
                 sentence_timeout=sentence_timeout,
             )
 
+    def _flag_death(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Mark *result* with ``lsp_died: True`` when this op's coq-lsp died.
+
+        ``_dead`` is reset by :meth:`_start`, and every public entry point
+        goes through ``_ensure_started`` first, so observing it here means
+        the process died *during* the current operation (crash / external
+        kill).  The server layer turns the flag into an explicit ``crashed``
+        envelope -- the check's partial result must not pass for a verdict.
+        """
+        with self._cv:
+            if self._dead:
+                result["lsp_died"] = True
+        return result
+
     @staticmethod
     def _result_from_diags(
         diags: list[dict[str, Any]],
@@ -807,13 +821,17 @@ class LspChecker:
         )
         diags = self._diags_after_grace(uri)
         elapsed = time.monotonic() - start_time
-        # Query callers turn ``timed_out`` into a timeout envelope; the
-        # file-check path ignores it (and skips the .vof save).
-        return self._result_from_diags(
+        # ``ok=settled``: an unfinished check (coq-lsp died, or a caller's
+        # deadline elapsed) must not degrade ``success`` to "no errors
+        # collected so far" -- a crash before the first error publish would
+        # otherwise surface as a clean pass.
+        result = self._result_from_diags(
             diags,
             check_time_ms=int(elapsed * 1000),
             timed_out=not settled,
+            ok=settled,
         )
+        return self._flag_death(result)
 
     def _drive_full_check_locked(
         self, uri: str, content: str, timeout: float
@@ -1053,11 +1071,13 @@ class LspChecker:
             )
             elapsed = time.monotonic() - start_time
 
-        return self._result_from_diags(
-            diags,
-            check_time_ms=int(elapsed * 1000),
-            timed_out=not settled,
-            ok=settled,
+        return self._flag_death(
+            self._result_from_diags(
+                diags,
+                check_time_ms=int(elapsed * 1000),
+                timed_out=not settled,
+                ok=settled,
+            )
         )
 
     def _diags_after_grace(self, uri: str) -> list[dict[str, Any]]:

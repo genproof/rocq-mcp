@@ -870,6 +870,37 @@ def _build_lsp_memory_abort_response(
     }
 
 
+def _build_lsp_died_response(
+    lifespan_state: dict[str, Any],
+    tool: str,
+    key: str,
+) -> dict[str, Any]:
+    """Recovery for a coq-lsp that died mid-operation on its own.
+
+    Used when the checker reports ``lsp_died`` -- the process crashed or was
+    killed externally (e.g. the kernel OOM killer under system-wide memory
+    pressure) with NO MCP watchdog firing, so none of the other envelopes
+    apply.  The check never finished; its partial result must not surface as
+    a verdict (a crash before the first error publish would read as a clean
+    success).  Discards the dead session (the next call respawns it, warm-
+    starting from a ``.vof`` when present) and returns the unified
+    ``crashed`` envelope.
+    """
+    _invalidate_lsp(lifespan_state, key)
+    error = (
+        f"{tool} aborted: coq-lsp died mid-operation (crashed or was killed "
+        "externally, e.g. by the kernel OOM killer). The session has been "
+        "discarded and will restart on the next call; retry the operation."
+    )
+    _record_error(lifespan_state, tool, error, reason="crashed")
+    return {
+        "success": False,
+        "error": error,
+        "reason": "crashed",
+        "lsp_restarted": True,
+    }
+
+
 def _build_lsp_hard_timeout_response(
     lifespan_state: dict[str, Any],
     tool: str,
@@ -2595,6 +2626,14 @@ async def rocq_compile_lsp(
         key=_session_key(workspace, file_path),
         sentence_timeout=eff_sentence_timeout,
     )
+
+    # coq-lsp died mid-check with no watchdog firing (crash / external kill,
+    # e.g. the kernel OOM killer): the check never finished, so its partial
+    # diagnostics are not a verdict.  Return the explicit envelope instead.
+    if isinstance(result, dict) and result.pop("lsp_died", False):
+        return _build_lsp_died_response(
+            lifespan_state, "rocq_compile_lsp", _session_key(workspace, file_path)
+        )
 
     # On a memory abort the envelope carries no warnings/info keys to pop.
     if not include_warnings:
