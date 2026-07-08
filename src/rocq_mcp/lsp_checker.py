@@ -1395,45 +1395,50 @@ class LspChecker:
             )
 
     # ------------------------------------------------------------------
-    # $/coq/filePerfData (per-sentence timing / memory profile)
+    # Per-sentence timing / memory profile
+    # (coq/getPerfData pull; $/coq/filePerfData push as fallback)
     # ------------------------------------------------------------------
 
-    def profile(
+    def perf_data(
         self,
         file_path: str,
+        line: int | None = None,
+        character: int | None = None,
         *,
         content: str | None = None,
-        workspace: str = "",
         timeout: float = _DEFAULT_REQUEST_TIMEOUT,
     ) -> dict[str, Any]:
-        """Collect coq-lsp's per-sentence timing / memory data for *file_path*.
+        """Fetch coq-lsp's per-sentence timing / memory data for *file_path*.
 
-        Drives a full check of the document and returns the
-        ``$/coq/filePerfData`` payload coq-lsp emits when checking completes:
-        a ``summary`` line (global hashing / parsing / exec breakdown) and one
-        ``timings`` entry per Flèche node (sentence), each ``{range, info:
-        {time, memory, cache_hit, time_hash}}`` -- ``time`` in seconds,
-        ``memory`` the heap words allocated (``Gc.quick_stat`` delta).
+        Sends ``coq/getPerfData`` (the genproof fork's pull variant of the
+        ``$/coq/filePerfData`` notification) at a point and returns its
+        payload: a ``summary`` line (global hashing / parsing / exec
+        breakdown) and one ``timings`` entry per checked Flèche node
+        (sentence), each ``{range, info: {time, memory, cache_hit,
+        time_hash}}`` -- ``time`` in seconds, ``memory`` the heap words
+        allocated (``Gc.quick_stat`` delta).  Each ``time`` is the sentence's
+        original elaboration time (reported even for a memo hit), so summed
+        totals stay comparable across calls; for a fully cold re-measurement
+        restart the session first.
 
-        The check is always re-driven from a fresh document version (a
-        ``didChange`` even when the text is unchanged, via
-        :meth:`_sync_document` rather than :meth:`_ensure_open`): coq-lsp only
-        emits the perf notification on a *completion*, and re-barriering an
-        already-checked document produces none.  Going through
-        ``_sync_document`` also bypasses the ``.vof`` warm-load, so the
-        sentences are really elaborated (a reloaded snapshot can carry no
-        per-sentence stats).  Each reported ``time`` is thus a real elaboration
-        time -- coq-lsp reports the original execution time even for a memo hit
-        -- so summed totals stay comparable across calls without clearing
-        caches.  For a fully cold re-measurement, restart the session first
-        (``rocq_restart``).
+        Like ``proof/goals`` this is a postponed position request: coq-lsp
+        answers once checking reaches the point, so it can *drive* a check --
+        though the intended flow is check first (``check_file`` /
+        ``check_up_to``), then pull, which answers immediately.  *line*
+        ``None`` targets EOF (the whole document); *character* ``None`` means
+        "through the end of *line*", matching :meth:`check_up_to`.  The
+        returned timings may extend past the point on a warm document;
+        callers filter by range.
 
-        Returns ``{"summary", "timings", "version", "check_time_ms",
-        "settled"}`` or a ``{"_lsp_error": ...}`` dict on transport failure,
-        timeout, or a check that did not complete (no perf data emitted).
+        On a stock coq-lsp (no ``coq/getPerfData``) and *line* ``None``,
+        falls back to the ``$/coq/filePerfData`` push captured from the last
+        completed check of the current document version.
+
+        Returns ``{"summary", "timings", "version"}`` or a
+        ``{"_lsp_error": ...}`` dict on failure.
         """
         with self._lock:
-            self._ensure_started(workspace)
+            self._ensure_started()
             resolved = str(Path(file_path).resolve())
             if content is None:
                 try:
@@ -1441,36 +1446,48 @@ class LspChecker:
                 except (OSError, PermissionError) as e:
                     return {"_lsp_error": str(e)}
             uri = Path(resolved).as_uri()
-            # Drop any stale capture so we wait for THIS check's notification.
-            with self._cv:
-                self._perf_data.pop(uri, None)
-            # Force a fresh version (didChange/didOpen) so coq-lsp re-checks to
-            # completion and re-emits $/coq/filePerfData; _ensure_open would
-            # early-return on unchanged content and none would be sent.
-            version = self._sync_document(uri, content)
-            start_time = time.monotonic()
-            settled = self._drive_full_check_locked(uri, content, timeout)
-            # The perf notification can race just behind the completion barrier;
-            # wait a bounded grace for it, never blocking forever (the check may
-            # be driven with no client deadline, timeout == 0).
-            perf_wait = timeout if timeout > 0 else _PERF_TRAILING_GRACE
-            perf = self._await_perf_locked(uri, version, perf_wait)
-            elapsed = time.monotonic() - start_time
-        if perf is None:
-            return {
-                "_lsp_error": (
-                    "profiling data not received"
-                    + ("" if settled else " (check did not complete in time)")
-                ),
-                "_lsp_timeout": not settled,
-            }
-        return {
-            "summary": perf["summary"],
-            "timings": perf["timings"],
-            "version": perf["version"],
-            "check_time_ms": int(elapsed * 1000),
-            "settled": settled,
-        }
+            self._ensure_open(uri, content, file_path=resolved)
+            # Resolve the point exactly like check_up_to: line=None -> just
+            # past EOF (whole document); character=None -> end of *line*.
+            text_lines = content.splitlines()
+            if line is None:
+                b_line, b_char = len(text_lines), 0
+            else:
+                b_line = line
+                if character is None:
+                    b_char = len(text_lines[line]) if line < len(text_lines) else 0
+                else:
+                    b_char = character
+            # The request must be reachable past upstream errors (a
+            # stop-at-first-error check may have lowered max_errors).
+            self._set_max_errors_locked(_MAX_ERRORS_FULL)
+            resp = self._request(
+                "coq/getPerfData",
+                {
+                    "textDocument": {"uri": uri},
+                    "position": {"line": b_line, "character": b_char},
+                },
+                timeout=timeout,
+            )
+            if isinstance(resp, dict) and "_lsp_error" not in resp:
+                return {
+                    "summary": resp.get("summary", ""),
+                    "timings": resp.get("timings") or [],
+                    "version": (resp.get("textDocument") or {}).get("version"),
+                }
+            # Pull failed (e.g. stock coq-lsp: method not found).  For a
+            # whole-document request, the push notification from the last
+            # completed check of this version is an exact substitute.
+            if line is None:
+                version = self._open_docs.get(uri, 0)
+                perf = self._await_perf_locked(uri, version, _PERF_TRAILING_GRACE)
+                if perf is not None:
+                    return {
+                        "summary": perf["summary"],
+                        "timings": perf["timings"],
+                        "version": perf["version"],
+                    }
+            return resp if isinstance(resp, dict) else {"_lsp_error": f"{resp!r}"}
 
     def _await_perf_locked(
         self, uri: str, version: int, timeout: float

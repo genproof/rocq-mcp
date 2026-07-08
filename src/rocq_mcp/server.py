@@ -1664,9 +1664,10 @@ from rocq_mcp.compile import (  # noqa: E402
 )
 from rocq_mcp.interactive import (  # noqa: E402
     _MAX_LINE_CHAR_RANGE,
+    _resolve_profile_output,
+    collect_and_save_perf,
     run_assumptions,
     run_extract,
-    run_profile,
     run_query,
     run_get_state,
     run_step,
@@ -2111,80 +2112,6 @@ async def rocq_toc(
         lifespan_state=ctx.lifespan_context,
     )
     return _attach_stale_warning(result, file_path, workspace, ctx.lifespan_context)
-
-
-# ---------------------------------------------------------------------------
-# Tool: rocq_profile
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool
-async def rocq_profile(
-    file_path: str,
-    workspace: str = "",
-    output: str = "",
-    top: int = 15,
-    ctx: Context = None,
-) -> dict[str, Any]:
-    """Profile a .v file: per-sentence execution time and memory via coq-lsp.
-
-    Checks the whole file and collects coq-lsp's ``$/coq/filePerfData`` — one
-    timing per sentence (``time`` in seconds, ``memory`` in heap words). The
-    full per-sentence table is written to a JSON file for later inspection;
-    the response returns the total time and the hottest sentences inline
-    (line + text + time) so you can act on them immediately.
-
-    Intended for a profile → refactor → re-profile loop: profile, edit the
-    slow sentence in the file, then call again and compare the numbers. Each
-    reported ``time`` is the sentence's real elaboration time (coq-lsp reports
-    the original time even when it serves the sentence from cache), so totals
-    stay comparable between calls without any special handling. There is no
-    built-in diff — save named snapshots via ``output`` (e.g. ``before.json``
-    / ``after.json``) and compare the two responses / files yourself.
-
-    For a fully cold re-measurement (every sentence re-executed from scratch,
-    including re-loading ``Require``-d libraries), call ``rocq_restart`` first
-    to drop the warm session, then profile.
-
-    Does NOT require a rocq_start session. Honestly slow sentences are allowed
-    to run to completion (no per-sentence stall abort) — bounded only by the
-    process-level memory and hard-timeout watchdogs; on a breach the response
-    is a ``{success: False, reason: ..., lsp_restarted: True}`` envelope.
-
-    Args:
-        file_path: Path to the .v file (relative to workspace).
-        workspace: Workspace directory. If omitted, auto-detected by walking
-            up from *file_path* looking for ``_RocqProject`` / ``_CoqProject`` /
-            ``dune-project``; falls back to the ``ROCQ_WORKSPACE`` env var
-            (default: cwd).
-        output: Path (relative to workspace) for the JSON profile file.
-            Default: ``<file>.profile.json`` next to the .v file. Use distinct
-            names to keep baseline snapshots for comparison.
-        top: How many hottest sentences to include inline in the response
-            (default 15; the file always has every sentence).
-    """
-    workspace = workspace or _find_project_root_from_file(file_path) or ROCQ_WORKSPACE
-
-    err = _validate_workspace(workspace)
-    if err:
-        return _fail(
-            ctx.lifespan_context if ctx else None, "rocq_profile", err, "validation"
-        )
-
-    if ctx is None:
-        return {
-            "success": False,
-            "reason": "validation",
-            "error": "Internal error: no MCP context.",
-        }
-
-    return await run_profile(
-        file_path=file_path,
-        workspace=workspace,
-        lifespan_state=ctx.lifespan_context,
-        output=output or None,
-        top=top,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -2654,6 +2581,7 @@ async def rocq_compile_lsp(
     stop_at_first_error: bool = True,
     save_vof_with_errors: bool = False,
     sentence_timeout: float | None = None,
+    save_perf_to: str = "",
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Incrementally check a .v file using coq-lsp diagnostics.
@@ -2749,6 +2677,30 @@ async def rocq_compile_lsp(
             not a diverging tactic -- from both this abort and the progress-stall
             backstop, so a long ``Qed`` runs to completion (only ``ROCQ_HARD_TIMEOUT``
             and the RSS watchdog bound a truly runaway one).
+        save_perf_to: Path (relative to workspace) of a JSON file to save
+            per-sentence profiling data to (default: "" = no profiling).
+            The check's per-sentence execution ``time`` (seconds) and
+            ``memory`` (heap words) come from coq-lsp itself, at zero extra
+            elaboration cost -- profiling is a byproduct of the check.  The
+            file gets the full table (position, source text, time, memory,
+            cache_hit) in document order; the response gets a compact
+            ``perf`` object: ``{saved, output_file, n_sentences,
+            total_time_s, hotspots}`` with the ~10 hottest sentences inline
+            (``{line, time_s, text}``) so the profile -> edit -> re-check
+            loop needs no extra calls.  Composes with ``line``: only the
+            prefix up to the position is profiled and the tail is never
+            elaborated (requires the ``genproof/rocq-lsp`` fork's
+            ``coq/getPerfData``; on stock coq-lsp only full-file profiling
+            works, via the perf notification).  Each ``time`` is the
+            sentence's original elaboration time -- reported even when
+            coq-lsp serves it from cache -- so totals stay comparable
+            between calls; use ``rocq_restart`` first for a fully cold
+            re-measurement.  Implies ``stop_at_first_error=False`` (the
+            check must reach its target to be profiled).  A sentence aborted
+            by ``sentence_timeout`` appears with its time-until-abort; pass
+            ``sentence_timeout=0`` to measure sentences slower than the cap.
+            On an incomplete check the response carries ``perf: {saved:
+            false, reason}`` and no file is written.
     """
     # Same workspace handling as the other file tools: auto-detect the
     # project root from *file_path* when no explicit workspace is given.
@@ -2783,9 +2735,24 @@ async def rocq_compile_lsp(
             f"line and character must be in range [0, {_MAX_LINE_CHAR_RANGE}].",
         )
 
+    # Profiling output path: validated up front (workspace containment), so a
+    # bad path fails fast instead of after an expensive check.
+    perf_out: Path | None = None
+    if save_perf_to:
+        resolved_out = _resolve_profile_output(workspace, save_perf_to)
+        if isinstance(resolved_out, str):  # rejection message
+            return _fail(
+                lifespan_state, "rocq_compile_lsp", resolved_out, "validation"
+            )
+        perf_out = resolved_out
+
     # Snapshotting a broken file (save_vof_with_errors) needs a completed, EOF-
     # reaching check, so it implies a full check (overrides stop-at-first).
-    effective_stop = stop_at_first_error and not save_vof_with_errors
+    # Profiling (save_perf_to) likewise needs the check to reach its target
+    # (EOF, or *line*): a first-error halt leaves the perf request unanswered.
+    effective_stop = (
+        stop_at_first_error and not save_vof_with_errors and not save_perf_to
+    )
 
     # None (the default) means "use the global ROCQ_SENTENCE_TIMEOUT default";
     # an explicit value (including 0 to force-disable) overrides it.
@@ -2798,7 +2765,7 @@ async def rocq_compile_lsp(
     # as a hard backstop, by ROCQ_HARD_TIMEOUT (kill+restart) in _run_with_lsp.
     def _check(checker: Any) -> dict[str, Any]:
         if line is None:
-            return checker.check_file(
+            result = checker.check_file(
                 resolved,
                 workspace,
                 0.0,
@@ -2806,15 +2773,42 @@ async def rocq_compile_lsp(
                 save_vof_on_error=save_vof_with_errors,
                 sentence_timeout=eff_sentence_timeout,
             )
-        return checker.check_up_to(
-            resolved,
-            line,
-            character,
-            workspace=workspace,
-            timeout=0.0,
-            stop_at_first_error=effective_stop,
-            sentence_timeout=eff_sentence_timeout,
-        )
+        else:
+            result = checker.check_up_to(
+                resolved,
+                line,
+                character,
+                workspace=workspace,
+                timeout=0.0,
+                stop_at_first_error=effective_stop,
+                sentence_timeout=eff_sentence_timeout,
+            )
+        # Profiling piggybacks on the check just driven: the coq/getPerfData
+        # pull answers immediately for the checked region (no re-elaboration).
+        # Skipped when the check never reached its target (client timeout, or
+        # a halt at coq-lsp's max_errors budget) -- a postponed perf request
+        # against the halted document would stall until its own timeout.
+        if perf_out is not None:
+            if result.get("timed_out"):
+                result["perf"] = {
+                    "saved": False,
+                    "reason": "check did not complete (timed out)",
+                }
+            elif result.get("errors_truncated"):
+                result["perf"] = {
+                    "saved": False,
+                    "reason": "check halted at the max_errors budget",
+                }
+            else:
+                result["perf"] = collect_and_save_perf(
+                    checker,
+                    resolved,
+                    workspace,
+                    perf_out,
+                    line=line,
+                    character=character,
+                )
+        return result
 
     # _run_with_lsp handles checker lifecycle, the RSS memory watchdog
     # (memory_exhausted envelope on breach), and the post-success soft

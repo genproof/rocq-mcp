@@ -972,13 +972,18 @@ async def run_toc(
 
 
 # ---------------------------------------------------------------------------
-# Tool: rocq_profile (per-sentence timing / memory via $/coq/filePerfData)
+# Per-sentence perf profiling (rocq_compile_lsp's save_perf_to flag)
 # ---------------------------------------------------------------------------
+#
+# The timing data comes from coq-lsp: coq/getPerfData (genproof fork pull;
+# $/coq/filePerfData push as the stock fallback) -- see LspChecker.perf_data.
+# The helpers below enrich the raw timings with source text, write the full
+# per-sentence table to a JSON file, and build the compact inline summary
+# rocq_compile_lsp attaches to its response.
 
-# How many hottest sentences to surface inline in the tool response by default
+# How many hottest sentences to surface inline in the tool response
 # (the full per-sentence table always goes to the output file).
-_PROFILE_TOP_DEFAULT: int = 15
-_PROFILE_TOP_MAX: int = 200
+_PROFILE_TOP_HOTSPOTS: int = 10
 # Per-sentence text caps: generous in the saved file (enough to identify a
 # sentence), tight for the inline hotspot list (keeps the response compact).
 _PROFILE_FILE_TEXT_CAP: int = 300
@@ -1061,121 +1066,90 @@ def _hotspot_view(s: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _resolve_profile_output(
-    resolved_v: str, workspace: str, output: str | None
-) -> Path | str:
-    """Resolve the profile JSON output path, constrained to the workspace.
+def _resolve_profile_output(workspace: str, output: str) -> Path | str:
+    """Resolve the perf JSON output path, constrained to the workspace.
 
     Returns a ``Path`` on success or an error-message ``str`` on rejection.
-    ``output`` is relative to *workspace* (default: ``<stem>.profile.json``
-    next to the ``.v`` file).
+    ``output`` (required) is relative to *workspace*.
     """
     ws = Path(workspace).resolve()
-    if not output:
-        base = Path(resolved_v)
-        return base.with_name(base.stem + ".profile.json")
     cand = (ws / output).resolve()
     if not _server._path_within(cand, ws):
-        return "output path must be within the workspace."
+        return "save_perf_to path must be within the workspace."
     if cand.is_dir():
-        return f"output path is a directory: {output}"
+        return f"save_perf_to path is a directory: {output}"
     return cand
 
 
-async def run_profile(
-    file_path: str,
+def collect_and_save_perf(
+    checker: Any,
+    resolved: str,
     workspace: str,
-    lifespan_state: dict[str, Any],
+    out_path: Path,
     *,
-    output: str | None = None,
-    top: int = _PROFILE_TOP_DEFAULT,
+    line: int | None = None,
+    character: int | None = None,
 ) -> dict[str, Any]:
-    """Core implementation of rocq_profile (testable without FastMCP Context).
+    """Pull per-sentence perf data, write the JSON table, build the summary.
 
-    Drives a full check and collects coq-lsp's ``$/coq/filePerfData``
-    (per-sentence ``time`` / ``memory``), writes the full per-sentence table
-    to a JSON file for later inspection, and returns a compact summary with
-    the hottest sentences inline.
+    The ``perf`` sub-object builder for ``rocq_compile_lsp(save_perf_to=…)``.
+    Runs inside the tool's checker closure (worker thread), right after the
+    check drove the document to its target -- the ``coq/getPerfData`` pull
+    then answers immediately.  With *line* set, only sentences starting at or
+    before it are kept (the position-limited check's prefix; a warm document
+    may carry timings past the point).
+
+    Returns ``{"saved": True, "output_file", "n_sentences", "total_time_s",
+    "hotspots"}`` on success, else ``{"saved": False, "reason"}`` -- perf
+    trouble never fails the check result it decorates.
     """
+    res = checker.perf_data(resolved, line, character)
+    if not isinstance(res, dict) or "_lsp_error" in res:
+        err = res.get("_lsp_error") if isinstance(res, dict) else res
+        msg = err.get("message") if isinstance(err, dict) else str(err)
+        return {"saved": False, "reason": f"coq-lsp perf data unavailable: {msg}"}
+
     try:
-        resolved = _server._resolve_file_in_workspace(file_path, workspace)
-    except (ValueError, FileNotFoundError) as e:
-        return _server._fail(lifespan_state, "rocq_profile", str(e))
+        content_lines = Path(resolved).read_text().splitlines()
+    except (OSError, PermissionError) as e:
+        return {"saved": False, "reason": str(e)}
 
-    top = max(1, min(int(top), _PROFILE_TOP_MAX))
+    timings = res.get("timings") or []
+    if line is not None:
+        timings = [
+            t
+            for t in timings
+            if ((t.get("range") or {}).get("start") or {}).get("line", 0) <= line
+        ]
+    sentences = _build_profile_sentences(timings, content_lines)
+    total_time_s = round(sum(s["time_s"] for s in sentences), 6)
 
-    out_path = _resolve_profile_output(resolved, workspace, output)
-    if isinstance(out_path, str):  # rejection message
-        return _server._fail(
-            lifespan_state, "rocq_profile", out_path, "validation"
-        )
+    document = {
+        "file": resolved,
+        "workspace": str(Path(workspace).resolve()),
+        "checked_through_line": line,
+        "coq_lsp_summary": res.get("summary", ""),
+        "n_sentences": len(sentences),
+        "total_time_s": total_time_s,
+        "total_memory_words": sum(s["memory_words"] for s in sentences),
+        "sentences": sentences,
+    }
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(document, indent=2))
+    except OSError as e:
+        return {"saved": False, "reason": f"could not write {out_path}: {e}"}
 
-    def _do(checker: Any) -> dict[str, Any]:
-        # No client-side deadline (timeout=0): the check blocks until coq-lsp
-        # settles, bounded process-side by the memory + hard-timeout watchdogs
-        # in _run_with_lsp.  We deliberately do NOT arm a per-sentence stall
-        # timeout here (sentence_timeout=0 below): profiling exists to measure
-        # slow sentences, so an honestly slow tactic must run to completion
-        # rather than be aborted as if it were diverging.
-        res = checker.profile(resolved, workspace=workspace, timeout=0.0)
-        if isinstance(res, dict) and "_lsp_error" in res:
-            lerr = res["_lsp_error"]
-            reason = "timeout" if res.get("_lsp_timeout") else "crashed"
-            msg = lerr.get("message") if isinstance(lerr, dict) else str(lerr)
-            return _server._fail(
-                lifespan_state,
-                "rocq_profile",
-                f"coq-lsp profiling failed: {msg}",
-                reason,
-            )
-
-        try:
-            content_lines = Path(resolved).read_text().splitlines()
-        except (OSError, PermissionError) as e:
-            return _server._fail(lifespan_state, "rocq_profile", str(e), "crashed")
-
-        sentences = _build_profile_sentences(res.get("timings") or [], content_lines)
-        total_time_s = round(sum(s["time_s"] for s in sentences), 6)
-        total_memory_words = sum(s["memory_words"] for s in sentences)
-
-        document = {
-            "file": resolved,
-            "workspace": str(Path(workspace).resolve()),
-            "coq_lsp_summary": res.get("summary", ""),
-            "n_sentences": len(sentences),
-            "total_time_s": total_time_s,
-            "total_memory_words": total_memory_words,
-            "sentences": sentences,
-        }
-        try:
-            out_path.write_text(json.dumps(document, indent=2))
-        except OSError as e:
-            return _server._fail(
-                lifespan_state,
-                "rocq_profile",
-                f"could not write profile to {out_path}: {e}",
-                "crashed",
-            )
-
-        hotspots = sorted(sentences, key=lambda s: s["time_s"], reverse=True)[:top]
-        return {
-            "success": True,
-            "file": file_path,
-            "output_file": os.path.relpath(out_path, Path(workspace).resolve()),
-            "n_sentences": len(sentences),
-            "total_time_s": total_time_s,
-            "summary": res.get("summary", ""),
-            "hotspots": [_hotspot_view(s) for s in hotspots],
-        }
-
-    return await _server._run_with_lsp(
-        _do,
-        lifespan_state,
-        "rocq_profile",
-        workspace=workspace,
-        key=_server._session_key(workspace, file_path),
-        sentence_timeout=0.0,
-    )
+    hotspots = sorted(sentences, key=lambda s: s["time_s"], reverse=True)
+    return {
+        "saved": True,
+        "output_file": os.path.relpath(out_path, Path(workspace).resolve()),
+        "n_sentences": len(sentences),
+        "total_time_s": total_time_s,
+        "hotspots": [
+            _hotspot_view(s) for s in hotspots[:_PROFILE_TOP_HOTSPOTS]
+        ],
+    }
 
 
 # ===========================================================================
