@@ -1027,6 +1027,13 @@ def _build_profile_sentences(
     Each record carries the sentence's position, the source text sliced from
     its range, and the timing / memory fields from ``$/coq/filePerfData``,
     preserving coq-lsp's document order.
+
+    The payload's memo diagnostics (``cache_hit``, ``time_hash``) are
+    deliberately NOT mapped: ``cache_hit`` stays False on document-level node
+    reuse (the common warm-run path never consults the memo), so the natural
+    reading "False = freshly measured" is wrong -- and without the flag its
+    lookup-overhead companion is meaningless.  ``time`` needs no such flag:
+    coq-lsp always reports the sentence's original elaboration time.
     """
     sentences: list[dict[str, Any]] = []
     for i, t in enumerate(timings):
@@ -1049,8 +1056,6 @@ def _build_profile_sentences(
                 "text": _normalize_sentence_text(text, _PROFILE_FILE_TEXT_CAP),
                 "time_s": round(float(info.get("time", 0.0)), 6),
                 "memory_words": float(info.get("memory", 0.0)),
-                "cache_hit": bool(info.get("cache_hit", False)),
-                "time_hash_s": round(float(info.get("time_hash", 0.0)), 6),
             }
         )
     return sentences
@@ -1061,7 +1066,6 @@ def _hotspot_view(s: dict[str, Any]) -> dict[str, Any]:
     return {
         "line": s["line"],
         "time_s": s["time_s"],
-        "cache_hit": s["cache_hit"],
         "text": _normalize_sentence_text(s["text"], _PROFILE_HOTSPOT_TEXT_CAP),
     }
 
@@ -1099,9 +1103,12 @@ def collect_and_save_perf(
     before it are kept (the position-limited check's prefix; a warm document
     may carry timings past the point).
 
-    Returns ``{"saved": True, "output_file", "n_sentences", "total_time_s",
-    "hotspots"}`` on success, else ``{"saved": False, "reason"}`` -- perf
-    trouble never fails the check result it decorates.
+    Returns ``{"saved": True, "output_file", "n_sentences", "hotspots"}`` on
+    success, else ``{"saved": False, "reason"}`` -- perf trouble never fails
+    the check result it decorates.  Aggregates (``total_time_s``,
+    ``total_memory_words``) live only in the JSON file, next to
+    ``checked_through_line``: out of that context a prefix total is easily
+    misread as a whole-file cost.
     """
     res = checker.perf_data(resolved, line, character)
     if not isinstance(res, dict) or "_lsp_error" in res:
@@ -1145,7 +1152,6 @@ def collect_and_save_perf(
         "saved": True,
         "output_file": os.path.relpath(out_path, Path(workspace).resolve()),
         "n_sentences": len(sentences),
-        "total_time_s": total_time_s,
         "hotspots": [
             _hotspot_view(s) for s in hotspots[:_PROFILE_TOP_HOTSPOTS]
         ],

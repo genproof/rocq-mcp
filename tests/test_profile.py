@@ -125,7 +125,10 @@ class TestBuildProfileSentences:
         assert s["text"] == "Lemma a : 1 + 1 = 2."
         assert s["time_s"] == 0.5
         assert s["memory_words"] == 4.0
-        assert s["cache_hit"] is False
+        # The memo diagnostics from the raw payload are deliberately not
+        # mapped ("cache_hit: false" reads as "freshly measured" but isn't).
+        assert "cache_hit" not in s
+        assert "time_hash_s" not in s
 
     def test_tolerates_missing_fields(self):
         out = _build_profile_sentences([{}], ["x"])
@@ -194,11 +197,14 @@ class TestCollectAndSavePerf:
         perf = collect_and_save_perf(fake, str(v), str(tmp_path), out)
         assert perf["saved"] is True
         assert perf["n_sentences"] == 2
-        assert perf["total_time_s"] == 1.0
+        # Aggregates live only in the JSON file (a bare prefix total is easily
+        # misread as a whole-file cost); the response carries none.
+        assert "total_time_s" not in perf
         # Hotspots sorted by time descending.
         assert [h["line"] for h in perf["hotspots"]] == [1, 0]
         doc = json.loads(out.read_text())
         assert doc["n_sentences"] == 2
+        assert doc["total_time_s"] == 1.0
         assert doc["sentences"][0]["text"].startswith("Lemma a")
 
     def test_line_filters_tail_timings(self, tmp_path):
@@ -269,11 +275,12 @@ class TestSavePerfIntegration:
         assert perf["saved"] is True
         assert perf["output_file"] == "perf.json"
         assert perf["n_sentences"] > 0
-        assert perf["total_time_s"] >= 0.0
+        assert "total_time_s" not in perf  # aggregates live in the file only
         times = [h["time_s"] for h in perf["hotspots"]]
         assert times == sorted(times, reverse=True)
 
         doc = json.loads((tmp_path / "perf.json").read_text())
+        assert doc["total_time_s"] >= 0.0
         assert doc["n_sentences"] == perf["n_sentences"]
         assert len(doc["sentences"]) == perf["n_sentences"]
         texts = " ".join(s["text"] for s in doc["sentences"])
@@ -310,9 +317,10 @@ class TestSavePerfIntegration:
         assert doc["checked_through_line"] == 1
 
     @pytest.mark.asyncio
-    async def test_erroring_file_still_profiles(self, tmp_path, lstate):
-        """save_perf_to implies a full check: errors are recovered from and the
-        completed document is still profiled."""
+    async def test_erroring_file_does_not_profile(self, tmp_path, lstate):
+        """Perf is only saved for a clean check: an erroring file reports
+        perf: {saved: false} and writes no file (its timings would mislead --
+        post-error sentences run in recovery mode or not at all)."""
         (tmp_path / "err.v").write_text(
             "Lemma good : True. Proof. exact I. Qed.\n"
             "Lemma bad : 1 = 2. Proof. reflexivity. Qed.\n"
@@ -325,10 +333,68 @@ class TestSavePerfIntegration:
         assert result["success"] is False  # the file has a real error
         assert len(result["errors"]) > 0
         perf = result["perf"]
-        assert perf["saved"] is True, perf
-        doc = json.loads((tmp_path / "err-perf.json").read_text())
-        # Sentences past the error were checked too (full-check implied).
-        assert any(s["line"] == 2 for s in doc["sentences"])
+        assert perf["saved"] is False
+        assert "error" in perf["reason"]
+        assert not (tmp_path / "err-perf.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_sentence_timeout_abort_blocks_perf(self, tmp_path, lstate):
+        """A sentence aborted by ``sentence_timeout`` surfaces as an error
+        diagnostic, so the clean-check-only rule refuses the perf save (its
+        time-until-abort is not the sentence's real cost).  The documented
+        way to profile sentences slower than the cap is sentence_timeout=0.
+
+        Mirrors test_qed_sentence_timeout.py: ``loop 1500000`` forces ~1.5M
+        kernel reduction steps in the *tactic* (reflexivity), well past the
+        0.5s cap on any realistic box; a fast-box control skips instead of
+        asserting on hardware.
+        """
+        (tmp_path / "st.v").write_text(
+            "Fixpoint loop (n : nat) : nat := "
+            "match n with 0 => 0 | S k => loop k end.\n"
+            "Lemma slow : loop 1500000 = 0.\n"
+            "Proof. reflexivity. Qed.\n"
+        )
+        result = await _server.rocq_compile_lsp(
+            file_path="st.v", workspace=str(tmp_path),
+            sentence_timeout=0.5, save_perf_to="st-perf.json", ctx=_Ctx(lstate),
+        )
+        timed_out = [
+            e for e in result.get("errors") or []
+            if "timeout" in (e.get("message") or "").lower()
+        ]
+        if not timed_out:
+            pytest.skip(
+                "box too fast: loop 1500000 did not exceed "
+                "sentence_timeout=0.5s, so the abort can't be exercised"
+            )
+        assert result["success"] is False
+        perf = result["perf"]
+        assert perf["saved"] is False
+        assert "error" in perf["reason"]
+        assert not (tmp_path / "st-perf.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_error_below_position_still_profiles_prefix(
+        self, tmp_path, lstate
+    ):
+        """Only errors in the CHECKED region block saving: a broken tail below
+        the position does not taint a clean-prefix profile."""
+        (tmp_path / "tb.v").write_text(
+            "Lemma a : 1 + 1 = 2. Proof. reflexivity. Qed.\n"
+            "Lemma b : 2 + 2 = 4. Proof. reflexivity. Qed.\n"
+            "Lemma broken : 1 = 2. Proof. reflexivity. Qed.\n"
+        )
+        result = await _server.rocq_compile_lsp(
+            file_path="tb.v", workspace=str(tmp_path), line=1,
+            save_perf_to="tb-perf.json", ctx=_Ctx(lstate),
+        )
+        assert result["success"] is True, result  # prefix is clean
+        perf = result["perf"]
+        if not perf["saved"]:
+            pytest.skip(f"no coq/getPerfData on this coq-lsp: {perf['reason']}")
+        doc = json.loads((tmp_path / "tb-perf.json").read_text())
+        assert all(s["line"] <= 1 for s in doc["sentences"])
 
     @pytest.mark.asyncio
     async def test_reprofile_same_file(self, tmp_path, lstate):

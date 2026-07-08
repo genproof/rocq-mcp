@@ -2682,12 +2682,15 @@ async def rocq_compile_lsp(
             The check's per-sentence execution ``time`` (seconds) and
             ``memory`` (heap words) come from coq-lsp itself, at zero extra
             elaboration cost -- profiling is a byproduct of the check.  The
-            file gets the full table (position, source text, time, memory,
-            cache_hit) in document order; the response gets a compact
-            ``perf`` object: ``{saved, output_file, n_sentences,
-            total_time_s, hotspots}`` with the ~10 hottest sentences inline
-            (``{line, time_s, text}``) so the profile -> edit -> re-check
-            loop needs no extra calls.  Composes with ``line``: only the
+            file gets the full table (position, source text, time, memory)
+            in document order, plus the aggregates
+            (``total_time_s``, ``total_memory_words``) next to
+            ``checked_through_line``; the response gets a compact ``perf``
+            object: ``{saved, output_file, n_sentences, hotspots}`` with the
+            ~10 hottest sentences inline (``{line, time_s, text}``) so the
+            profile -> edit -> re-check loop needs no extra calls.
+            Aggregates are deliberately NOT inlined -- a prefix total read
+            without its region is misleading; take totals from the file.  Composes with ``line``: only the
             prefix up to the position is profiled and the tail is never
             elaborated (requires the ``genproof/rocq-lsp`` fork's
             ``coq/getPerfData``; on stock coq-lsp only full-file profiling
@@ -2695,12 +2698,14 @@ async def rocq_compile_lsp(
             sentence's original elaboration time -- reported even when
             coq-lsp serves it from cache -- so totals stay comparable
             between calls; use ``rocq_restart`` first for a fully cold
-            re-measurement.  Implies ``stop_at_first_error=False`` (the
-            check must reach its target to be profiled).  A sentence aborted
-            by ``sentence_timeout`` appears with its time-until-abort; pass
-            ``sentence_timeout=0`` to measure sentences slower than the cap.
-            On an incomplete check the response carries ``perf: {saved:
-            false, reason}`` and no file is written.
+            re-measurement.  Perf is saved only for a **clean** check: any
+            error diagnostic (or a timed-out check) yields ``perf: {saved:
+            false, reason}`` and no file -- a broken document's timings are
+            misleading (sentences after an error run in recovery mode), and
+            an unchecked tail would silently shrink the totals.  Note a
+            ``sentence_timeout`` abort is an error too and thus blocks
+            saving; pass ``sentence_timeout=0`` to measure sentences slower
+            than the cap.
     """
     # Same workspace handling as the other file tools: auto-detect the
     # project root from *file_path* when no explicit workspace is given.
@@ -2748,11 +2753,10 @@ async def rocq_compile_lsp(
 
     # Snapshotting a broken file (save_vof_with_errors) needs a completed, EOF-
     # reaching check, so it implies a full check (overrides stop-at-first).
-    # Profiling (save_perf_to) likewise needs the check to reach its target
-    # (EOF, or *line*): a first-error halt leaves the perf request unanswered.
-    effective_stop = (
-        stop_at_first_error and not save_vof_with_errors and not save_perf_to
-    )
+    # Profiling (save_perf_to) needs no such override: an erroring check is
+    # never profiled, so a first-error halt just reports perf unavailable --
+    # keeping the fast first-error feedback even with the flag set.
+    effective_stop = stop_at_first_error and not save_vof_with_errors
 
     # None (the default) means "use the global ROCQ_SENTENCE_TIMEOUT default";
     # an explicit value (including 0 to force-disable) overrides it.
@@ -2785,19 +2789,24 @@ async def rocq_compile_lsp(
             )
         # Profiling piggybacks on the check just driven: the coq/getPerfData
         # pull answers immediately for the checked region (no re-elaboration).
-        # Skipped when the check never reached its target (client timeout, or
-        # a halt at coq-lsp's max_errors budget) -- a postponed perf request
-        # against the halted document would stall until its own timeout.
+        # Only a CLEAN check is profiled: a broken document's timings are
+        # misleading (post-error sentences run in recovery mode / not at all),
+        # and any halt (first error, max_errors budget, timeout) leaves the
+        # document short of the target -- a postponed perf request against it
+        # would stall until its own timeout.  The errors guard also covers the
+        # errors_truncated (budget-halt) case.
         if perf_out is not None:
             if result.get("timed_out"):
                 result["perf"] = {
                     "saved": False,
                     "reason": "check did not complete (timed out)",
                 }
-            elif result.get("errors_truncated"):
+            elif result.get("errors"):
                 result["perf"] = {
                     "saved": False,
-                    "reason": "check halted at the max_errors budget",
+                    "reason": (
+                        "check has errors; perf is only saved for a clean check"
+                    ),
                 }
             else:
                 result["perf"] = collect_and_save_perf(
