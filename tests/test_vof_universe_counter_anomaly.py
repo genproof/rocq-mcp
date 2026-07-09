@@ -103,7 +103,18 @@ async def test_edit_after_vof_reload_survives_universe_minting(
     assert (tmp_path / "t.vof").is_file(), "precondition: no .vof was saved"
 
     # Session B (fresh coq-lsp process): warm-start from the snapshot on the
-    # unchanged file, then append one more universe-minting lemma.
+    # unchanged file, then edit.  Both field shapes are covered: appending a
+    # new minting lemma (the 2026-07-09 "any single forward" episodes) and a
+    # MID-FILE insert, after which the unchanged-but-dropped code below the
+    # cut re-elaborates in the reloading process (the 2026-07-06 episode:
+    # the anomaly fired at unchanged code below a large insert).
+    one = _minting_proof("tnew")
+    edits = {
+        "append": _BASE + one,
+        "mid-insert": _BASE.replace(
+            "Lemma t1 : True.", one + "Lemma t1 : True.", 1
+        ),
+    }
     s2 = make_lifespan_state(full=True)
     try:
         r1 = await _server.rocq_compile_lsp(
@@ -111,16 +122,17 @@ async def test_edit_after_vof_reload_survives_universe_minting(
         )
         assert r1["success"] is True, ("warm-start read failed", r1)
 
-        f.write_text(_BASE + _minting_proof("t3"))
-        r2 = await _server.rocq_compile_lsp(
-            file_path=str(f), workspace=str(tmp_path),
-            stop_at_first_error=False, ctx=_Ctx(s2),
-        )
-        assert not _anomalies(r2), (
-            "universe-counter collision after .vof reload "
-            f"(anomalies={_anomalies(r2)[:2]!r})"
-        )
-        assert r2["success"] is True, r2
+        for shape, content in edits.items():
+            f.write_text(content)
+            r2 = await _server.rocq_compile_lsp(
+                file_path=str(f), workspace=str(tmp_path),
+                stop_at_first_error=False, ctx=_Ctx(s2),
+            )
+            assert not _anomalies(r2), (
+                f"universe-counter collision after .vof reload ({shape}: "
+                f"anomalies={_anomalies(r2)[:2]!r})"
+            )
+            assert r2["success"] is True, (shape, r2)
     finally:
         stop_all_checkers(s2)
 
