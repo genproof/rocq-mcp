@@ -2648,7 +2648,9 @@ async def rocq_compile_lsp(
         stop_at_first_error: Return as soon as the check hits the first
             error, without elaborating anything below it (default: True) --
             fast feedback on a broken file, and an expensive/slow tactic
-            below the error is never run.  Set to False to check through to
+            below the error is never run.  Only the first error (plus any
+            warnings/info before it) is reported, regardless of what earlier
+            calls on this session already found.  Set to False to check through to
             the end (or *line*) and report every error.  Applies to both the
             whole-file and position-limited checks.  "Every error" is capped
             by coq-lsp's error budget (150): a document with more errors

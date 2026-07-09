@@ -176,6 +176,40 @@ def _split_by_severity(
     return errors, warnings, info
 
 
+def _trim_to_first_error(diags: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Trim a diagnostic set to what a halt at the FIRST error would publish.
+
+    In stop-at-first-error mode the settle can be served from diagnostics a
+    wider drive (``max_errors=150``: a report-all check or any goals-driven
+    request) left behind -- cached in ``_doc_state`` for unchanged content,
+    or republished with the retained prefix on didChange.  Those relics
+    carry every error the wider drive recovered past, so returning them
+    verbatim reports errors past the first-error halt: the same call gives
+    different results warm vs fresh, and the extra entries include
+    error-recovery cascade artifacts (see
+    test_compile_lsp_stale_first_error_settle).  Keeping only diagnostics
+    that START at or before the first error's end restores the halt
+    publish's shape: everything before the error (the clean prefix's
+    warnings/info) survives; everything past it -- elaborated only under
+    error recovery -- is dropped.
+
+    Sound because budgets agree on the first error: elaboration before it
+    involves no recovery, so the relic's minimal error is exactly what a
+    live ``max_errors=0`` halt would re-mint.  Approximation: the true halt
+    boundary is the end of the first erroring *sentence*, which the client
+    does not know; the first error's own end is the closest available cut
+    (a second sentence on the same line past that end is dropped, where a
+    live halt would never have run it anyway).  No-op when there are no
+    errors.
+    """
+    errors = [d for d in diags if d["severity"] == SEVERITY_ERROR]
+    if not errors:
+        return diags
+    first = min(errors, key=lambda d: (d["line"], d["character"]))
+    cut = (first["end_line"], first["end_character"])
+    return [d for d in diags if (d["line"], d["character"]) <= cut]
+
+
 def _barrier_end_line(barrier: dict[str, Any] | None) -> int:
     """End line of the sentence covering the barrier point, from a
     ``GoalsAnswer`` payload; ``-1`` when unavailable (no answer arrived, or
@@ -687,7 +721,12 @@ class LspChecker:
         *stop_at_first_error* (default): return as soon as coq-lsp hits the
         first error -- it halts there without running anything below, so a
         broken file does not pay for an expensive tail.  Set it ``False`` to
-        check the whole document and report every error.
+        check the whole document and report every error.  The result is
+        trimmed to the first error and what precedes it even when a wider
+        drive on this warm session (a report-all check, a goals request)
+        already published errors further down (see
+        :func:`_trim_to_first_error`) -- the mode's verdict must not depend
+        on session history.
 
         *save_vof_on_error* controls the warm-start snapshot when the file
         has error diagnostics: by default we only persist a ``.vof`` for a
@@ -871,6 +910,11 @@ class LspChecker:
             sentence_timeout=sentence_timeout,
         )
         diags = self._diags_after_grace(uri)
+        if stop_at_first_error:
+            # The settle may have been served from a wider drive's relic set
+            # (every error it recovered past); report only what a live halt
+            # at the first error would have published.
+            diags = _trim_to_first_error(diags)
         elapsed = time.monotonic() - start_time
         # ``ok=settled``: an unfinished check (coq-lsp died, or a caller's
         # deadline elapsed) must not degrade ``success`` to "no errors
@@ -1024,11 +1068,20 @@ class LspChecker:
                 if self._dead:
                     break
                 if stop_at_first_error:
+                    # An error publish settles the drive.  It is either the
+                    # live halt (max_errors=0 stops at the first error) or a
+                    # wider drive's relic -- cached for unchanged content or
+                    # republished with the retained prefix on didChange.  The
+                    # settle is sound either way: an errored doc cannot
+                    # advance under max_errors=0, and the relic's minimal
+                    # error is exactly the halt's.  But the relic carries
+                    # errors PAST the halt too, so the check paths trim the
+                    # result to the first error (_trim_to_first_error).
                     st = self._doc_state.get(uri)
                     if st and any(
                         d["severity"] == SEVERITY_ERROR for d in st["diags"]
                     ):
-                        settled = True  # coq-lsp halted at the first error
+                        settled = True
                         break
                 else:
                     # Report-all mode: the max_errors budget halt is the one
@@ -1191,6 +1244,10 @@ class LspChecker:
             diags = self._collect_prefix_diags(
                 uri, max(line, _barrier_end_line(barrier))
             )
+            if stop_at_first_error:
+                # Same relic-set trim as the whole-file path: report only
+                # what a live halt at the first error would have published.
+                diags = _trim_to_first_error(diags)
             elapsed = time.monotonic() - start_time
 
         result = self._result_from_diags(
