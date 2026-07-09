@@ -89,8 +89,17 @@ _MAX_ERRORS_FIRST: int = 0
 
 # Sentinel diagnostic coq-lsp emits when it stops at the max_errors limit
 # (fleche/doc.ml ``max_errors_node``).  It is an artifact of the limit, not a
-# real proof error, so we drop it from reported diagnostics.
+# real proof error, so we drop it (by prefix) from reported diagnostics.
+# The genproof fork tags it with the budget that minted it --
+# ``"... (max_errors=N)"`` -- so the report-all settle can tell a live halt
+# at ITS budget from the stale relic of an earlier stop-at-first-error halt
+# (see :func:`_sentinel_for_budget` and ``_drive_barrier_locked``).
 _MAX_ERRORS_SENTINEL: str = "Maximum number of errors reached"
+
+
+def _sentinel_for_budget(n: int) -> str:
+    """The exact sentinel message a halt at ``max_errors == n`` mints."""
+    return f"{_MAX_ERRORS_SENTINEL} (max_errors={n})"
 
 # Base coq-lsp settings.  ``do_settings`` (init + didChangeConfiguration)
 # REPLACES the whole config from this object, so every send must include these.
@@ -946,9 +955,13 @@ class LspChecker:
         the first error (which it publishes but then stops, so an expensive
         tail below it is never run); or, in report-all mode, coq-lsp halted
         at the ``max_errors`` budget -- its sentinel diagnostic ("Maximum
-        number of errors reached") is published exactly then, and a barrier
-        past the halt can never be answered afterwards (the over-budget doc
-        is never re-scheduled), so the sentinel IS the completion signal.
+        number of errors reached (max_errors=N)") is published exactly then,
+        and a barrier past the halt can never be answered afterwards (the
+        over-budget doc is never re-scheduled), so the sentinel IS the
+        completion signal.  Only a sentinel whose budget tag matches this
+        drive's budget counts -- a relic of an earlier ``max_errors=0`` halt
+        can sit in ``_doc_state`` while the doc can perfectly well advance
+        under the current budget (see the settle branch below).
         ``False`` on timeout / dead process -- the document is then only
         partially checked.
 
@@ -1024,10 +1037,23 @@ class LspChecker:
                     # Its sentinel diagnostic is the completion signal --
                     # published together with the full, capped error set --
                     # so waiting longer only hands an idle session to a
-                    # watchdog.
+                    # watchdog.  Only a sentinel minted at THIS drive's
+                    # budget counts: ``_doc_state`` can still hold a
+                    # sentinel from an earlier stop-at-first-error halt
+                    # (max_errors=0) -- cached across a no-didChange
+                    # re-check of unchanged content, or republished with
+                    # the retained prefix on didChange -- and that relic's
+                    # doc CAN advance under this budget; settling on it
+                    # would return before the resumed check runs, silently
+                    # dropping every error past the old halt (see
+                    # test_compile_lsp_stale_sentinel).  A matching-budget
+                    # sentinel is sound even when republished: it is minted
+                    # below the error nodes it counted, so its retention
+                    # implies the over-budget error mass is retained too.
                     st = self._doc_state.get(uri)
                     if st and any(
-                        d["message"] == _MAX_ERRORS_SENTINEL for d in st["diags"]
+                        d["message"] == _sentinel_for_budget(_MAX_ERRORS_FULL)
+                        for d in st["diags"]
                     ):
                         settled = True
                         budget_hit = True
@@ -1194,8 +1220,13 @@ class LspChecker:
         if not st:
             return []
         # Drop the max_errors sentinel -- it is an artifact of stopping at the
-        # limit, not a real diagnostic.
-        return [d for d in st["diags"] if d.get("message") != _MAX_ERRORS_SENTINEL]
+        # limit, not a real diagnostic.  Prefix match: the genproof fork tags
+        # it with the minting budget ("... (max_errors=N)").
+        return [
+            d
+            for d in st["diags"]
+            if not str(d.get("message", "")).startswith(_MAX_ERRORS_SENTINEL)
+        ]
 
     def _collect_prefix_diags(self, uri: str, line: int) -> list[dict[str, Any]]:
         """Diagnostics for *uri* with start line ``<= line`` (the barrier
