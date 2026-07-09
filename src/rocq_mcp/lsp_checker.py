@@ -96,6 +96,13 @@ _MAX_ERRORS_FIRST: int = 0
 # (see :func:`_sentinel_for_budget` and ``_drive_barrier_locked``).
 _MAX_ERRORS_SENTINEL: str = "Maximum number of errors reached"
 
+# Prefix of the diagnostic the genproof fork mints when the per-sentence
+# watchdog aborts a sentence (``sentence_timeout_prefix`` in fleche/doc.ml,
+# deliberately self-identifying).  Such an error is TRANSIENT -- a property
+# of that run's budget and machine load, not of the document -- so serving
+# it from a cache is staleness; see :meth:`_timeout_relic_cached`.
+_SENTENCE_TIMEOUT_PREFIX: str = "rocq-lsp: sentence timeout"
+
 
 def _sentinel_for_budget(n: int) -> str:
     """The exact sentinel message a halt at ``max_errors == n`` mints."""
@@ -575,6 +582,33 @@ class LspChecker:
         if uri not in self._open_docs and self._try_load_vof(uri, file_path, content):
             return self._open_docs[uri]
         return self._sync_document(uri, content)
+
+    def _timeout_relic_cached(self, uri: str, content: str) -> bool:
+        """Whether *uri* is open at exactly *content* with a sentence-timeout
+        error among its cached diagnostics.
+
+        A timeout error is transient (that run's budget, not the document),
+        and the fork's cure lives in ``Doc.bump_version``: a timeout node is
+        a retention barrier, so any didChange re-elaborates the aborted
+        sentence under the budget in effect now.  The no-didChange warm path
+        (:meth:`_ensure_open` skipping the sync for unchanged content) is
+        the one way around that barrier -- the relic would be replayed
+        verbatim, without the sentence ever being re-tried, even by a call
+        that explicitly disables the timeout (see
+        test_compile_lsp_stale_timeout_relic).  Callers use this to force an
+        identical-content version bump instead.  Caller holds ``self._lock``.
+        """
+        if uri not in self._open_docs or self._last_content.get(uri) != content:
+            return False
+        with self._cv:
+            st = self._doc_state.get(uri)
+        if not st:
+            return False
+        return any(
+            d["severity"] == SEVERITY_ERROR
+            and str(d.get("message", "")).startswith(_SENTENCE_TIMEOUT_PREFIX)
+            for d in st["diags"]
+        )
 
     def close_document(self, file_path: str) -> None:
         """Close a document (didClose) and forget its cached state."""
@@ -1192,7 +1226,11 @@ class LspChecker:
         *sentence_timeout* > 0 bounds each sentence on the way to the point
         (seconds); a slow/diverging tactic *before* the point is aborted and
         reported as "Timeout!" instead of blocking the barrier.  See
-        :meth:`check_file`.  ``0.0`` (default) disables it.
+        :meth:`check_file`.  ``0.0`` (default) disables it.  A cached
+        sentence-timeout error for unchanged content forces an
+        identical-content re-sync first (:meth:`_timeout_relic_cached`), so
+        the aborted sentence is re-elaborated under THIS call's budget
+        instead of the transient relic being replayed.
         """
         with self._lock:
             self._ensure_started(workspace)
@@ -1223,6 +1261,19 @@ class LspChecker:
 
             start_time = time.monotonic()
             self._ensure_open(uri, content, file_path=resolved)
+            if self._timeout_relic_cached(uri, content):
+                # Mirror the whole-file path (which always syncs): an
+                # identical-content version bump routes through the server's
+                # timeout retention barrier, so the drive below re-elaborates
+                # the aborted sentence under THIS call's budget instead of
+                # replaying the transient relic.  Only timeout-red documents
+                # pay; they either go green or honestly re-earn the red.
+                # Checked after _ensure_open so a just-reloaded ``.vof``
+                # snapshot carrying a timeout error (its diagnostics publish
+                # precedes the load ack) is bumped too; after a real edit
+                # this can never double-sync -- the didChange republish
+                # excludes timeout nodes (the barrier dropped them).
+                self._sync_document(uri, content)
             # Drive checking toward the point.  *settled* is False only on
             # timeout / dead process (the check never reached the point and
             # found no error on the way); the prefix diagnostics are then
