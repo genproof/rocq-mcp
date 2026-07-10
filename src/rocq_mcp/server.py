@@ -898,10 +898,63 @@ def _fail(
     return {"success": False, "error": message, "reason": reason, **extra}
 
 
+def _fresh_frontier(checker: Any, op_start: float) -> tuple[float, int, int] | None:
+    """The checker's ``$/coq/fileProgress`` frontier, gated for kill-time use.
+
+    Returns the ``(monotonic_ts, line, char)`` tuple only when it is
+    well-formed AND from the current op (``ts >= op_start``): the abort
+    recoveries run regardless of whether a frontier watchdog phase reset the
+    progress baseline, so a warm session may hold a relic from a prior call.
+    Shape-checked like the watchdog's read (an unconfigured mock must not
+    crash recovery).
+    """
+    get_prog = getattr(checker, "last_progress", None)
+    prog = get_prog() if get_prog is not None else None
+    if (
+        isinstance(prog, tuple)
+        and len(prog) == 3
+        and isinstance(prog[0], (int, float))
+        and prog[0] >= op_start
+    ):
+        return prog
+    return None
+
+
+def _describe_frontier_sentence(
+    key: str,
+    progress: tuple[float, int, int] | None,
+    when: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """(``elaborating_sentence`` dict, error-message suffix) for a kill-time
+    frontier.
+
+    *progress* is the ``$/coq/fileProgress`` frontier (or ``None``): it names
+    the sentence that was *elaborating* at the moment described by *when*
+    (e.g. ``"at the kill"``) -- 0-based ``line``/``character``, with the
+    sentence text when the session is keyed by a readable file.  Unlike the
+    stall path's ``diverging_sentence``, it is a hint, not a verdict: the
+    fault (memory growth, wall-clock, a crash) may have accumulated across
+    earlier sentences.  ``(None, "")`` when there is no frontier to report.
+    """
+    if progress is None:
+        return None, ""
+    line, character = progress[1], progress[2]
+    sentence = _extract_sentence(key, line, character)
+    elaborating = {"line": line, "character": character, "text": sentence}
+    note = (
+        f". The sentence being elaborated {when} was at "
+        f"line {line}, character {character} (0-based)"
+    )
+    if sentence:
+        note += f": {sentence}"
+    return elaborating, note
+
+
 def _build_lsp_memory_abort_response(
     lifespan_state: dict[str, Any],
     tool: str,
     key: str,
+    progress: tuple[float, int, int] | None = None,
 ) -> dict[str, Any]:
     """Memory-abort recovery for one coq-lsp session.
 
@@ -911,26 +964,34 @@ def _build_lsp_memory_abort_response(
     ``memory_exhausted`` envelope.  Other sessions in the pool are
     untouched -- LspChecker owns its lock per-instance, and discarding
     one checker discards only its lock.
+
+    *progress* is the frontier at the moment of the kill; it names the
+    sentence that was elaborating when RSS crossed the cap (see
+    :func:`_describe_frontier_sentence`).
     """
     _invalidate_lsp(lifespan_state, key)
+    elaborating, note = _describe_frontier_sentence(key, progress, "at the kill")
     error = (
         f"{tool} aborted: coq-lsp RSS exceeded "
-        f"{ROCQ_MAX_LSP_RSS_MB} MB. coq-lsp has been restarted. "
-        "Retry on a smaller file or split the work into smaller pieces."
+        f"{ROCQ_MAX_LSP_RSS_MB} MB. coq-lsp has been restarted" + note
     )
     _record_error(lifespan_state, tool, error, reason="memory_exhausted")
-    return {
+    response: dict[str, Any] = {
         "success": False,
         "error": error,
         "reason": "memory_exhausted",
         "lsp_restarted": True,
     }
+    if elaborating is not None:
+        response["elaborating_sentence"] = elaborating
+    return response
 
 
 def _build_lsp_died_response(
     lifespan_state: dict[str, Any],
     tool: str,
     key: str,
+    progress: tuple[float, int, int] | None = None,
 ) -> dict[str, Any]:
     """Recovery for a coq-lsp that died mid-operation on its own.
 
@@ -942,26 +1003,36 @@ def _build_lsp_died_response(
     success).  Discards the dead session (the next call respawns it, warm-
     starting from a ``.vof`` when present) and returns the unified
     ``crashed`` envelope.
+
+    *progress* is the last frontier before the death; it names the sentence
+    that was elaborating when the process died (see
+    :func:`_describe_frontier_sentence`).
     """
     _invalidate_lsp(lifespan_state, key)
+    elaborating, note = _describe_frontier_sentence(key, progress, "when it died")
     error = (
         f"{tool} aborted: coq-lsp died mid-operation (crashed or was killed "
         "externally, e.g. by the kernel OOM killer). The session has been "
-        "discarded and will restart on the next call; retry the operation."
+        "discarded and will restart on the next call; retry the operation"
+        + note
     )
     _record_error(lifespan_state, tool, error, reason="crashed")
-    return {
+    response: dict[str, Any] = {
         "success": False,
         "error": error,
         "reason": "crashed",
         "lsp_restarted": True,
     }
+    if elaborating is not None:
+        response["elaborating_sentence"] = elaborating
+    return response
 
 
 def _build_lsp_hard_timeout_response(
     lifespan_state: dict[str, Any],
     tool: str,
     key: str,
+    progress: tuple[float, int, int] | None = None,
 ) -> dict[str, Any]:
     """Hard-timeout recovery for one coq-lsp session.
 
@@ -972,22 +1043,31 @@ def _build_lsp_hard_timeout_response(
     to Coq's polled interrupt (a non-cooperative divergence), so killing the
     process is the only way to free the session.  Other sessions in the pool
     are untouched.
+
+    *progress* is the frontier at the moment of the kill; it names the
+    sentence that was elaborating when the deadline hit -- the wall clock
+    bounds the whole op, so earlier sentences may have spent the budget (see
+    :func:`_describe_frontier_sentence`).
     """
     _invalidate_lsp(lifespan_state, key)
+    elaborating, note = _describe_frontier_sentence(key, progress, "at the kill")
     error = (
         f"{tool} aborted: exceeded the hard timeout of {ROCQ_HARD_TIMEOUT}s "
         "(ROCQ_HARD_TIMEOUT). coq-lsp has been restarted. The operation hit a "
         "tactic that does not respond to interruption -- check for a diverging "
         "or non-terminating tactic (e.g. an unbounded loop or a runaway "
-        "computation)."
+        "computation)" + note
     )
     _record_error(lifespan_state, tool, error, reason="hard_timeout")
-    return {
+    response: dict[str, Any] = {
         "success": False,
         "error": error,
         "reason": "hard_timeout",
         "lsp_restarted": True,
     }
+    if elaborating is not None:
+        response["elaborating_sentence"] = elaborating
+    return response
 
 
 def _skip_ws_and_comments(text: str, i: int) -> int:
@@ -1595,19 +1675,31 @@ async def _run_with_lsp(
         # kill+restart this session's coq-lsp; an external cancel (neither
         # event set) must propagate.
         if mem_event.is_set():
+            # Frontier at the moment of the kill -- the sentence coq-lsp was
+            # elaborating when RSS crossed the cap (a hint: memory may have
+            # accumulated across earlier sentences).
+            prog = _fresh_frontier(checker, _t0)
             dlog.event(
                 "op", "lsp_op.memory_exhausted", tool=tool, key=key,
                 duration_s=round(time.monotonic() - _t0, 6),
                 peak_rss_mb=meta.get("peak_rss_mb"),
+                line=prog[1] if prog else None,
+                character=prog[2] if prog else None,
             )
-            return _build_lsp_memory_abort_response(lifespan_state, tool, key)
+            return _build_lsp_memory_abort_response(lifespan_state, tool, key, prog)
         if timeout_event.is_set():
+            # Frontier at the deadline -- the sentence coq-lsp was elaborating
+            # when the wall clock ran out (a hint: the hard timeout bounds the
+            # whole op, so earlier sentences may have spent the budget).
+            prog = _fresh_frontier(checker, _t0)
             dlog.event(
                 "op", "lsp_op.hard_timeout", tool=tool, key=key,
                 duration_s=round(time.monotonic() - _t0, 6),
                 limit_s=ROCQ_HARD_TIMEOUT,
+                line=prog[1] if prog else None,
+                character=prog[2] if prog else None,
             )
-            return _build_lsp_hard_timeout_response(lifespan_state, tool, key)
+            return _build_lsp_hard_timeout_response(lifespan_state, tool, key, prog)
         if stall_event.is_set():
             # Re-read the frontier *after* the cancel: coq-lsp is wedged (no new
             # progress) and about to be killed, so this is the stalled sentence.
@@ -2842,6 +2934,7 @@ async def rocq_compile_lsp(
     # _run_with_lsp handles checker lifecycle, the RSS memory watchdog
     # (memory_exhausted envelope on breach), and the post-success soft
     # trim (coq/trimCaches when RSS crosses ROCQ_LSP_TRIM_RSS_MB).
+    _op_t0 = time.monotonic()
     result = await _run_with_lsp(
         _check,
         lifespan_state,
@@ -2855,9 +2948,13 @@ async def rocq_compile_lsp(
     # e.g. the kernel OOM killer): the check never finished, so its partial
     # diagnostics are not a verdict.  Return the explicit envelope instead.
     if isinstance(result, dict) and result.pop("lsp_died", False):
-        return _build_lsp_died_response(
-            lifespan_state, "rocq_compile_lsp", _session_key(workspace, file_path)
-        )
+        key = _session_key(workspace, file_path)
+        # The dead checker is still pooled (only the builder drops it); its
+        # last frontier before the death names the sentence that was
+        # elaborating when the process died.
+        checker = lifespan_state.get("lsp_pool", {}).get(key)
+        prog = _fresh_frontier(checker, _op_t0) if checker is not None else None
+        return _build_lsp_died_response(lifespan_state, "rocq_compile_lsp", key, prog)
 
     # On a memory abort the envelope carries no warnings/info keys to pop.
     if not include_warnings:

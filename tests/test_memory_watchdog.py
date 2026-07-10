@@ -459,6 +459,73 @@ class TestLspMemoryWatchdogBreach:
         assert result["lsp_restarted"] is True
 
     @pytest.mark.asyncio
+    async def test_rss_breach_names_elaborating_sentence(self, tmp_path, monkeypatch):
+        """A fresh frontier at the kill -> the memory envelope names the
+        sentence that was elaborating (elaborating_sentence + error text)."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 100)
+        monkeypatch.setattr(_server, "ROCQ_HARD_TIMEOUT", 0.0)
+        monkeypatch.setattr(_server, "ROCQ_SENTENCE_TIMEOUT", 0.0)  # stall off
+        _patch_psutil_rss(monkeypatch, 500)  # 500 MB > 100 MB cap
+
+        vfile = tmp_path / "hog.v"
+        vfile.write_text("Definition a := 1.\nhog_memory_bbbb.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()
+        # Live frontier at line 1: timestamped now on each read, so it is
+        # fresh (>= op start) when the memory recovery reads it back.
+        checker.last_progress = lambda: (time.monotonic(), 1, 0)
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
+
+        ctx = _MockLspContext(ls)
+        result = await rocq_compile_lsp(
+            file_path=str(vfile), workspace=str(tmp_path), ctx=ctx
+        )
+
+        assert result["success"] is False
+        assert result["reason"] == "memory_exhausted"
+        es = result["elaborating_sentence"]
+        assert es["line"] == 1 and es["character"] == 0
+        assert es["text"] == "hog_memory_bbbb."
+        assert "hog_memory_bbbb." in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_rss_breach_ignores_stale_frontier_relic(self, tmp_path, monkeypatch):
+        """A frontier older than the op (warm-session relic; stall watchdog off,
+        so nothing reset the baseline) must NOT be reported as the elaborating
+        sentence -- the plain memory envelope is returned."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 100)
+        monkeypatch.setattr(_server, "ROCQ_HARD_TIMEOUT", 0.0)
+        monkeypatch.setattr(_server, "ROCQ_SENTENCE_TIMEOUT", 0.0)  # no reset
+        _patch_psutil_rss(monkeypatch, 500)  # 500 MB > 100 MB cap
+
+        vfile = tmp_path / "relic.v"
+        vfile.write_text("Definition a := 1.\nrelic_sentence_cccc.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()
+        # Relic frontier: timestamp 0.0 predates the op start.
+        checker.last_progress = lambda: (0.0, 1, 0)
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
+
+        ctx = _MockLspContext(ls)
+        result = await rocq_compile_lsp(
+            file_path=str(vfile), workspace=str(tmp_path), ctx=ctx
+        )
+
+        assert result["success"] is False
+        assert result["reason"] == "memory_exhausted"
+        assert "elaborating_sentence" not in result
+        assert "relic_sentence_cccc" not in result["error"]
+        assert result["error"].endswith("coq-lsp has been restarted")
+
+    @pytest.mark.asyncio
     async def test_low_lsp_rss_does_not_abort(self, tmp_path, monkeypatch):
         """LSP RSS below threshold -> normal result, no abort."""
         from rocq_mcp.server import rocq_compile_lsp
@@ -577,6 +644,43 @@ class TestLspHardTimeout:
             and e.get("tool") == "rocq_compile_lsp"
             for e in ls["recent_errors"]
         )
+
+    @pytest.mark.asyncio
+    async def test_hard_timeout_names_elaborating_sentence(self, tmp_path, monkeypatch):
+        """A fresh frontier at the deadline -> the hard_timeout envelope names
+        the sentence that was elaborating (elaborating_sentence + error text)."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 100_000)
+        monkeypatch.setattr(_server, "ROCQ_HARD_TIMEOUT", 0.05)
+        _patch_psutil_rss(monkeypatch, 10)
+
+        vfile = tmp_path / "diverge.v"
+        vfile.write_text("Definition a := 1.\nslow_sentence_dddd.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()
+        # Live frontier at line 1: fresh (>= op start) when the hard-timeout
+        # recovery reads it back at the deadline.
+        checker.last_progress = lambda: (time.monotonic(), 1, 0)
+        checker.check_file.side_effect = lambda *a, **kw: (
+            time.sleep(0.5)
+            or {"success": True, "errors": [], "warnings": [], "check_time_ms": 500}
+        )
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
+
+        ctx = _MockLspContext(ls)
+        result = await rocq_compile_lsp(
+            file_path=str(vfile), workspace=str(tmp_path), ctx=ctx
+        )
+
+        assert result["success"] is False
+        assert result["reason"] == "hard_timeout"
+        es = result["elaborating_sentence"]
+        assert es["line"] == 1 and es["character"] == 0
+        assert es["text"] == "slow_sentence_dddd."
+        assert "slow_sentence_dddd." in result["error"]
 
     @pytest.mark.asyncio
     async def test_disabled_hard_timeout_does_not_abort(self, tmp_path, monkeypatch):

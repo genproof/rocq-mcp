@@ -127,3 +127,10 @@ async def test_death_mid_check_returns_crashed_envelope(lstate, tmp_path):
     assert r.get("lsp_restarted") is True, r
     # The internal flag must not leak into the tool response.
     assert "lsp_died" not in r, r
+    # The last frontier before the death names the elaborating sentence: the
+    # kill lands inside the slow vm_compute, so the frontier sits at the end
+    # of the Require and the extracted sentence is the slow definition.
+    es = r.get("elaborating_sentence")
+    assert es is not None, r
+    assert es["text"] and es["text"].startswith("Definition slow"), r
+    assert "Definition slow" in r["error"], r
