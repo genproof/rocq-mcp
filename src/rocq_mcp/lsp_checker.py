@@ -29,11 +29,16 @@ duplex), so only one request is outstanding at a time.
 
 from __future__ import annotations
 
+import atexit
+import ctypes
 import json
 import os
+import signal
 import subprocess
+import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +59,10 @@ _DEFAULT_REQUEST_TIMEOUT: float = 60.0
 
 # Handshake (initialize) response timeout.
 _HANDSHAKE_TIMEOUT: float = 30.0
+
+# Graceful LSP ``shutdown`` timeout in :meth:`LspChecker.stop`; on expiry the
+# process group is SIGKILLed.
+_SHUTDOWN_TIMEOUT: float = 5.0
 
 # Timeout (seconds) for a ``coq/saveVof`` request.  Marshaling a large
 # document's full state to disk is slow (a heavy VST file is ~70s / ~2 GB),
@@ -107,6 +116,171 @@ _SENTENCE_TIMEOUT_PREFIX: str = "rocq-lsp: sentence timeout"
 def _sentinel_for_budget(n: int) -> str:
     """The exact sentinel message a halt at ``max_errors == n`` mints."""
     return f"{_MAX_ERRORS_SENTINEL} (max_errors={n})"
+
+
+# ---------------------------------------------------------------------------
+# Strict subprocess lifecycle
+# ---------------------------------------------------------------------------
+# coq-lsp must never outlive this server.  A *wedged* coq-lsp (diverging
+# elaboration -- the very case the hard-timeout/stall watchdogs kill for)
+# never reads stdin, so it does not notice pipe EOF when the parent dies;
+# without extra measures it survives as an orphan spinning at 100% CPU.
+# Three layers guarantee cleanup:
+#
+# 1. Every coq-lsp gets its own process group (``start_new_session``), and
+#    every kill targets the *group* (:func:`_kill_group`), so anything
+#    coq-lsp forks dies with it.
+# 2. On Linux, ``PR_SET_PDEATHSIG`` makes the kernel SIGKILL coq-lsp when
+#    its spawning thread dies -- covering `kill -9` of the MCP server, a
+#    crash, or any exit path that skips the lifespan cleanup.  The signal
+#    is tied to the spawning THREAD, so all spawns go through one
+#    persistent spawner thread (:data:`_SPAWNER`) that lives exactly as
+#    long as the interpreter (worker threads of a ThreadPoolExecutor never
+#    idle out; they are joined at interpreter shutdown, which is precisely
+#    when any surviving coq-lsp should die).
+# 3. An ``atexit`` sweep (:func:`_kill_survivors`) SIGKILLs any process not
+#    stopped explicitly -- the backstop for non-Linux platforms and exit
+#    paths where ``stop()`` never ran.
+
+# From <linux/prctl.h>.
+_PR_SET_PDEATHSIG = 1
+
+if sys.platform == "linux":
+    try:
+        _LIBC = ctypes.CDLL(None, use_errno=True)
+        _LIBC.prctl  # probe: raises AttributeError if not exported
+    except (OSError, AttributeError):
+        _LIBC = None
+else:
+    _LIBC = None
+
+
+def _preexec_pdeathsig() -> None:
+    """Child-side (between fork and exec): request SIGKILL on spawner-thread
+    death.  Must stay minimal -- it runs in the forked child before exec,
+    where only async-signal-safe work is truly safe.  pdeathsig survives
+    exec, so it applies to the coq-lsp binary itself.
+    """
+    _LIBC.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+
+
+# Single persistent spawner thread (see layer 2 above).  Lazily populated
+# on first use; the worker thread persists until interpreter shutdown.
+_SPAWNER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="coq-lsp-spawner")
+
+# Every live coq-lsp Popen, for the atexit sweep.  Entries are discarded
+# once reaped (in :func:`_reap`).
+_LIVE_PROCS: set[subprocess.Popen] = set()
+_LIVE_PROCS_LOCK = threading.Lock()
+
+
+def _spawn_coq_lsp() -> subprocess.Popen:
+    """Spawn coq-lsp in its own process group with parent-death protection."""
+
+    def spawn() -> subprocess.Popen:
+        return subprocess.Popen(
+            ["coq-lsp"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,  # binary mode for LSP framing
+            start_new_session=True,
+            preexec_fn=_preexec_pdeathsig if _LIBC is not None else None,
+        )
+
+    proc = _SPAWNER.submit(spawn).result()
+    with _LIVE_PROCS_LOCK:
+        _LIVE_PROCS.add(proc)
+    return proc
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """SIGKILL *proc*'s whole process group.  Never raises, never blocks.
+
+    Signals the group even after the leader exited or was reaped: any
+    surviving member (something coq-lsp forked) pins the pgid -- the
+    kernel does not recycle a pid while it is still some process's pgid
+    -- so the killpg reaches exactly our stragglers; with no survivors it
+    reports ESRCH and is a no-op.  Guaranteeing group death also
+    guarantees the reader thread's EOF (every write end of our pipes
+    lives in this group), which :meth:`LspChecker.stop` relies on.
+    """
+    try:
+        # start_new_session makes the child its own group leader: pgid == pid.
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        # ESRCH (no member left) ends up here; so does any exotic killpg
+        # failure, where the plain single-process kill is the fallback.
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
+def _reap(proc: subprocess.Popen, timeout: float = 3.0) -> None:
+    """Bounded wait to collect *proc*'s exit status.  Never raises.
+
+    A timeout means the process is stuck in uninterruptible sleep (D
+    state) -- nothing more can be done from userspace; the entry stays in
+    :data:`_LIVE_PROCS` so the atexit sweep retries.
+    """
+    try:
+        proc.wait(timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        return
+    with _LIVE_PROCS_LOCK:
+        _LIVE_PROCS.discard(proc)
+
+
+def _kill_tree(proc: subprocess.Popen, reap_timeout: float = 3.0) -> None:
+    """SIGKILL *proc*'s process group and reap it.  Never raises.
+
+    Safe on an already-dead or already-reaped process (both steps are
+    no-ops then), so every kill path can call it unconditionally.
+    """
+    _kill_group(proc)
+    _reap(proc, timeout=reap_timeout)
+
+
+def _teardown_transport(
+    proc: subprocess.Popen | None, reader: threading.Thread | None
+) -> None:
+    """Join the reader thread, then close our pipe ends.
+
+    Caller must have killed *proc*'s process group first: that closes
+    every write end of stdout (kill by group, not just leader --
+    anything coq-lsp forked inherits the pipe), so the reader's blocking
+    read hits EOF and it exits.  Order matters: closing a buffered
+    stream that another thread is blocked reading deadlocks on the
+    stream's internal lock, so stdout is closed only once the reader is
+    done with it (and skipped -- leaked to GC -- in the pathological
+    case where the reader is still stuck after the join grace; a leaked
+    fd beats a wedged server).
+    """
+    if reader is not None and reader.is_alive():
+        reader.join(timeout=2)
+    if proc is not None:
+        streams = [proc.stdin, proc.stderr]
+        if reader is None or not reader.is_alive():
+            streams.append(proc.stdout)
+        for stream in streams:
+            try:
+                if stream:
+                    stream.close()
+            except Exception:
+                pass
+
+
+def _kill_survivors() -> None:
+    """atexit backstop: SIGKILL any coq-lsp not stopped explicitly."""
+    with _LIVE_PROCS_LOCK:
+        procs = list(_LIVE_PROCS)
+    for proc in procs:
+        _kill_tree(proc, reap_timeout=1.0)
+
+
+atexit.register(_kill_survivors)
 
 # Base coq-lsp settings.  ``do_settings`` (init + didChangeConfiguration)
 # REPLACES the whole config from this object, so every send must include these.
@@ -318,18 +492,21 @@ class LspChecker:
 
     def _start(self) -> None:
         """Start coq-lsp, spawn the reader thread, perform the handshake."""
-        if self._process and self._process.poll() is None:
-            self._process.kill()
-            self._process.wait(timeout=3)
+        if self._process is not None:
+            # A previous incarnation (possibly wedged, possibly half-dead):
+            # SIGKILL its whole group and reap.  Never raises, so a stuck
+            # old process cannot prevent the respawn.
+            _kill_tree(self._process)
+        old_reader = self._reader
+        if old_reader is not None and old_reader.is_alive():
+            # Let the previous reader finish its EOF teardown (it sets
+            # ``_dead`` in its finally) BEFORE the flag reset below, so a
+            # late ``_dead = True`` cannot poison the fresh session.
+            self._reader_stop.set()
+            old_reader.join(timeout=2)
 
         _t0 = time.monotonic()
-        self._process = subprocess.Popen(
-            ["coq-lsp"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,  # binary mode for LSP framing
-        )
+        self._process = _spawn_coq_lsp()
         dlog.event(
             "process",
             "spawn",
@@ -364,20 +541,43 @@ class LspChecker:
         # ``max_errors`` so it takes coq-lsp's default (_MAX_ERRORS_FULL); the
         # check paths toggle it per-call via :meth:`_set_max_errors_locked`.
         root_uri = Path(self._workspace).as_uri() if self._workspace else None
-        self._request(
-            "initialize",
-            {
-                "processId": os.getpid(),
-                "rootUri": root_uri,
-                "capabilities": {},
-                "workspaceFolders": (
-                    [{"uri": root_uri, "name": "workspace"}] if root_uri else None
-                ),
-                "initializationOptions": dict(_BASE_SETTINGS),
-            },
-            timeout=_HANDSHAKE_TIMEOUT,
-        )
-        self._notify("initialized", {})
+        try:
+            init_result = self._request(
+                "initialize",
+                {
+                    "processId": os.getpid(),
+                    "rootUri": root_uri,
+                    "capabilities": {},
+                    "workspaceFolders": (
+                        [{"uri": root_uri, "name": "workspace"}] if root_uri else None
+                    ),
+                    "initializationOptions": dict(_BASE_SETTINGS),
+                },
+                timeout=_HANDSHAKE_TIMEOUT,
+            )
+            if isinstance(init_result, dict) and "_lsp_error" in init_result:
+                # _request never raises; surface its error envelope here so
+                # the kill-and-raise path below applies.
+                raise RuntimeError(
+                    f"coq-lsp initialize failed: {init_result['_lsp_error']}"
+                )
+            self._notify("initialized", {})
+        except Exception:
+            # Handshake failed -- a broken or silently hung coq-lsp (e.g. a
+            # binary that cannot load its stdlib stalls without answering).
+            # Kill it NOW: `_initialized` stays False so `_is_alive()` is
+            # False and the next call respawns, but without this the hung
+            # process would linger (previously it was even marked
+            # initialized and treated as a live session).
+            dlog.event(
+                "process", "handshake_failed",
+                proc=self._process.pid if self._process else None,
+            )
+            self._reader_stop.set()
+            _kill_tree(self._process)
+            reader, self._reader = self._reader, None
+            _teardown_transport(self._process, reader)
+            raise
         self._initialized = True
         # coq-lsp defaults after base init: max_errors=150, sentence_timeout=0.
         self._check_settings = (_MAX_ERRORS_FULL, 0.0)
@@ -460,19 +660,28 @@ class LspChecker:
         """
         proc = self._process
         if proc is not None:
-            try:
-                proc.kill()
-            except (OSError, ValueError):
-                # Already dead / FDs gone -- the read still unblocks via EOF.
-                pass
+            _kill_group(proc)
         # Wake the driving check (blocked in _cv.wait) even before the reader
         # notices EOF, so it returns and releases self._lock promptly.
         with self._cv:
             self._dead = True
             self._cv.notify_all()
+        # Reap only after waking the waiter (bounded; never raises).
+        if proc is not None:
+            _reap(proc)
 
     def stop(self) -> None:
-        """Shut down coq-lsp and join the reader thread."""
+        """Shut down coq-lsp and join the reader thread.
+
+        Escalation contract: try the graceful LSP shutdown, then
+        unconditionally SIGKILL the whole process group and reap --
+        even after a graceful leader exit :func:`_kill_tree` still reaps
+        group survivors (anything coq-lsp forked), and no-ops when the
+        group is fully gone.  No step raises, so the state cleanup below
+        ALWAYS runs -- a wedged coq-lsp can delay ``stop()`` but never
+        abort it half-way (which used to leak the process unreaped with
+        its pipes open).
+        """
         with self._lock:
             proc = self._process
             dlog.event(
@@ -481,29 +690,21 @@ class LspChecker:
             )
             if proc and proc.poll() is None:
                 try:
-                    self._request("shutdown", None, timeout=5.0)
+                    self._request("shutdown", None, timeout=_SHUTDOWN_TIMEOUT)
                     self._notify("exit", None)
-                    proc.wait(timeout=5)
+                    proc.wait(timeout=_SHUTDOWN_TIMEOUT)
                 except Exception:
-                    proc.kill()
-                    proc.wait(timeout=3)
-            self._reader_stop.set()
-            # Closing the pipe unblocks the reader's blocking read.
+                    pass
             if proc is not None:
-                for stream in (proc.stdin, proc.stdout, proc.stderr):
-                    try:
-                        if stream:
-                            stream.close()
-                    except Exception:
-                        pass
+                _kill_tree(proc)
+            self._reader_stop.set()
+            reader = self._reader
+            self._reader = None
             self._process = None
             self._initialized = False
             self._open_docs.clear()
             self._last_content.clear()
-        reader = self._reader
-        if reader is not None and reader.is_alive():
-            reader.join(timeout=2)
-        self._reader = None
+        _teardown_transport(proc, reader)
         with self._cv:
             self._dead = True
             self._cv.notify_all()

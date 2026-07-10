@@ -943,15 +943,22 @@ def test_extract_sentence_period_inside_midsentence_syntax(tmp_path):
 
 
 def test_force_kill_kills_process_and_wakes_waiters():
-    """force_kill SIGKILLs the subprocess and flips _dead (waking _cv waiters)
-    without taking self._lock."""
+    """force_kill SIGKILLs the subprocess's whole process group, reaps it,
+    and flips _dead (waking _cv waiters) without taking self._lock."""
+    import subprocess
+    import sys
+
     from rocq_mcp.lsp_checker import LspChecker
 
     c = LspChecker(workspace="/tmp")
-    proc = MagicMock()
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
     c._process = proc
     c.force_kill()
-    assert proc.kill.called
+    # Killed AND reaped: returncode is already collected, no <defunct> left.
+    assert proc.returncode is not None
     assert c._dead is True
 
 
