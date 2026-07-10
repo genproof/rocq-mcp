@@ -66,7 +66,8 @@ _SHUTDOWN_TIMEOUT: float = 5.0
 
 # Timeout (seconds) for a ``coq/saveVof`` request.  Marshaling a large
 # document's full state to disk is slow (a heavy VST file is ~70s / ~2 GB),
-# so this is generous; configurable via ROCQ_VOF_SAVE_TIMEOUT.
+# so this is generous; configurable via ROCQ_VOF_SAVE_TIMEOUT.  Shared by
+# ``coq/saveVo`` (writing the compiled library is the same order of work).
 _VOF_SAVE_TIMEOUT: float = float(os.environ.get("ROCQ_VOF_SAVE_TIMEOUT", "300"))
 
 # Version baseline for a reloaded ``.vof`` whose sidecar predates the recorded
@@ -333,6 +334,17 @@ def _log_result(method: str, result: Any) -> Any:
         }
     # Generic: keep the top-level keys, summarise large string values.
     return {k: (dlog.blob(v) if isinstance(v, str) else v) for k, v in result.items()}
+
+
+def _lsp_error_message(err: Any) -> str:
+    """Human-readable message from a ``_lsp_error`` payload.
+
+    JSON-RPC error objects carry it under ``message``; transport failures
+    (send failed / timed out / died) are plain strings already.
+    """
+    if isinstance(err, dict) and isinstance(err.get("message"), str):
+        return err["message"]
+    return str(err)
 
 
 def _parse_diagnostic(d: dict[str, Any]) -> dict[str, Any]:
@@ -871,6 +883,36 @@ class LspChecker:
         dlog.event("vof", "save.ok", file=str(Path(file_path).resolve()))
         return True
 
+    def save_vo(self, file_path: str) -> dict[str, Any]:
+        """Compile the open, completed document to a real Coq ``<file>.vo``.
+
+        Sends ``coq/saveVo`` — coq-lsp writes the checked document's library
+        next to the source via ``Library.save_library_to``, the same output
+        ``coqc`` produces, so dependent files can ``Require`` it without a
+        separate build.  coq-lsp rejects the save unless the document checked
+        to completion with every proof closed (an open proof at EOF yields
+        "There are pending proofs…"; ``Admitted`` closes a proof and is
+        fine).  Returns ``{"saved": True, "vo_file": path}`` on success,
+        ``{"saved": False, "error": message}`` otherwise.
+        """
+        resolved = str(Path(file_path).resolve())
+        with self._lock:
+            if not self._is_alive():
+                return {"saved": False, "error": "no live coq-lsp session"}
+            uri = Path(resolved).as_uri()
+            if uri not in self._open_docs:
+                return {"saved": False, "error": "document is not open"}
+            resp = self._request(
+                "coq/saveVo", {"textDocument": {"uri": uri}}, timeout=_VOF_SAVE_TIMEOUT
+            )
+        if isinstance(resp, dict) and "_lsp_error" in resp:
+            err = _lsp_error_message(resp["_lsp_error"])
+            dlog.event("vo", "save.rejected", file=resolved, error=dlog.blob(err))
+            return {"saved": False, "error": err}
+        vo_file = os.path.splitext(resolved)[0] + ".vo"
+        dlog.event("vo", "save.ok", file=resolved, vo=vo_file)
+        return {"saved": True, "vo_file": vo_file}
+
     def _try_load_vof(
         self, uri: str, file_path: str | None, content: str
     ) -> bool:
@@ -945,6 +987,7 @@ class LspChecker:
         stop_at_first_error: bool = True,
         *,
         save_vof_on_error: bool = False,
+        save_vo: bool = True,
         sentence_timeout: float = 0.0,
     ) -> dict[str, Any]:
         """Check a file on disk and return diagnostics.
@@ -970,6 +1013,13 @@ class LspChecker:
         ``True`` to snapshot any *completed* check regardless of errors
         (coq-lsp's ``coq/saveVof`` still requires the document to have
         reached EOF).  A timed-out check is never snapshotted.
+
+        *save_vo* (default ``True``): after a clean completed check, also
+        compile the document to a real ``<file>.vo`` via ``coq/saveVo`` (see
+        :meth:`save_vo`) and report the outcome under ``vo_saved`` /
+        ``vo_file`` / ``vo_error`` in the result.  Never attempted for an
+        erroring or timed-out check (a broken ``.vo`` would poison dependent
+        builds), in which case the keys are absent.
 
         *sentence_timeout* > 0 bounds each individual sentence of the check on
         the coq-lsp side (seconds): a sentence that runs longer is aborted and
@@ -1031,6 +1081,28 @@ class LspChecker:
                 self.save_vof(resolved)
             except Exception:
                 pass
+        # A clean, completed check is also compiled to a real ``.vo``
+        # (coq/saveVo) unless *save_vo* is False: the elaboration is already
+        # paid for, and the ``.vo`` makes the file Require-able by dependents
+        # without a separate coqc/dune build.  An erroring or timed-out check
+        # never produces one -- a broken ``.vo`` silently poisons dependent
+        # builds, worse than no ``.vo`` -- and a died session has nothing to
+        # ask.  The vo_* keys are attached only when a save was attempted.
+        if (
+            save_vo
+            and not result.get("timed_out")
+            and not result.get("errors")
+            and not result.get("lsp_died")
+        ):
+            try:
+                vo = self.save_vo(resolved)
+            except Exception as e:  # persistence must never break the check
+                vo = {"saved": False, "error": str(e)}
+            result["vo_saved"] = bool(vo.get("saved"))
+            if vo.get("saved"):
+                result["vo_file"] = vo.get("vo_file")
+            else:
+                result["vo_error"] = vo.get("error")
         return result
 
     def check_content(
