@@ -400,6 +400,53 @@ class TestVofWarmReload:
         finally:
             c.stop()
 
+    @pytest.mark.slow
+    @pytest.mark.xfail(
+        strict=True,
+        reason="check_file never warm-loads the .vof (see "
+        "test_fresh_check_file_warm_loads_vof), so a fresh session's "
+        "whole-file check re-runs the vm_compute instead of reloading the "
+        "snapshot -- as slow as the cold check.",
+    )
+    def test_check_file_reload_is_faster_than_cold_check(self, tmp_path):
+        """Timing twin of :meth:`test_reload_is_faster_than_cold_check` for
+        the WHOLE-FILE CHECK path (what ``rocq_compile_lsp`` without ``line``
+        runs).  The existing test proves the loader works -- but only through
+        the goals path (``_ensure_open``); its warm side never enters
+        ``check_file``, which is how the loadVof gap survived it.  This twin
+        makes the same wall-clock demand of ``check_file`` itself: a fresh
+        session re-checking an unchanged file with a valid ``.vof`` must be
+        far faster than the cold elaboration.
+        """
+        from rocq_mcp.lsp_checker import LspChecker
+
+        (tmp_path / "_CoqProject").write_text("-R . Top\n")
+        f = tmp_path / "F.v"
+        f.write_text(_SLOW)
+        fp = str(f.resolve())
+
+        # Cold: fresh process, full elaboration (also writes the .vof).
+        c1 = LspChecker(workspace=str(tmp_path))
+        t = time.monotonic()
+        r = c1.check_file(fp, str(tmp_path), 0.0)
+        cold = time.monotonic() - t
+        c1.stop()
+        assert r["success"] is True
+        assert vc.is_valid(fp, str(tmp_path))
+
+        # Warm: a brand-new process runs the same whole-file check.
+        c2 = LspChecker(workspace=str(tmp_path))
+        t = time.monotonic()
+        r2 = c2.check_file(fp, str(tmp_path), 0.0)
+        warm = time.monotonic() - t
+        c2.stop()
+
+        assert r2["success"] is True
+        assert warm < cold / 2, (
+            f"fresh-session check_file {warm:.2f}s not < half of cold "
+            f"check {cold:.2f}s"
+        )
+
     @pytest.mark.xfail(
         strict=True,
         reason="the whole-file check path (_check_content_locked) syncs the "
