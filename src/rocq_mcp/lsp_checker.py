@@ -846,42 +846,44 @@ class LspChecker:
     # .vof warm-start cache (coq/saveVof / coq/loadVof)
     # ------------------------------------------------------------------
 
-    def save_vof(self, file_path: str) -> bool:
+    def save_vof(self, file_path: str) -> dict[str, Any]:
         """Persist the open, completed document as ``<file>.vof``.
 
-        Sends ``coq/saveVof`` (a request) and records the cache sidecar so
-        a later session can validate and reload the snapshot.  Returns
-        ``True`` on success.  No-op (``False``) when the cache is disabled,
-        the document is not open, or coq-lsp rejects the save (e.g. the
-        document did not check to completion).
+        Sends ``coq/saveVof`` (a request) and records the cache sidecar so a
+        later session can validate and reload the snapshot.  Returns
+        ``{"saved": True, "vof_file": path}`` on success, ``{"saved": False,
+        "error": message}`` when the document is not open or coq-lsp rejects
+        the save (e.g. the document did not check to completion).  When the
+        cache is disabled (``ROCQ_VOF_CACHE=0``) the dict carries
+        ``disabled: True`` instead of an error, so callers can tell
+        "feature off" from a failure.
         """
         from rocq_mcp import vof_cache
 
+        resolved = str(Path(file_path).resolve())
         if not vof_cache.enabled():
-            return False
+            return {"saved": False, "disabled": True}
         with self._lock:
             if not self._is_alive():
-                return False
-            uri = Path(file_path).resolve().as_uri()
+                return {"saved": False, "error": "no live coq-lsp session"}
+            uri = Path(resolved).as_uri()
             if uri not in self._open_docs:
-                return False
+                return {"saved": False, "error": "document is not open"}
             resp = self._request(
                 "coq/saveVof", {"textDocument": {"uri": uri}}, timeout=_VOF_SAVE_TIMEOUT
             )
             if isinstance(resp, dict) and "_lsp_error" in resp:
-                dlog.event(
-                    "vof", "save.rejected",
-                    file=str(Path(file_path).resolve()), error=resp["_lsp_error"],
-                )
-                return False
+                err = _lsp_error_message(resp["_lsp_error"])
+                dlog.event("vof", "save.rejected", file=resolved, error=dlog.blob(err))
+                return {"saved": False, "error": err}
             # The version coq-lsp marshals into the .vof is the doc's current
             # version, which we track in _open_docs.  Capture it under the lock
             # so a reloading session can resume numbering above it.
             version = self._open_docs[uri]
         # Record the fingerprint outside the lock (pure filesystem work).
-        vof_cache.record(str(Path(file_path).resolve()), self._workspace, version)
-        dlog.event("vof", "save.ok", file=str(Path(file_path).resolve()))
-        return True
+        vof_cache.record(resolved, self._workspace, version)
+        dlog.event("vof", "save.ok", file=resolved)
+        return {"saved": True, "vof_file": vof_cache.vof_path(resolved)}
 
     def save_vo(self, file_path: str) -> dict[str, Any]:
         """Compile the open, completed document to a real Coq ``<file>.vo``.
@@ -1012,7 +1014,11 @@ class LspChecker:
         warm-start a future session into the same errors).  Set it to
         ``True`` to snapshot any *completed* check regardless of errors
         (coq-lsp's ``coq/saveVof`` still requires the document to have
-        reached EOF).  A timed-out check is never snapshotted.
+        reached EOF).  A timed-out check is never snapshotted.  When a
+        snapshot is attempted the result reports the outcome under
+        ``vof_saved`` / ``vof_file`` / ``vof_error``; the keys are absent
+        when the save was skipped (timed out, errors without the opt-in, or
+        the cache disabled via ``ROCQ_VOF_CACHE=0``).
 
         *save_vo* (default ``True``): after a clean completed check, also
         compile the document to a real ``<file>.vo`` via ``coq/saveVo`` (see
@@ -1078,9 +1084,19 @@ class LspChecker:
             save_vof_on_error or not result.get("errors")
         ):
             try:
-                self.save_vof(resolved)
-            except Exception:
-                pass
+                vof = self.save_vof(resolved)
+            except Exception as e:  # persistence must never break the check
+                vof = {"saved": False, "error": str(e)}
+            # Mirror the vo_* reporting below.  Keys are absent when the save
+            # was not attempted -- here additionally when the cache is off
+            # (ROCQ_VOF_CACHE=0): a deliberately disabled feature is not a
+            # failure worth reporting on every result.
+            if not vof.get("disabled"):
+                result["vof_saved"] = bool(vof.get("saved"))
+                if vof.get("saved"):
+                    result["vof_file"] = vof.get("vof_file")
+                else:
+                    result["vof_error"] = vof.get("error")
         # A clean, completed check is also compiled to a real ``.vo``
         # (coq/saveVo) unless *save_vo* is False: the elaboration is already
         # paid for, and the ``.vo`` makes the file Require-able by dependents

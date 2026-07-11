@@ -116,6 +116,10 @@ class TestCheckFileSavesVo:
             assert r["vo_saved"] is False
             assert "pending proofs" in r["vo_error"]
             assert not (tmp_path / "Open.vo").exists()
+            # Asymmetry pin: the .vof snapshot has no pending-proofs gate
+            # (it marshals the document, proofs open or not), so it saves
+            # where the .vo is rejected.
+            assert r["vof_saved"] is True
         finally:
             c.stop()
 

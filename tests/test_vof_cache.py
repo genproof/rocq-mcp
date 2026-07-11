@@ -137,6 +137,8 @@ class TestLspCheckerVof:
         try:
             r = c.check_file(f, str(tmp_path), 0.0)
             assert r["success"] is True
+            assert r["vof_saved"] is True
+            assert r["vof_file"] == str(tmp_path / "Foo.vof")
             assert (tmp_path / "Foo.vof").is_file()
             assert (tmp_path / "Foo.vof.meta").is_file()
             assert vc.is_valid(f, str(tmp_path)) is True
@@ -193,6 +195,8 @@ class TestLspCheckerVof:
             r = c.check_file(f, str(tmp_path), 0.0)
             assert r["success"] is True
             assert not (tmp_path / "Foo.vof").exists()
+            # A deliberately disabled cache is not reported on every result.
+            assert "vof_saved" not in r
         finally:
             c.stop()
 
@@ -239,6 +243,7 @@ class TestLspCheckerVof:
             r = c.check_file(str(f), str(tmp_path), 0.05)
             assert r["timed_out"] is True
             assert not (tmp_path / "Slow.vof").exists()
+            assert "vof_saved" not in r
         finally:
             c.stop()
 
@@ -262,6 +267,7 @@ class TestLspCheckerVof:
             r = c.check_file(str(f), str(tmp_path), 0.0, stop_at_first_error=False)
             assert r["success"] is False and r["errors"]
             assert not (tmp_path / "Bad.vof").exists()
+            assert "vof_saved" not in r
         finally:
             c.stop()
 
@@ -282,6 +288,8 @@ class TestLspCheckerVof:
                 stop_at_first_error=False, save_vof_on_error=True,
             )
             assert r["success"] is False and r["errors"]
+            assert r["vof_saved"] is True
+            assert r["vof_file"] == str(tmp_path / "Bad.vof")
             assert (tmp_path / "Bad.vof").is_file()
             assert (tmp_path / "Bad.vof.meta").is_file()
         finally:

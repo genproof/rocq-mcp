@@ -2761,6 +2761,11 @@ async def rocq_compile_lsp(
             full check (``line`` omitted) -- position-limited checks never
             snapshot.  Implies a full check (overrides *stop_at_first_error*),
             since a snapshot needs the document checked through to EOF.
+            When a snapshot is attempted the response reports the outcome
+            under ``vof_saved`` / ``vof_file`` / ``vof_error`` (mirroring
+            the ``vo_*`` keys); absent when the save was skipped (timed out,
+            errors without this opt-in, position-limited check, or the cache
+            disabled via ``ROCQ_VOF_CACHE=0``).
         save_vo: Compile the file to a real ``<file>.vo`` after a successful
             full check (default: True).  When the whole-file check completes
             with no errors, coq-lsp writes the compiled library next to the
