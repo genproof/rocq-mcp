@@ -2672,7 +2672,7 @@ async def rocq_compile_lsp(
     character: int | None = None,
     stop_at_first_error: bool = True,
     save_vof_with_errors: bool = False,
-    save_vo: bool = True,
+    save_vo: bool = False,
     sentence_timeout: float | None = None,
     save_perf_to: str = "",
     ctx: Context = None,
@@ -2689,9 +2689,9 @@ async def rocq_compile_lsp(
     on a proof.  Use rocq_compile_file for final authoritative
     verification with coqc.
 
-    A successful full-file check also compiles the file to ``<file>.vo``
-    (same output as coqc), so dependent files can ``Require`` it without a
-    separate build — see ``save_vo`` below to disable.
+    Pass ``save_vo=True`` to also compile a successful full-file check to
+    ``<file>.vo`` (same output as coqc), so dependent files can ``Require``
+    it without a separate build.
 
     **Check up to a position (low latency).**  Pass ``line`` (and
     optionally ``character``) to get the diagnostics for the file *up to
@@ -2767,17 +2767,21 @@ async def rocq_compile_lsp(
             errors without this opt-in, position-limited check, or the cache
             disabled via ``ROCQ_VOF_CACHE=0``).
         save_vo: Compile the file to a real ``<file>.vo`` after a successful
-            full check (default: True).  When the whole-file check completes
-            with no errors, coq-lsp writes the compiled library next to the
-            source (``coq/saveVo`` — the same output ``coqc`` produces), so
-            dependent files can ``Require`` it without a separate
-            ``dune build`` / ``make``.  The response then carries
-            ``vo_saved: true`` and ``vo_file``, or ``vo_saved: false`` with
-            ``vo_error`` when coq-lsp rejects the save — notably ``"There
-            are pending proofs …"`` for a proof left open at EOF, a real
-            defect the diagnostics alone do not surface.  Never attempted
-            (keys absent) for erroring, timed-out, or position-limited
-            (``line`` given) checks.  Set to False to disable.
+            full check (default: False).  When enabled and the whole-file
+            check completes with no errors, coq-lsp writes the compiled
+            library next to the source (``coq/saveVo`` — the same output
+            ``coqc`` produces), so dependent files can ``Require`` it
+            without a separate ``dune build`` / ``make``.  The response then
+            carries ``vo_saved: true`` and ``vo_file``, or ``vo_saved:
+            false`` with ``vo_error`` when coq-lsp rejects the save —
+            notably ``"There are pending proofs …"`` for a proof left open
+            at EOF, a real defect the diagnostics alone do not surface.
+            Never attempted (keys absent) for erroring, timed-out, or
+            position-limited (``line`` given) checks.  Off by default: the
+            ``.vo`` mtime bump makes ``make``/``dune`` consider dependents
+            out of date, and a ``.vof``-warm-started session currently
+            cannot save one at all (kernel anomaly; see
+            test_save_vo_after_vof_reload).
         sentence_timeout: Per-sentence wall-clock budget in seconds for the
             check.  When > 0, any single sentence that runs longer is aborted
             coq-lsp-side and reported as a ``Timeout!`` error; checking then

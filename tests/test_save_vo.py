@@ -1,12 +1,12 @@
 """Tests for .vo saving after a successful full check (coq/saveVo wiring).
 
-A clean, completed ``check_file`` compiles the document to a real Coq
-``<file>.vo`` by default (``save_vo=True``) — the same output ``coqc``
-produces — so dependent files can ``Require`` it without a separate
-build.  Erroring / timed-out / position-limited checks never produce
-one, and coq-lsp itself rejects the save when a proof is left open at
-EOF ("There are pending proofs…"), which the result surfaces as
-``vo_error``.  These tests require coq-lsp.
+With ``save_vo=True`` (opt-in; default off), a clean, completed
+``check_file`` compiles the document to a real Coq ``<file>.vo`` — the
+same output ``coqc`` produces — so dependent files can ``Require`` it
+without a separate build.  Erroring / timed-out / position-limited
+checks never produce one, and coq-lsp itself rejects the save when a
+proof is left open at EOF ("There are pending proofs…"), which the
+result surfaces as ``vo_error``.  These tests require coq-lsp.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ class TestCheckFileSavesVo:
         f = _project(tmp_path)
         c = LspChecker(workspace=str(tmp_path))
         try:
-            r = c.check_file(f, str(tmp_path), 0.0)
+            r = c.check_file(f, str(tmp_path), 0.0, save_vo=True)
             assert r["success"] is True
             assert r["vo_saved"] is True
             assert r["vo_file"] == str(tmp_path / "Foo.vo")
@@ -61,7 +61,7 @@ class TestCheckFileSavesVo:
         f = _project(tmp_path)
         c = LspChecker(workspace=str(tmp_path))
         try:
-            r = c.check_file(f, str(tmp_path), 0.0)
+            r = c.check_file(f, str(tmp_path), 0.0, save_vo=True)
             assert r["vo_saved"] is True
             bar = tmp_path / "Bar.v"
             bar.write_text(
@@ -73,13 +73,13 @@ class TestCheckFileSavesVo:
         finally:
             c.stop()
 
-    def test_save_vo_false_skips(self, tmp_path):
+    def test_save_vo_off_by_default(self, tmp_path):
         from rocq_mcp.lsp_checker import LspChecker
 
         f = _project(tmp_path)
         c = LspChecker(workspace=str(tmp_path))
         try:
-            r = c.check_file(f, str(tmp_path), 0.0, save_vo=False)
+            r = c.check_file(f, str(tmp_path), 0.0)
             assert r["success"] is True
             assert not (tmp_path / "Foo.vo").exists()
             assert "vo_saved" not in r
@@ -94,7 +94,9 @@ class TestCheckFileSavesVo:
         )
         c = LspChecker(workspace=str(tmp_path))
         try:
-            r = c.check_file(f, str(tmp_path), 0.0, stop_at_first_error=False)
+            r = c.check_file(
+                f, str(tmp_path), 0.0, stop_at_first_error=False, save_vo=True
+            )
             assert r["success"] is False and r["errors"]
             assert not (tmp_path / "Bad.vo").exists()
             assert "vo_saved" not in r
@@ -111,7 +113,7 @@ class TestCheckFileSavesVo:
         f = _project(tmp_path, "Open.v", "Theorem t : True.\nProof.\n")
         c = LspChecker(workspace=str(tmp_path))
         try:
-            r = c.check_file(f, str(tmp_path), 0.0)
+            r = c.check_file(f, str(tmp_path), 0.0, save_vo=True)
             assert r["success"] is True  # the known stale-green behaviour
             assert r["vo_saved"] is False
             assert "pending proofs" in r["vo_error"]
@@ -142,7 +144,7 @@ class TestCheckFileSavesVo:
         )
         c = LspChecker(workspace=str(tmp_path))
         try:
-            r = c.check_file(f, str(tmp_path), 0.0)
+            r = c.check_file(f, str(tmp_path), 0.0, save_vo=True)
             assert r["success"] is True  # the known stale-green behaviour
             assert r["vo_saved"] is False
             assert "needs to be closed" in r["vo_error"]
@@ -169,7 +171,7 @@ class TestCheckFileSavesVo:
         f = _project(tmp_path)  # _PROOF has a Qed => one opaque proof
         c1 = LspChecker(workspace=str(tmp_path))
         try:
-            r = c1.check_file(f, str(tmp_path), 0.0)
+            r = c1.check_file(f, str(tmp_path), 0.0, save_vo=True)
             assert r["vof_saved"] is True and r["vo_saved"] is True
         finally:
             c1.stop()
@@ -180,7 +182,7 @@ class TestCheckFileSavesVo:
         orig = c2._send_message
         c2._send_message = lambda m: (sent.append(m.get("method")), orig(m))[1]
         try:
-            r2 = c2.check_file(f, str(tmp_path), 0.0)
+            r2 = c2.check_file(f, str(tmp_path), 0.0, save_vo=True)
             # Precondition, not the pin: the warm path must actually fire
             # (a cold fallback would make the save trivially succeed and
             # strict-XPASS this test for the wrong reason).
@@ -202,7 +204,7 @@ class TestCheckFileSavesVo:
         )
         c = LspChecker(workspace=str(tmp_path))
         try:
-            r = c.check_file(f, str(tmp_path), 0.05)
+            r = c.check_file(f, str(tmp_path), 0.05, save_vo=True)
             assert r["timed_out"] is True
             assert not (tmp_path / "Slow.vo").exists()
             assert "vo_saved" not in r
@@ -232,25 +234,25 @@ def lstate(tmp_path, monkeypatch):
 @_lsp_only
 class TestCompileLspSaveVo:
     @pytest.mark.asyncio
-    async def test_default_saves_vo(self, lstate, tmp_path):
+    async def test_default_skips_vo(self, lstate, tmp_path):
         _project(tmp_path)
         result = await _server.rocq_compile_lsp(
             file_path="Foo.v", workspace=str(tmp_path), ctx=_Ctx(lstate)
         )
         assert result["success"] is True
+        assert not (tmp_path / "Foo.vo").exists()
+        assert "vo_saved" not in result
+
+    @pytest.mark.asyncio
+    async def test_save_vo_true_saves(self, lstate, tmp_path):
+        _project(tmp_path)
+        result = await _server.rocq_compile_lsp(
+            file_path="Foo.v", workspace=str(tmp_path), save_vo=True, ctx=_Ctx(lstate)
+        )
+        assert result["success"] is True
         assert result["vo_saved"] is True
         assert result["vo_file"] == str(tmp_path / "Foo.vo")
         assert (tmp_path / "Foo.vo").is_file()
-
-    @pytest.mark.asyncio
-    async def test_save_vo_false_skips(self, lstate, tmp_path):
-        _project(tmp_path)
-        result = await _server.rocq_compile_lsp(
-            file_path="Foo.v", workspace=str(tmp_path), save_vo=False, ctx=_Ctx(lstate)
-        )
-        assert result["success"] is True
-        assert not (tmp_path / "Foo.vo").exists()
-        assert "vo_saved" not in result
 
     @pytest.mark.asyncio
     async def test_position_check_never_saves_vo(self, lstate, tmp_path):
@@ -259,7 +261,8 @@ class TestCompileLspSaveVo:
         # clean.
         _project(tmp_path)
         result = await _server.rocq_compile_lsp(
-            file_path="Foo.v", workspace=str(tmp_path), line=4, ctx=_Ctx(lstate)
+            file_path="Foo.v", workspace=str(tmp_path), line=4, save_vo=True,
+            ctx=_Ctx(lstate),
         )
         assert result["success"] is True
         assert not (tmp_path / "Foo.vo").exists()

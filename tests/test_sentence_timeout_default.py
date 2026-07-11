@@ -45,7 +45,7 @@ class _RecordingChecker:
         stop_at_first_error=True,
         *,
         save_vof_on_error=False,
-        save_vo=True,
+        save_vo=False,
         sentence_timeout=0.0,
     ) -> dict:
         self.calls.append(sentence_timeout)

@@ -989,7 +989,7 @@ class LspChecker:
         stop_at_first_error: bool = True,
         *,
         save_vof_on_error: bool = False,
-        save_vo: bool = True,
+        save_vo: bool = False,
         sentence_timeout: float = 0.0,
     ) -> dict[str, Any]:
         """Check a file on disk and return diagnostics.
@@ -1023,7 +1023,7 @@ class LspChecker:
         when the save was skipped (timed out, errors without the opt-in, or
         the cache disabled via ``ROCQ_VOF_CACHE=0``).
 
-        *save_vo* (default ``True``): after a clean completed check, also
+        *save_vo* (default ``False``): after a clean completed check, also
         compile the document to a real ``<file>.vo`` via ``coq/saveVo`` (see
         :meth:`save_vo`) and report the outcome under ``vo_saved`` /
         ``vo_file`` / ``vo_error`` in the result.  Never attempted for an
