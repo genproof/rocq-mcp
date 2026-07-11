@@ -400,6 +400,42 @@ class TestVofWarmReload:
         finally:
             c.stop()
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="the whole-file check path (_check_content_locked) syncs the "
+        "document cold via _sync_document and never attempts coq/loadVof; "
+        "only the _ensure_open paths (goals/interactive tools and the "
+        "position-limited check_up_to) warm-load.  So a fresh session's "
+        "rocq_compile_lsp full check re-elaborates the entire file even "
+        "when a valid .vof sits next to it -- as slow as the first call.",
+    )
+    def test_fresh_check_file_warm_loads_vof(self, tmp_path):
+        """A fresh session's ``check_file`` should reuse a valid ``.vof``
+        instead of cold-re-elaborating (the user-visible symptom: a fresh
+        session's full ``rocq_compile_lsp`` is as slow as the first ever
+        call, while ``rocq_get_state`` on the same file is instant)."""
+        from rocq_mcp.lsp_checker import LspChecker
+
+        fp = self._seed_vof(tmp_path, _COMM)
+        assert vc.is_valid(fp, str(tmp_path))
+
+        c = LspChecker(workspace=str(tmp_path))  # fresh process
+        sent: list[str] = []
+        orig = c._send_message
+
+        def spy(msg):
+            if isinstance(msg, dict) and "method" in msg:
+                sent.append(msg["method"])
+            return orig(msg)
+
+        c._send_message = spy
+        try:
+            r = c.check_file(fp, str(tmp_path), 0.0)
+            assert r["success"] is True
+            assert "coq/loadVof" in sent, sent
+        finally:
+            c.stop()
+
     def test_edit_after_warm_load_rechecks_incrementally(self, tmp_path):
         """After a warm reload, editing the file (adding real tactics) and
         re-querying returns correct incrementally-rechecked states."""

@@ -123,6 +123,35 @@ class TestCheckFileSavesVo:
         finally:
             c.stop()
 
+    def test_open_section_reports_vo_error_keeps_vof(self, tmp_path):
+        """An unclosed ``Section`` at EOF is the same stale-green family as
+        an open proof: every sentence is well-formed so the check reports
+        ``success: True`` with no diagnostic, yet ``coqc`` rejects the file
+        ("The section ... needs to be closed").  ``coq/saveVo`` surfaces it
+        as ``vo_error`` (Library.save_library_to cannot close the library).
+
+        The ``.vof`` snapshot is orthogonal: it marshals the document state,
+        open sections and all, so the warm-start cache still works -- an
+        open section is NOT a reason for a slow fresh session."""
+        from rocq_mcp.lsp_checker import LspChecker
+
+        f = _project(
+            tmp_path,
+            "Sec.v",
+            "Section Vsu.\nTheorem t : True.\nProof. exact I. Qed.\n",
+        )
+        c = LspChecker(workspace=str(tmp_path))
+        try:
+            r = c.check_file(f, str(tmp_path), 0.0)
+            assert r["success"] is True  # the known stale-green behaviour
+            assert r["vo_saved"] is False
+            assert "needs to be closed" in r["vo_error"]
+            assert not (tmp_path / "Sec.vo").exists()
+            assert r["vof_saved"] is True
+            assert (tmp_path / "Sec.vof").is_file()
+        finally:
+            c.stop()
+
     def test_timed_out_check_skips_vo(self, tmp_path):
         from rocq_mcp.lsp_checker import LspChecker
 
