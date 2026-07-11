@@ -152,6 +152,46 @@ class TestCheckFileSavesVo:
         finally:
             c.stop()
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="coq/saveVo on a .vof-RELOADED document dies with the kernel "
+        "anomaly 'Proof object 0 is not checked nor to be checked': the "
+        "opaque-proof bookkeeping does not survive the document Marshal "
+        "round-trip, so a warm-started session cannot compile its .vo "
+        "(found on liblzma-verification vsu.v, 2026-07-11).",
+    )
+    def test_save_vo_after_vof_reload(self, tmp_path):
+        """A fresh session that warm-loads a ``.vof`` should still be able
+        to compile the ``.vo`` -- today the save is rejected with a kernel
+        anomaly, so warm sessions silently lose .vo emission."""
+        from rocq_mcp.lsp_checker import LspChecker
+
+        f = _project(tmp_path)  # _PROOF has a Qed => one opaque proof
+        c1 = LspChecker(workspace=str(tmp_path))
+        try:
+            r = c1.check_file(f, str(tmp_path), 0.0)
+            assert r["vof_saved"] is True and r["vo_saved"] is True
+        finally:
+            c1.stop()
+        (tmp_path / "Foo.vo").unlink()
+
+        c2 = LspChecker(workspace=str(tmp_path))  # fresh -> warm reload
+        sent: list[str] = []
+        orig = c2._send_message
+        c2._send_message = lambda m: (sent.append(m.get("method")), orig(m))[1]
+        try:
+            r2 = c2.check_file(f, str(tmp_path), 0.0)
+            # Precondition, not the pin: the warm path must actually fire
+            # (a cold fallback would make the save trivially succeed and
+            # strict-XPASS this test for the wrong reason).
+            assert "coq/loadVof" in sent, sent
+            assert r2["success"] is True
+            # The pin: .vo emission should survive a .vof warm start.
+            assert r2["vo_saved"] is True, r2.get("vo_error")
+            assert (tmp_path / "Foo.vo").is_file()
+        finally:
+            c2.stop()
+
     def test_timed_out_check_skips_vo(self, tmp_path):
         from rocq_mcp.lsp_checker import LspChecker
 
