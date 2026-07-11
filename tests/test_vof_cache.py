@@ -401,22 +401,15 @@ class TestVofWarmReload:
             c.stop()
 
     @pytest.mark.slow
-    @pytest.mark.xfail(
-        strict=True,
-        reason="check_file never warm-loads the .vof (see "
-        "test_fresh_check_file_warm_loads_vof), so a fresh session's "
-        "whole-file check re-runs the vm_compute instead of reloading the "
-        "snapshot -- as slow as the cold check.",
-    )
     def test_check_file_reload_is_faster_than_cold_check(self, tmp_path):
         """Timing twin of :meth:`test_reload_is_faster_than_cold_check` for
         the WHOLE-FILE CHECK path (what ``rocq_compile_lsp`` without ``line``
-        runs).  The existing test proves the loader works -- but only through
-        the goals path (``_ensure_open``); its warm side never enters
-        ``check_file``, which is how the loadVof gap survived it.  This twin
-        makes the same wall-clock demand of ``check_file`` itself: a fresh
-        session re-checking an unchanged file with a valid ``.vof`` must be
-        far faster than the cold elaboration.
+        runs).  The original test's warm side goes through ``goals()``
+        (``_ensure_open``), which is how ``check_file``'s missing loadVof
+        wiring survived it for so long: a fresh session's full check
+        re-elaborated everything -- as slow as the first ever call -- while
+        the goals tools reloaded instantly.  This twin makes the same
+        wall-clock demand of ``check_file`` itself.
         """
         from rocq_mcp.lsp_checker import LspChecker
 
@@ -447,20 +440,12 @@ class TestVofWarmReload:
             f"check {cold:.2f}s"
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="the whole-file check path (_check_content_locked) syncs the "
-        "document cold via _sync_document and never attempts coq/loadVof; "
-        "only the _ensure_open paths (goals/interactive tools and the "
-        "position-limited check_up_to) warm-load.  So a fresh session's "
-        "rocq_compile_lsp full check re-elaborates the entire file even "
-        "when a valid .vof sits next to it -- as slow as the first call.",
-    )
     def test_fresh_check_file_warm_loads_vof(self, tmp_path):
-        """A fresh session's ``check_file`` should reuse a valid ``.vof``
-        instead of cold-re-elaborating (the user-visible symptom: a fresh
-        session's full ``rocq_compile_lsp`` is as slow as the first ever
-        call, while ``rocq_get_state`` on the same file is instant)."""
+        """A fresh session's ``check_file`` reuses a valid ``.vof`` instead
+        of cold-re-elaborating: ``coq/loadVof`` must appear on the wire.
+        Regression pin for the gap where only the ``_ensure_open`` paths
+        (goals/interactive tools, position-limited ``check_up_to``)
+        warm-loaded and the whole-file check always did a cold didOpen."""
         from rocq_mcp.lsp_checker import LspChecker
 
         fp = self._seed_vof(tmp_path, _COMM)
@@ -482,6 +467,55 @@ class TestVofWarmReload:
             assert "coq/loadVof" in sent, sent
         finally:
             c.stop()
+
+    @pytest.mark.parametrize("stop_first", [True, False])
+    def test_warm_check_of_erroring_snapshot_reports_errors(
+        self, tmp_path, stop_first
+    ):
+        """The stale-green guard for the warm check path: a ``.vof`` saved
+        from a completed-but-erroring document (the ``save_vof_on_error``
+        opt-in) must not let a fresh session's whole-file check report
+        clean.  Sound because ``Theory.load_vof`` fires the Completed hooks
+        -- ``send_diags`` among them -- so the snapshot's diagnostics are
+        republished before the load ack and the settle logic sees exactly
+        what the original live check published.  Covers both drive modes
+        (the error settles the stop-at-first drive; report-all reads the
+        same published set)."""
+        from rocq_mcp.lsp_checker import LspChecker
+
+        (tmp_path / "_CoqProject").write_text("-R . Top\n")
+        f = tmp_path / "Bad.v"
+        f.write_text("Theorem bad : 1 = 2.\nProof. reflexivity. Qed.\n")
+        fp = str(f.resolve())
+        c1 = LspChecker(workspace=str(tmp_path))
+        try:
+            r = c1.check_file(
+                fp, str(tmp_path), 0.0,
+                stop_at_first_error=False, save_vof_on_error=True,
+            )
+            assert r["errors"] and r["vof_saved"] is True
+        finally:
+            c1.stop()
+        assert vc.is_valid(fp, str(tmp_path))
+
+        c2 = LspChecker(workspace=str(tmp_path))  # fresh process
+        sent: list[str] = []
+        orig = c2._send_message
+
+        def spy(msg):
+            if isinstance(msg, dict) and "method" in msg:
+                sent.append(msg["method"])
+            return orig(msg)
+
+        c2._send_message = spy
+        try:
+            r2 = c2.check_file(fp, str(tmp_path), 0.0, stop_at_first_error=stop_first)
+            assert "coq/loadVof" in sent, sent  # the warm path was exercised
+            assert r2["success"] is False
+            assert r2["errors"], r2
+            assert any("Unable to unify" in e["message"] for e in r2["errors"]), r2
+        finally:
+            c2.stop()
 
     def test_edit_after_warm_load_rechecks_incrementally(self, tmp_path):
         """After a warm reload, editing the file (adding real tactics) and

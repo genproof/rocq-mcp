@@ -994,9 +994,12 @@ class LspChecker:
     ) -> dict[str, Any]:
         """Check a file on disk and return diagnostics.
 
-        On first call for a file, opens it via didOpen.  On subsequent
-        calls, sends didChange with the new content.  coq-lsp
-        incrementally rechecks only from the edit point.
+        On first call for a file, opens it via didOpen -- or, when a valid
+        ``.vof`` snapshot sits next to the file, warm-starts by reloading it
+        via ``coq/loadVof`` instead of re-elaborating (same as the request
+        paths; see ``_check_content_locked``).  On subsequent calls, sends
+        didChange with the new content.  coq-lsp incrementally rechecks only
+        from the edit point.
 
         *stop_at_first_error* (default): return as soon as coq-lsp hits the
         first error -- it halts there without running anything below, so a
@@ -1071,6 +1074,7 @@ class LspChecker:
                 timeout,
                 stop_at_first_error=stop_at_first_error,
                 sentence_timeout=sentence_timeout,
+                from_disk=True,
             )
         # After a completed full-file check, persist the warm document as a
         # .vof so a future fresh session can reload it instead of
@@ -1202,9 +1206,16 @@ class LspChecker:
         timeout: float,
         stop_at_first_error: bool = False,
         sentence_timeout: float = 0.0,
+        from_disk: bool = False,
     ) -> dict[str, Any]:
         """Core whole-document check; caller holds ``self._lock`` and coq-lsp
         is alive.
+
+        *from_disk* asserts that *content* is exactly the on-disk file's text
+        (``check_file`` reads it; ``check_content`` gets arbitrary buffers).
+        Only then may a fresh document warm-start from a valid ``.vof``
+        snapshot -- ``vof_cache.is_valid`` fingerprints the on-disk file, so
+        the snapshot corresponds to *content* precisely when they agree.
 
         coq-lsp runs in ``check_only_on_request`` mode (see :meth:`_start`),
         so a plain ``didChange`` does not start checking; we drive it
@@ -1223,7 +1234,29 @@ class LspChecker:
         """
         uri = Path(resolved).as_uri()
         start_time = time.monotonic()
-        self._sync_document(uri, content)
+        # Warm start: a fresh document with a valid ``.vof`` reloads the
+        # snapshot instead of a cold didOpen (previously only the
+        # _ensure_open request paths did; the whole-file check re-elaborated
+        # from scratch).  Sound because the load republishes the snapshot's
+        # full diagnostic set -- Theory.load_vof fires the Completed hooks,
+        # send_diags among them, and the publish precedes the load ack -- so
+        # the settle logic below sees exactly what a live check would have
+        # published: errors of an opted-in erroring snapshot settle the
+        # first-error drive, a saved max_errors sentinel still reports
+        # errors_truncated, and a clean doc answers the EOF barrier
+        # instantly.  A reloaded snapshot carrying a sentence-timeout relic
+        # is version-bumped exactly like the request paths do (see
+        # check_up_to): the relic is transient -- that run's budget -- so it
+        # must be re-elaborated, never replayed.
+        if (
+            from_disk
+            and uri not in self._open_docs
+            and self._try_load_vof(uri, resolved, content)
+        ):
+            if self._timeout_relic_cached(uri, content):
+                self._sync_document(uri, content)
+        else:
+            self._sync_document(uri, content)
         settled, _, budget_hit = self._drive_barrier_locked(
             uri,
             len(content.splitlines()),
@@ -1551,11 +1584,12 @@ class LspChecker:
             start_time = time.monotonic()
             self._ensure_open(uri, content, file_path=resolved)
             if self._timeout_relic_cached(uri, content):
-                # Mirror the whole-file path (which always syncs): an
-                # identical-content version bump routes through the server's
-                # timeout retention barrier, so the drive below re-elaborates
-                # the aborted sentence under THIS call's budget instead of
-                # replaying the transient relic.  Only timeout-red documents
+                # An identical-content version bump routes through the
+                # server's timeout retention barrier, so the drive below
+                # re-elaborates the aborted sentence under THIS call's
+                # budget instead of replaying the transient relic (the
+                # whole-file path bumps the same way on its warm path, and
+                # syncs unconditionally otherwise).  Only timeout-red documents
                 # pay; they either go green or honestly re-earn the red.
                 # Checked after _ensure_open so a just-reloaded ``.vof``
                 # snapshot carrying a timeout error (its diagnostics publish
