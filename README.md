@@ -120,7 +120,7 @@ After a full file check (`rocq_compile_lsp` without a position, or any tool that
 
 By default a snapshot is saved only for a **clean** check: a file with errors still *completes* (coq-lsp recovers from ordinary errors and checks to EOF), but caching a broken state would just warm-start the next session straight back into the same errors. Pass `rocq_compile_lsp(..., save_vof_with_errors=True)` to snapshot a completed-but-erroring document anyway — useful to warm-start a large file whose tail you are still fixing. Position-limited checks (`line` set) never snapshot.
 
-It is a latency win, not a memory one (the reload restores the full state). It helps only when the file **and its dependencies** are unchanged; editing the file or rebuilding a dependency `.vo` invalidates the snapshot, and the next full check re-saves a fresh one.
+It is a latency win, not a memory one (the reload restores the full state). It helps only when the file **and its dependencies** are unchanged; editing the file or rebuilding a dependency `.vo` invalidates the snapshot, and the next full check re-saves a fresh one. A still-valid snapshot is **not re-marshaled** on subsequent clean checks (the response carries `vof_reused: true`): marshaling the whole document transiently costs ~1.07× the session's RSS (measured +6.7 GB on a 6.3 GB VST document), so gratuitous re-saves are the single most expensive memory event a session can repeat.
 
 **Requirements & notes:**
 - Requires a coq-lsp build exposing the `coq/saveVof` / `coq/loadVof` methods (the [`genproof/rocq-lsp`](https://github.com/genproof/rocq-lsp) fork). On a stock coq-lsp the save silently no-ops and every other tool still works.

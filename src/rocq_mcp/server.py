@@ -2765,7 +2765,10 @@ async def rocq_compile_lsp(
             under ``vof_saved`` / ``vof_file`` / ``vof_error`` (mirroring
             the ``vo_*`` keys); absent when the save was skipped (timed out,
             errors without this opt-in, position-limited check, or the cache
-            disabled via ``ROCQ_VOF_CACHE=0``).
+            disabled via ``ROCQ_VOF_CACHE=0``).  When the on-disk snapshot
+            is still valid for the current content, it is NOT re-marshaled
+            (marshaling transiently costs ~1.07x the session's RSS); the
+            response then carries ``vof_reused: true``.
         save_vo: Compile the file to a real ``<file>.vo`` after a successful
             full check (default: False).  When enabled and the whole-file
             check completes with no errors, coq-lsp writes the compiled

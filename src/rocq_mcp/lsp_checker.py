@@ -857,12 +857,34 @@ class LspChecker:
         cache is disabled (``ROCQ_VOF_CACHE=0``) the dict carries
         ``disabled: True`` instead of an error, so callers can tell
         "feature off" from a failure.
+
+        When the on-disk snapshot is already valid for the current file
+        content, toolchain, and dependencies (``vof_cache.is_valid``), the
+        save is SKIPPED and the dict carries ``reused: True`` alongside
+        ``saved: True``: re-marshaling would write a semantically identical
+        snapshot, and the marshal is the single most expensive memory event
+        in a session -- its sharing table transiently costs ~1.07x the
+        process RSS (measured +6.7 GB on a 6.3 GB VST document), previously
+        paid on every clean re-check of unchanged content and after every
+        warm reload.  One corner is deliberately accepted: a snapshot saved
+        with errors (``save_vof_on_error``) whose only errors were transient
+        sentence-timeout relics stays as-is when the same content later
+        checks clean -- a reloading session heals it via the relic version
+        bump (see ``_timeout_relic_cached``), paying a re-elaboration of the
+        aborted sentence rather than reporting the relic.
         """
         from rocq_mcp import vof_cache
 
         resolved = str(Path(file_path).resolve())
         if not vof_cache.enabled():
             return {"saved": False, "disabled": True}
+        if vof_cache.is_valid(resolved, self._workspace):
+            dlog.event("vof", "save.skipped_valid", file=resolved)
+            return {
+                "saved": True,
+                "vof_file": vof_cache.vof_path(resolved),
+                "reused": True,
+            }
         with self._lock:
             if not self._is_alive():
                 return {"saved": False, "error": "no live coq-lsp session"}
@@ -1021,7 +1043,9 @@ class LspChecker:
         snapshot is attempted the result reports the outcome under
         ``vof_saved`` / ``vof_file`` / ``vof_error``; the keys are absent
         when the save was skipped (timed out, errors without the opt-in, or
-        the cache disabled via ``ROCQ_VOF_CACHE=0``).
+        the cache disabled via ``ROCQ_VOF_CACHE=0``).  A still-valid on-disk
+        snapshot is not re-marshaled: the result carries ``vof_reused: True``
+        next to ``vof_saved`` (see :meth:`save_vof`).
 
         *save_vo* (default ``False``): after a clean completed check, also
         compile the document to a real ``<file>.vo`` via ``coq/saveVo`` (see
@@ -1099,6 +1123,10 @@ class LspChecker:
                 result["vof_saved"] = bool(vof.get("saved"))
                 if vof.get("saved"):
                     result["vof_file"] = vof.get("vof_file")
+                    if vof.get("reused"):
+                        # The on-disk snapshot was still valid, so the
+                        # (memory-expensive) re-marshal was skipped.
+                        result["vof_reused"] = True
                 else:
                     result["vof_error"] = vof.get("error")
         # A clean, completed check is also compiled to a real ``.vo``

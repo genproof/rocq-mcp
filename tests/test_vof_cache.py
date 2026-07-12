@@ -297,6 +297,90 @@ class TestLspCheckerVof:
 
 
 # ---------------------------------------------------------------------------
+# Skip re-save when the on-disk snapshot is still valid
+# ---------------------------------------------------------------------------
+
+
+@_lsp_only
+class TestVofSkipResave:
+    """Marshaling the whole document transiently costs ~1.07x the session's
+    RSS, so a clean re-check of unchanged content must NOT re-marshal a
+    snapshot that is still valid -- previously every clean check (and every
+    check after a warm reload) re-paid the full spike."""
+
+    def _spy(self, c):
+        sent: list[str] = []
+        orig = c._send_message
+        c._send_message = lambda m: (sent.append(m.get("method")), orig(m))[1]
+        return sent
+
+    def test_unchanged_recheck_skips_remarshal(self, tmp_path):
+        from rocq_mcp.lsp_checker import LspChecker
+
+        f = _project(tmp_path)
+        c = LspChecker(workspace=str(tmp_path))
+        sent = self._spy(c)
+        try:
+            r1 = c.check_file(f, str(tmp_path), 0.0)
+            assert r1["vof_saved"] is True
+            assert "vof_reused" not in r1
+            mtime1 = (tmp_path / "Foo.vof").stat().st_mtime_ns
+
+            r2 = c.check_file(f, str(tmp_path), 0.0)
+            assert r2["vof_saved"] is True
+            assert r2["vof_reused"] is True
+            # Both proofs of the skip: no second request on the wire, and
+            # the snapshot bytes were not rewritten.
+            assert sent.count("coq/saveVof") == 1, sent
+            assert (tmp_path / "Foo.vof").stat().st_mtime_ns == mtime1
+        finally:
+            c.stop()
+
+    def test_warm_loaded_check_skips_remarshal(self, tmp_path):
+        """The biggest win: a fresh session that warm-loads the snapshot
+        used to re-marshal it right back at the end of its first check --
+        paying the full RSS spike to write bytes identical to the ones it
+        just read."""
+        from rocq_mcp.lsp_checker import LspChecker
+
+        f = _project(tmp_path)
+        c1 = LspChecker(workspace=str(tmp_path))
+        try:
+            assert c1.check_file(f, str(tmp_path), 0.0)["vof_saved"] is True
+        finally:
+            c1.stop()
+
+        c2 = LspChecker(workspace=str(tmp_path))  # fresh process
+        sent = self._spy(c2)
+        try:
+            r = c2.check_file(f, str(tmp_path), 0.0)
+            assert r["success"] is True
+            assert "coq/loadVof" in sent, sent  # warm path fired
+            assert r["vof_saved"] is True
+            assert r["vof_reused"] is True
+            assert "coq/saveVof" not in sent, sent
+        finally:
+            c2.stop()
+
+    def test_edit_still_resaves(self, tmp_path):
+        from rocq_mcp.lsp_checker import LspChecker
+
+        f = _project(tmp_path)
+        c = LspChecker(workspace=str(tmp_path))
+        sent = self._spy(c)
+        try:
+            assert c.check_file(f, str(tmp_path), 0.0)["vof_saved"] is True
+            (tmp_path / "Foo.v").write_text(_PROOF + "Definition extra := 1.\n")
+            r = c.check_file(f, str(tmp_path), 0.0)
+            assert r["vof_saved"] is True
+            assert "vof_reused" not in r
+            assert sent.count("coq/saveVof") == 2, sent
+            assert vc.is_valid(f, str(tmp_path)) is True
+        finally:
+            c.stop()
+
+
+# ---------------------------------------------------------------------------
 # Warm reload is fast, and the reloaded doc is fully usable (edits + new
 # tactics produce correct states)
 # ---------------------------------------------------------------------------
