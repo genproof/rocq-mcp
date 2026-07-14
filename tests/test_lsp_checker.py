@@ -187,3 +187,51 @@ class TestLspChecker:
         )
         # Sanity: errors/warnings are unaffected by the new info path.
         assert r["errors"] == []
+
+
+# ---------------------------------------------------------------------------
+# Save-phase window (kill attribution for coq/saveVof / coq/saveVo)
+# ---------------------------------------------------------------------------
+
+
+def test_save_phase_window(tmp_path, monkeypatch):
+    """save_vof / save_vo record their in-flight window; save_phase_at
+    matches during the request and for a short slack after, is gated by
+    *since* (op freshness), and closes outside the window.  All internals
+    mocked -- no coq-lsp process."""
+    from pathlib import Path
+
+    from rocq_mcp import vof_cache
+    from rocq_mcp.lsp_checker import LspChecker
+
+    c = LspChecker(workspace=str(tmp_path))
+    f = tmp_path / "A.v"
+    f.write_text("Definition a := 1.\n")
+    uri = Path(str(f)).resolve().as_uri()
+    c._open_docs[uri] = 1
+    monkeypatch.setattr(c, "_is_alive", lambda: True)
+    monkeypatch.setattr(vof_cache, "is_valid", lambda *a, **k: False)
+    monkeypatch.setattr(vof_cache, "record", lambda *a, **k: None)
+    seen: dict[str, str | None] = {}
+
+    def fake_request(method, params, timeout=None):
+        seen[method] = c.save_phase_at(time.monotonic())
+        return None
+
+    monkeypatch.setattr(c, "_request", fake_request)
+
+    assert c.save_phase_at(time.monotonic()) is None  # nothing in flight
+
+    assert c.save_vof(str(f))["saved"] is True
+    assert seen["coq/saveVof"] == ".vof snapshot (coq/saveVof)"  # during
+    now = time.monotonic()
+    # A just-finished save still matches (the kill is what wakes the save,
+    # so the recovery reads the clock moments after the end is recorded).
+    assert c.save_phase_at(now) == ".vof snapshot (coq/saveVof)"
+    # Freshness gate: a save that STARTED before the op cannot be blamed.
+    assert c.save_phase_at(now, since=now) is None
+    # Outside the slack window: no match.
+    assert c.save_phase_at(now + 60.0) is None
+
+    assert c.save_vo(str(f))["saved"] is True
+    assert seen["coq/saveVo"] == ".vo library (coq/saveVo)"

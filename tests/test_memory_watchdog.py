@@ -1374,3 +1374,110 @@ class TestIsProofClosingSentence:
     )
     def test_rejects_non_proof_closing(self, text):
         assert not _server._is_proof_closing_sentence(text)
+
+
+# ---------------------------------------------------------------------------
+# Kill-during-save attribution (coq/saveVof, coq/saveVo)
+# ---------------------------------------------------------------------------
+
+
+class TestKillDuringSaveAttribution:
+    """A kill that lands during ``coq/saveVof`` / ``coq/saveVo`` must not be
+    blamed on "the sentence being elaborated": during a save the fileProgress
+    frontier is a relic of the already-COMPLETED check, parked on the last
+    sentence it processed.  (Found on liblzma-verification's vsu.v: the .vof
+    marshal transiently needs ~1x the session's RSS again, tripped the
+    memory watchdog, and the envelope named the file's final -- already
+    elaborated -- sentence as the culprit.)"""
+
+    _SAVE_VOF = ".vof snapshot (coq/saveVof)"
+    _SAVE_VO = ".vo library (coq/saveVo)"
+
+    @pytest.mark.asyncio
+    async def test_rss_breach_during_save_names_save(self, tmp_path, monkeypatch):
+        """Wiring: fresh frontier present AND a save in flight -> the save
+        wins; no elaborating_sentence, killed_during_save instead."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 100)
+        monkeypatch.setattr(_server, "ROCQ_HARD_TIMEOUT", 0.0)
+        monkeypatch.setattr(_server, "ROCQ_SENTENCE_TIMEOUT", 0.0)
+        _patch_psutil_rss(monkeypatch, 500)  # 500 MB > 100 MB cap
+
+        vfile = tmp_path / "save_hog.v"
+        vfile.write_text("Definition a := 1.\nlast_sentence_eeee.\n")
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()
+        # The completed check's relic: a fresh frontier parked on the last
+        # sentence.  Without the save phase this would be reported as the
+        # elaborating sentence.
+        checker.last_progress = lambda: (time.monotonic(), 1, 0)
+        checker.save_phase_at = lambda ts, since=0.0: self._SAVE_VOF
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
+
+        result = await rocq_compile_lsp(
+            file_path=str(vfile), workspace=str(tmp_path), ctx=_MockLspContext(ls)
+        )
+
+        assert result["success"] is False
+        assert result["reason"] == "memory_exhausted"
+        assert "elaborating_sentence" not in result
+        assert result["killed_during_save"] == self._SAVE_VOF
+        assert "already completed" in result["error"]
+        assert "The sentence being elaborated" not in result["error"]
+        assert "last_sentence_eeee" not in result["error"]
+        # The vof-specific hint: the marshal itself is the memory event.
+        assert "RSS again" in result["error"]
+
+    def test_died_builder_prefers_save_phase(self):
+        ls = make_lifespan_state(full=True)
+        r = _server._build_lsp_died_response(
+            ls, "rocq_compile_lsp", "k", progress=(1.0, 3, 0),
+            save_phase=self._SAVE_VO,
+        )
+        assert r["reason"] == "crashed"
+        assert "elaborating_sentence" not in r
+        assert r["killed_during_save"] == self._SAVE_VO
+        assert "already completed" in r["error"]
+        assert "The sentence being elaborated" not in r["error"]
+        # The RSS hint is vof-specific; a .vo save is cheap (+~30 MB measured)
+        # and must not get the misleading marshal explanation.
+        assert "RSS again" not in r["error"]
+
+    def test_hard_timeout_builder_prefers_save_phase(self):
+        ls = make_lifespan_state(full=True)
+        r = _server._build_lsp_hard_timeout_response(
+            ls, "rocq_compile_lsp", "k", progress=(1.0, 3, 0),
+            save_phase=self._SAVE_VOF,
+        )
+        assert r["reason"] == "hard_timeout"
+        assert "elaborating_sentence" not in r
+        assert r["killed_during_save"] == self._SAVE_VOF
+        assert "already completed" in r["error"]
+        # No "diverging tactic" advice: nothing was diverging, the op spent
+        # its wall clock writing the snapshot.
+        assert "diverging" not in r["error"]
+
+    def test_stall_builder_prefers_save_phase(self):
+        ls = make_lifespan_state(full=True)
+        r = _server._build_lsp_stall_timeout_response(
+            ls, "rocq_compile_lsp", "k", (1.0, 5, 0), 30.0,
+            save_phase=self._SAVE_VOF,
+        )
+        assert r["reason"] == "stall_timeout"
+        assert "diverging_sentence" not in r
+        assert r["killed_during_save"] == self._SAVE_VOF
+        assert "already completed" in r["error"]
+        assert "diverging" not in r["error"]
+
+    def test_no_save_phase_keeps_sentence_attribution(self):
+        """Without a save in flight the ebad078 behaviour is unchanged."""
+        ls = make_lifespan_state(full=True)
+        r = _server._build_lsp_memory_abort_response(
+            ls, "rocq_compile_lsp", "k", progress=(1.0, 3, 0)
+        )
+        assert r["elaborating_sentence"]["line"] == 3
+        assert "The sentence being elaborated" in r["error"]
+        assert "killed_during_save" not in r

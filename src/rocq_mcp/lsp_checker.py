@@ -463,6 +463,13 @@ class LspChecker:
         # Track last content sent per uri (to skip no-op didChange and to
         # know whether a buffer needs a didChange before a goals request)
         self._last_content: dict[str, str] = {}
+        # In-flight / most recent save request, as ``(label, start, end)``
+        # monotonic timestamps (``end`` is None while the request is being
+        # served).  Read lock-free by the server's abort recoveries
+        # (:meth:`save_phase_at`): a kill during a save must not be blamed
+        # on "the sentence being elaborated" -- during a save the
+        # fileProgress frontier is a relic of the already-completed check.
+        self._save_phase: tuple[str, float, float | None] | None = None
 
         # --- background reader + message routing ---------------------
         self._reader: threading.Thread | None = None
@@ -625,6 +632,32 @@ class LspChecker:
         """
         with self._cv:
             self._last_progress = None
+
+    def save_phase_at(self, ts: float, since: float = 0.0) -> str | None:
+        """The save request in flight at monotonic time *ts*, if any.
+
+        Returns the label (e.g. ``".vof snapshot (coq/saveVof)"``) when a
+        ``coq/saveVof`` / ``coq/saveVo`` request that started at or after
+        *since* was being served at *ts*, else ``None``.  *since* is the
+        caller's operation start -- the same freshness gate the abort
+        recoveries apply to the fileProgress frontier, so a completed save
+        from a *previous* call can never be blamed for this one's kill.  A
+        just-finished save keeps matching for a short slack window: the kill
+        itself is what wakes the save request (which records its end), and
+        the recovery reads the clock moments later; nothing else can start
+        in between because the worker is still inside ``check_file``.
+        Lock-free (a single tuple read, GIL-atomic), so watchdogs can call
+        it while the worker holds ``self._lock``.
+        """
+        rec = self._save_phase
+        if rec is None:
+            return None
+        label, start, end = rec
+        if start < since or ts < start:
+            return None
+        if end is None or ts <= end + 5.0:
+            return label
+        return None
 
     def trim_caches(self) -> None:
         """Tell coq-lsp to free its global memoization tables.
@@ -891,9 +924,16 @@ class LspChecker:
             uri = Path(resolved).as_uri()
             if uri not in self._open_docs:
                 return {"saved": False, "error": "document is not open"}
-            resp = self._request(
-                "coq/saveVof", {"textDocument": {"uri": uri}}, timeout=_VOF_SAVE_TIMEOUT
-            )
+            self._save_phase = (".vof snapshot (coq/saveVof)", time.monotonic(), None)
+            try:
+                resp = self._request(
+                    "coq/saveVof",
+                    {"textDocument": {"uri": uri}},
+                    timeout=_VOF_SAVE_TIMEOUT,
+                )
+            finally:
+                label, start, _ = self._save_phase
+                self._save_phase = (label, start, time.monotonic())
             if isinstance(resp, dict) and "_lsp_error" in resp:
                 err = _lsp_error_message(resp["_lsp_error"])
                 dlog.event("vof", "save.rejected", file=resolved, error=dlog.blob(err))
@@ -926,9 +966,16 @@ class LspChecker:
             uri = Path(resolved).as_uri()
             if uri not in self._open_docs:
                 return {"saved": False, "error": "document is not open"}
-            resp = self._request(
-                "coq/saveVo", {"textDocument": {"uri": uri}}, timeout=_VOF_SAVE_TIMEOUT
-            )
+            self._save_phase = (".vo library (coq/saveVo)", time.monotonic(), None)
+            try:
+                resp = self._request(
+                    "coq/saveVo",
+                    {"textDocument": {"uri": uri}},
+                    timeout=_VOF_SAVE_TIMEOUT,
+                )
+            finally:
+                label, start, _ = self._save_phase
+                self._save_phase = (label, start, time.monotonic())
         if isinstance(resp, dict) and "_lsp_error" in resp:
             err = _lsp_error_message(resp["_lsp_error"])
             dlog.event("vo", "save.rejected", file=resolved, error=dlog.blob(err))

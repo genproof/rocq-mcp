@@ -920,10 +920,30 @@ def _fresh_frontier(checker: Any, op_start: float) -> tuple[float, int, int] | N
     return None
 
 
+def _save_phase_at_kill(checker: Any, op_start: float) -> str | None:
+    """The save request (``coq/saveVof`` / ``coq/saveVo``) in flight on
+    *checker* at this moment, if any -- shape-guarded like
+    :func:`_fresh_frontier`, and gated to saves started by the current op.
+
+    During a save the ``$/coq/fileProgress`` frontier is a relic of the
+    already-completed check (a save emits no progress), so an abort recovery
+    must not present it as "the sentence being elaborated".
+    """
+    get = getattr(checker, "save_phase_at", None)
+    if get is None:
+        return None
+    try:
+        phase = get(time.monotonic(), since=op_start)
+    except Exception:
+        return None
+    return phase if isinstance(phase, str) else None
+
+
 def _describe_frontier_sentence(
     key: str,
     progress: tuple[float, int, int] | None,
     when: str,
+    save_phase: str | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     """(``elaborating_sentence`` dict, error-message suffix) for a kill-time
     frontier.
@@ -935,7 +955,27 @@ def _describe_frontier_sentence(
     stall path's ``diverging_sentence``, it is a hint, not a verdict: the
     fault (memory growth, wall-clock, a crash) may have accumulated across
     earlier sentences.  ``(None, "")`` when there is no frontier to report.
+
+    *save_phase* (see :func:`_save_phase_at_kill`) overrides the frontier:
+    when the kill landed during a ``coq/saveVof`` / ``coq/saveVo`` request,
+    the check had already completed and the frontier merely points at the
+    last sentence it processed -- naming it "being elaborated" would send
+    the caller hunting a proof that already succeeded.  The suffix then
+    attributes the kill to the save instead, and no ``elaborating_sentence``
+    is reported.
     """
+    if save_phase is not None:
+        note = (
+            f". The document check itself had already completed; coq-lsp "
+            f"was writing the {save_phase} {when} -- no sentence was being "
+            f"elaborated"
+        )
+        if "saveVof" in save_phase:
+            note += (
+                " (marshaling the whole document transiently needs roughly "
+                "the session's own RSS again)"
+            )
+        return None, note
     if progress is None:
         return None, ""
     line, character = progress[1], progress[2]
@@ -955,6 +995,7 @@ def _build_lsp_memory_abort_response(
     tool: str,
     key: str,
     progress: tuple[float, int, int] | None = None,
+    save_phase: str | None = None,
 ) -> dict[str, Any]:
     """Memory-abort recovery for one coq-lsp session.
 
@@ -970,7 +1011,9 @@ def _build_lsp_memory_abort_response(
     :func:`_describe_frontier_sentence`).
     """
     _invalidate_lsp(lifespan_state, key)
-    elaborating, note = _describe_frontier_sentence(key, progress, "at the kill")
+    elaborating, note = _describe_frontier_sentence(
+        key, progress, "at the kill", save_phase=save_phase
+    )
     error = (
         f"{tool} aborted: coq-lsp RSS exceeded "
         f"{ROCQ_MAX_LSP_RSS_MB} MB. coq-lsp has been restarted" + note
@@ -984,6 +1027,8 @@ def _build_lsp_memory_abort_response(
     }
     if elaborating is not None:
         response["elaborating_sentence"] = elaborating
+    elif save_phase is not None:
+        response["killed_during_save"] = save_phase
     return response
 
 
@@ -992,6 +1037,7 @@ def _build_lsp_died_response(
     tool: str,
     key: str,
     progress: tuple[float, int, int] | None = None,
+    save_phase: str | None = None,
 ) -> dict[str, Any]:
     """Recovery for a coq-lsp that died mid-operation on its own.
 
@@ -1009,7 +1055,9 @@ def _build_lsp_died_response(
     :func:`_describe_frontier_sentence`).
     """
     _invalidate_lsp(lifespan_state, key)
-    elaborating, note = _describe_frontier_sentence(key, progress, "when it died")
+    elaborating, note = _describe_frontier_sentence(
+        key, progress, "when it died", save_phase=save_phase
+    )
     error = (
         f"{tool} aborted: coq-lsp died mid-operation (crashed or was killed "
         "externally, e.g. by the kernel OOM killer). The session has been "
@@ -1025,6 +1073,8 @@ def _build_lsp_died_response(
     }
     if elaborating is not None:
         response["elaborating_sentence"] = elaborating
+    elif save_phase is not None:
+        response["killed_during_save"] = save_phase
     return response
 
 
@@ -1033,6 +1083,7 @@ def _build_lsp_hard_timeout_response(
     tool: str,
     key: str,
     progress: tuple[float, int, int] | None = None,
+    save_phase: str | None = None,
 ) -> dict[str, Any]:
     """Hard-timeout recovery for one coq-lsp session.
 
@@ -1050,14 +1101,23 @@ def _build_lsp_hard_timeout_response(
     :func:`_describe_frontier_sentence`).
     """
     _invalidate_lsp(lifespan_state, key)
-    elaborating, note = _describe_frontier_sentence(key, progress, "at the kill")
-    error = (
-        f"{tool} aborted: exceeded the hard timeout of {ROCQ_HARD_TIMEOUT}s "
-        "(ROCQ_HARD_TIMEOUT). coq-lsp has been restarted. The operation hit a "
-        "tactic that does not respond to interruption -- check for a diverging "
-        "or non-terminating tactic (e.g. an unbounded loop or a runaway "
-        "computation)" + note
+    elaborating, note = _describe_frontier_sentence(
+        key, progress, "at the kill", save_phase=save_phase
     )
+    if save_phase is not None:
+        error = (
+            f"{tool} aborted: exceeded the hard timeout of "
+            f"{ROCQ_HARD_TIMEOUT}s (ROCQ_HARD_TIMEOUT). coq-lsp has been "
+            "restarted" + note
+        )
+    else:
+        error = (
+            f"{tool} aborted: exceeded the hard timeout of "
+            f"{ROCQ_HARD_TIMEOUT}s (ROCQ_HARD_TIMEOUT). coq-lsp has been "
+            "restarted. The operation hit a tactic that does not respond to "
+            "interruption -- check for a diverging or non-terminating tactic "
+            "(e.g. an unbounded loop or a runaway computation)" + note
+        )
     _record_error(lifespan_state, tool, error, reason="hard_timeout")
     response: dict[str, Any] = {
         "success": False,
@@ -1067,6 +1127,8 @@ def _build_lsp_hard_timeout_response(
     }
     if elaborating is not None:
         response["elaborating_sentence"] = elaborating
+    elif save_phase is not None:
+        response["killed_during_save"] = save_phase
     return response
 
 
@@ -1187,6 +1249,7 @@ def _build_lsp_stall_timeout_response(
     key: str,
     progress: tuple[float, int, int] | None,
     stall_window: float | None,
+    save_phase: str | None = None,
 ) -> dict[str, Any]:
     """Progress-stall recovery for one coq-lsp session.
 
@@ -1201,6 +1264,28 @@ def _build_lsp_stall_timeout_response(
     """
     _invalidate_lsp(lifespan_state, key)
     window = f"{stall_window:.0f}s" if stall_window is not None else "the budget"
+    if save_phase is not None:
+        # A save emits no fileProgress, so a long enough marshal trips the
+        # stall watchdog -- but nothing is diverging and the check itself
+        # had already completed.  Do NOT name the frontier sentence (it is
+        # the last sentence of the finished check, not a culprit).
+        error = (
+            f"{tool} aborted: coq-lsp emitted no checking progress for "
+            f"{window} (sentence_timeout + ROCQ_PROGRESS_GRACE) -- but the "
+            f"document check itself had already completed; coq-lsp was "
+            f"writing the {save_phase}, which emits no progress, and was "
+            "killed mid-save. coq-lsp has been restarted; the check verdict "
+            "was lost with it, so retry (a large snapshot can need longer "
+            "than the stall window to marshal)"
+        )
+        _record_error(lifespan_state, tool, error, reason="stall_timeout")
+        return {
+            "success": False,
+            "error": error,
+            "reason": "stall_timeout",
+            "lsp_restarted": True,
+            "killed_during_save": save_phase,
+        }
     diverging: dict[str, Any] | None = None
     if progress is not None:
         line, character = progress[1], progress[2]
@@ -1679,40 +1764,50 @@ async def _run_with_lsp(
             # elaborating when RSS crossed the cap (a hint: memory may have
             # accumulated across earlier sentences).
             prog = _fresh_frontier(checker, _t0)
+            sp = _save_phase_at_kill(checker, _t0)
             dlog.event(
                 "op", "lsp_op.memory_exhausted", tool=tool, key=key,
                 duration_s=round(time.monotonic() - _t0, 6),
                 peak_rss_mb=meta.get("peak_rss_mb"),
                 line=prog[1] if prog else None,
                 character=prog[2] if prog else None,
+                save_phase=sp,
             )
-            return _build_lsp_memory_abort_response(lifespan_state, tool, key, prog)
+            return _build_lsp_memory_abort_response(
+                lifespan_state, tool, key, prog, save_phase=sp
+            )
         if timeout_event.is_set():
             # Frontier at the deadline -- the sentence coq-lsp was elaborating
             # when the wall clock ran out (a hint: the hard timeout bounds the
             # whole op, so earlier sentences may have spent the budget).
             prog = _fresh_frontier(checker, _t0)
+            sp = _save_phase_at_kill(checker, _t0)
             dlog.event(
                 "op", "lsp_op.hard_timeout", tool=tool, key=key,
                 duration_s=round(time.monotonic() - _t0, 6),
                 limit_s=ROCQ_HARD_TIMEOUT,
                 line=prog[1] if prog else None,
                 character=prog[2] if prog else None,
+                save_phase=sp,
             )
-            return _build_lsp_hard_timeout_response(lifespan_state, tool, key, prog)
+            return _build_lsp_hard_timeout_response(
+                lifespan_state, tool, key, prog, save_phase=sp
+            )
         if stall_event.is_set():
             # Re-read the frontier *after* the cancel: coq-lsp is wedged (no new
             # progress) and about to be killed, so this is the stalled sentence.
             prog = checker.last_progress()
+            sp = _save_phase_at_kill(checker, _t0)
             dlog.event(
                 "op", "lsp_op.stall_timeout", tool=tool, key=key,
                 duration_s=round(time.monotonic() - _t0, 6),
                 stall_window_s=stall_window,
                 line=prog[1] if prog else None,
                 character=prog[2] if prog else None,
+                save_phase=sp,
             )
             return _build_lsp_stall_timeout_response(
-                lifespan_state, tool, key, prog, stall_window
+                lifespan_state, tool, key, prog, stall_window, save_phase=sp
             )
         if command_event.is_set():
             dlog.event(
@@ -2718,7 +2813,11 @@ async def rocq_compile_lsp(
     timeout (``ROCQ_HARD_TIMEOUT``).  On any breach the session's coq-lsp is
     killed and restarted and the response is ``{success: False, reason:
     "memory_exhausted" | "stall_timeout" | "hard_timeout", lsp_restarted:
-    True}``.  For a *non-cooperative* divergence — one that ignores Coq's
+    True}``.  Abort envelopes locate the work that was killed: the sentence
+    being elaborated (``elaborating_sentence`` / ``diverging_sentence``) --
+    or, when the kill landed during the post-check ``.vof``/``.vo`` save
+    (the check itself had completed; nothing was elaborating),
+    ``killed_during_save`` names the save instead.  For a *non-cooperative* divergence — one that ignores Coq's
     interrupt, which ``sentence_timeout`` cannot touch — prefer the stall
     watchdog: when ``sentence_timeout > 0`` and the checking frontier
     (``$/coq/fileProgress``) stops advancing for ``sentence_timeout +
@@ -2966,7 +3065,10 @@ async def rocq_compile_lsp(
         # elaborating when the process died.
         checker = lifespan_state.get("lsp_pool", {}).get(key)
         prog = _fresh_frontier(checker, _op_t0) if checker is not None else None
-        return _build_lsp_died_response(lifespan_state, "rocq_compile_lsp", key, prog)
+        sp = _save_phase_at_kill(checker, _op_t0) if checker is not None else None
+        return _build_lsp_died_response(
+            lifespan_state, "rocq_compile_lsp", key, prog, save_phase=sp
+        )
 
     # On a memory abort the envelope carries no warnings/info keys to pop.
     if not include_warnings:
