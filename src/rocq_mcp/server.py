@@ -118,6 +118,26 @@ ROCQ_LSP_TRIM_RSS_MB: int = int(
         "ROCQ_LSP_TRIM_RSS_MB", str(max(1, ROCQ_MAX_LSP_RSS_MB // 2))
     )
 )
+
+# ---------------------------------------------------------------------------
+# Transport selection
+# ---------------------------------------------------------------------------
+# ``stdio`` (the default) keeps the classic model: the MCP client launches
+# the server as a child process and owns its lifetime -- zero setup, but the
+# warm coq-lsp cache dies with the client.  ``http`` instead runs the server
+# as a standalone Streamable-HTTP daemon, so the cache (and its coq-lsp
+# sessions) survive client restarts and can be shared across sessions; point
+# the client's ``.mcp.json`` at ``{"type": "http", "url":
+# "http://HOST:PORT/PATH"}``.  ``sse``/``streamable-http`` are accepted as
+# explicit aliases.
+ROCQ_TRANSPORT: str = os.environ.get("ROCQ_TRANSPORT", "stdio").strip().lower()
+# HTTP bind settings (used only when ROCQ_TRANSPORT is an HTTP transport).
+# Bind to loopback by default; expose beyond localhost only behind your own
+# auth/proxy.
+ROCQ_HTTP_HOST: str = os.environ.get("ROCQ_HTTP_HOST", "127.0.0.1")
+ROCQ_HTTP_PORT: int = int(os.environ.get("ROCQ_HTTP_PORT", "8000"))
+ROCQ_HTTP_PATH: str = os.environ.get("ROCQ_HTTP_PATH", "/mcp")
+
 _MEMORY_WATCHDOG_INTERVAL: float = 0.5
 _RECENT_ERRORS_MAX: int = 20
 
@@ -3140,8 +3160,26 @@ def _maybe_trim_lsp_caches(
 
 
 def main() -> None:
-    """Run the MCP server."""
-    mcp.run(transport="stdio")
+    """Run the MCP server on the configured transport (``ROCQ_TRANSPORT``).
+
+    Defaults to ``stdio`` so existing clients are unaffected; set
+    ``ROCQ_TRANSPORT=http`` (with optional ``ROCQ_HTTP_HOST`` /
+    ``ROCQ_HTTP_PORT`` / ``ROCQ_HTTP_PATH``) to serve as a persistent daemon.
+    """
+    if ROCQ_TRANSPORT == "stdio":
+        mcp.run(transport="stdio")
+    elif ROCQ_TRANSPORT in ("http", "streamable-http", "sse"):
+        mcp.run(
+            transport=ROCQ_TRANSPORT,
+            host=ROCQ_HTTP_HOST,
+            port=ROCQ_HTTP_PORT,
+            path=ROCQ_HTTP_PATH,
+        )
+    else:
+        raise SystemExit(
+            f"ROCQ_TRANSPORT={ROCQ_TRANSPORT!r} is not supported "
+            "(use 'stdio' or 'http')."
+        )
 
 
 if __name__ == "__main__":
