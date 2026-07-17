@@ -632,3 +632,89 @@ class TestVofWarmReload:
             assert r["success"] is True, r
         finally:
             c.stop()
+
+
+# ---------------------------------------------------------------------------
+# Forked .vof save (genproof/rocq-lsp): an OOM-killed save must not take the
+# warm session with it
+# ---------------------------------------------------------------------------
+
+
+@_lsp_only
+class TestVofForkedSave:
+    """The .vof marshal runs in a forked child of coq-lsp: its ~1x-RSS
+    sharing-table transient lands in the child, so under memory pressure
+    the kernel OOM killer takes the child while the warm parent -- and the
+    check verdict it just produced -- survives.  The child writes to
+    ``<file>.vof.tmp`` and the parent renames on success, so a killed save
+    leaves no truncated snapshot behind."""
+
+    def test_child_kill_leaves_session_alive(self, tmp_path, monkeypatch):
+        """SIGKILL the save child mid-marshal (deterministic via the
+        COQ_LSP_VOF_CHILD_DELAY_S hook): the check verdict stands, the
+        vof_error names the signal, no .vof/.tmp is left, and the SAME warm
+        session keeps answering."""
+        import threading
+
+        import psutil
+
+        from rocq_mcp.lsp_checker import LspChecker
+
+        # Hold the save child open before it writes, so the kill window is
+        # deterministic.  Must be set before the coq-lsp spawn.
+        monkeypatch.setenv("COQ_LSP_VOF_CHILD_DELAY_S", "5")
+        f = _project(tmp_path)
+        c = LspChecker(workspace=str(tmp_path))
+        result: dict = {}
+        t = threading.Thread(
+            target=lambda: result.update(c.check_file(f, str(tmp_path), 0.0))
+        )
+        t.start()
+        try:
+            child = None
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and child is None:
+                proc = c._process
+                if proc is not None:
+                    try:
+                        kids = psutil.Process(proc.pid).children()
+                    except psutil.Error:
+                        kids = []
+                    child = kids[0] if kids else None
+                if child is None:
+                    if result:
+                        # The save completed without ever forking: binary
+                        # predates the forked save.
+                        pytest.skip("coq-lsp predates the forked .vof save")
+                    time.sleep(0.01)
+            assert child is not None, "no .vof save child appeared"
+            child.kill()  # SIGKILL: what the kernel OOM killer sends
+            t.join(timeout=60)
+            assert not t.is_alive(), "check_file did not return after the kill"
+
+            assert result["success"] is True  # the check verdict survives
+            assert result["vof_saved"] is False
+            assert "SIGKILL" in result["vof_error"], result["vof_error"]
+            assert not (tmp_path / "Foo.vof").exists()
+            assert not (tmp_path / "Foo.vof.tmp").exists()
+            # The parent coq-lsp is alive and the warm document still
+            # answers -- the whole point of the isolation.
+            g = c.goals(f, 3, 0, mode="Prev")
+            glist = (g.get("goals") or {}).get("goals")
+            assert glist and glist[0]["ty"] == "n = n", g
+        finally:
+            t.join(timeout=5)
+            c.stop()
+
+    def test_forked_save_leaves_no_tmp(self, tmp_path):
+        from rocq_mcp.lsp_checker import LspChecker
+
+        f = _project(tmp_path)
+        c = LspChecker(workspace=str(tmp_path))
+        try:
+            r = c.check_file(f, str(tmp_path), 0.0)
+            assert r["vof_saved"] is True
+            assert (tmp_path / "Foo.vof").is_file()
+            assert not (tmp_path / "Foo.vof.tmp").exists()
+        finally:
+            c.stop()
