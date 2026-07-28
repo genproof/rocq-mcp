@@ -341,6 +341,201 @@ class TestWatchdogCoroutine:
         with pytest.raises(asyncio.CancelledError):
             await main_task
 
+    @pytest.mark.asyncio
+    async def test_watchdog_rss_breach_exempts_qed_frontier(
+        self, monkeypatch, tmp_path
+    ):
+        """An RSS breach while the frontier is parked on a ``Qed`` does NOT
+        kill: kernel verification of a deep proof term may legitimately
+        exceed the cap.  The exemption is logged once, not once per tick."""
+        _patch_psutil_rss(monkeypatch, 500)  # 500 MB > 100 MB cap
+        f = tmp_path / "p.v"
+        f.write_text("Lemma l : True.\nProof.\nQed.\n")  # Qed on line 2
+        events: list[str] = []
+        monkeypatch.setattr(
+            _server.dlog, "event", lambda cat, ev, **kw: events.append(ev)
+        )
+
+        checker = _FakeLspChecker()
+        mem = asyncio.Event()
+
+        async def work():
+            await asyncio.sleep(0.2)  # many breach ticks; ends the watchdog loop
+
+        main_task = asyncio.create_task(work())
+        t0 = time.monotonic()
+        await _server._memory_watchdog(
+            100, main_task, mem,
+            get_process=lambda: checker._process,
+            # Fresh (>= op_start) frontier parked on the Qed on every read.
+            get_progress=lambda: (time.monotonic(), 2, 0),
+            op_start=t0, stall_path=str(f),
+        )
+        assert not mem.is_set()
+        assert not main_task.cancelled()
+        assert events.count("rss_breach_exempt_qed") == 1
+        assert "rss_breach" not in events
+
+    @pytest.mark.asyncio
+    async def test_watchdog_rss_breach_fires_for_non_qed_frontier(
+        self, monkeypatch, tmp_path
+    ):
+        """Control: with stall_path set but the frontier on a *tactic*, the
+        RSS breach still kills -- the exemption is specific to proof-closing
+        commands."""
+        _patch_psutil_rss(monkeypatch, 500)
+        f = tmp_path / "p.v"
+        f.write_text("Lemma l : True.\nProof.\ninduction n.\n")  # tactic on line 2
+
+        checker = _FakeLspChecker()
+        mem = asyncio.Event()
+
+        async def work():
+            await asyncio.sleep(10)
+
+        main_task = asyncio.create_task(work())
+        t0 = time.monotonic()
+        await _server._memory_watchdog(
+            100, main_task, mem,
+            get_process=lambda: checker._process,
+            get_progress=lambda: (time.monotonic(), 2, 0),
+            op_start=t0, stall_path=str(f),
+        )
+        assert mem.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            await main_task
+
+    @pytest.mark.asyncio
+    async def test_watchdog_rss_exemption_rearms_when_frontier_moves(
+        self, monkeypatch, tmp_path
+    ):
+        """The exemption is re-checked each tick: once the frontier moves past
+        the ``Qed`` to a non-closing sentence with RSS still over the cap, the
+        kill fires."""
+        _patch_psutil_rss(monkeypatch, 500)
+        f = tmp_path / "p.v"
+        f.write_text(
+            "Lemma l : True.\nProof.\nQed.\nLemma m : True.\ndo 9 idtac.\n"
+        )  # Qed on line 2, tactic on line 4
+
+        checker = _FakeLspChecker()
+        mem = asyncio.Event()
+        ticks = {"n": 0}
+
+        def prog():
+            ticks["n"] += 1
+            line = 2 if ticks["n"] <= 3 else 4  # parked on the Qed, then past it
+            return (time.monotonic(), line, 0)
+
+        async def work():
+            await asyncio.sleep(10)
+
+        main_task = asyncio.create_task(work())
+        t0 = time.monotonic()
+        await _server._memory_watchdog(
+            100, main_task, mem,
+            get_process=lambda: checker._process,
+            get_progress=prog, op_start=t0, stall_path=str(f),
+        )
+        assert ticks["n"] > 3, "killed while still parked on the Qed"
+        assert mem.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            await main_task
+
+    @pytest.mark.asyncio
+    async def test_watchdog_rss_breach_ignores_stale_qed_frontier(
+        self, monkeypatch, tmp_path
+    ):
+        """Fail-closed: a warm-session relic frontier (older than the op)
+        parked on a ``Qed`` does NOT exempt -- the current op may be hogging
+        memory somewhere else entirely."""
+        _patch_psutil_rss(monkeypatch, 500)
+        f = tmp_path / "p.v"
+        f.write_text("Lemma l : True.\nProof.\nQed.\n")
+
+        checker = _FakeLspChecker()
+        mem = asyncio.Event()
+
+        async def work():
+            await asyncio.sleep(10)
+
+        main_task = asyncio.create_task(work())
+        await _server._memory_watchdog(
+            100, main_task, mem,
+            get_process=lambda: checker._process,
+            get_progress=lambda: (0.0, 2, 0),  # relic: predates the op
+            op_start=time.monotonic(), stall_path=str(f),
+        )
+        assert mem.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            await main_task
+
+    @pytest.mark.asyncio
+    async def test_watchdog_rss_breach_fires_for_qed_at_pretac_point(
+        self, monkeypatch, tmp_path
+    ):
+        """A pretac op whose point sits right before the file's ``Qed``: the
+        speculative command (not the Qed) is what is allocating, so the
+        breach still kills -- the exemption holds only in the elaborate
+        phase, like the stall one."""
+        _patch_psutil_rss(monkeypatch, 500)
+        f = tmp_path / "p.v"
+        f.write_text("Lemma l : True.\nProof.\nQed.\n")
+
+        checker = _FakeLspChecker()
+        mem = asyncio.Event()
+        cmd = asyncio.Event()
+
+        async def work():
+            await asyncio.sleep(10)
+
+        main_task = asyncio.create_task(work())
+        t0 = time.monotonic()
+        await _server._memory_watchdog(
+            100, main_task, mem,
+            get_process=lambda: checker._process,
+            # Fresh frontier at the point -> command phase; the sentence at
+            # the point in the FILE is the Qed, but the pretac is running.
+            get_progress=lambda: (time.monotonic(), 2, 0),
+            command_window=10.0, command_event=cmd,  # pretac op; never stalls
+            point=(2, 0), op_start=t0, stall_path=str(f),
+        )
+        assert mem.is_set()
+        assert not cmd.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            await main_task
+
+    @pytest.mark.asyncio
+    async def test_watchdog_rss_breach_fires_during_save(
+        self, monkeypatch, tmp_path
+    ):
+        """A breach during ``coq/saveVof`` kills even though the relic
+        frontier is parked on the file's final ``Qed``: the marshal, not the
+        kernel, is the memory event (the liblzma vsu.v incident this cap
+        caught)."""
+        _patch_psutil_rss(monkeypatch, 500)
+        f = tmp_path / "p.v"
+        f.write_text("Lemma l : True.\nProof.\nQed.\n")
+
+        checker = _FakeLspChecker()
+        mem = asyncio.Event()
+
+        async def work():
+            await asyncio.sleep(10)
+
+        main_task = asyncio.create_task(work())
+        t0 = time.monotonic()
+        await _server._memory_watchdog(
+            100, main_task, mem,
+            get_process=lambda: checker._process,
+            get_progress=lambda: (time.monotonic(), 2, 0),
+            op_start=t0, stall_path=str(f),
+            get_save_phase=lambda: ".vof snapshot (coq/saveVof)",
+        )
+        assert mem.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            await main_task
+
 
 # ---------------------------------------------------------------------------
 # coq-lsp watchdog (ROCQ_MAX_LSP_RSS_MB)
@@ -524,6 +719,47 @@ class TestLspMemoryWatchdogBreach:
         assert "elaborating_sentence" not in result
         assert "relic_sentence_cccc" not in result["error"]
         assert result["error"].endswith("coq-lsp has been restarted")
+
+    @pytest.mark.asyncio
+    async def test_rss_breach_exempted_while_qed_elaborating(
+        self, tmp_path, monkeypatch
+    ):
+        """End-to-end: RSS over the cap while the frontier is parked on the
+        file's ``Qed`` -> the check is NOT aborted (honest kernel
+        verification); the session stays warm, the result comes back
+        normally, and the peak is still tracked."""
+        from rocq_mcp.server import rocq_compile_lsp
+
+        monkeypatch.setattr(_server, "ROCQ_MAX_LSP_RSS_MB", 100)
+        monkeypatch.setattr(_server, "ROCQ_HARD_TIMEOUT", 0.0)
+        monkeypatch.setattr(_server, "ROCQ_SENTENCE_TIMEOUT", 0.0)
+        monkeypatch.setattr(_server, "ROCQ_LSP_TRIM_RSS_MB", 0)
+        _patch_psutil_rss(monkeypatch, 500)  # 500 MB > 100 MB cap, every tick
+
+        vfile = tmp_path / "big_qed.v"
+        vfile.write_text("Lemma l : True.\nProof.\nQed.\n")  # Qed on line 2
+
+        ls = make_lifespan_state(full=True)
+        ls["workspace"] = str(tmp_path)
+        checker = _mock_lsp_checker()  # default check_file blocks ~0.2 s
+        # Frontier parked on the Qed, fresh on every read.  (The MagicMock's
+        # auto-created save_phase_at returns a non-str -> guarded to "no
+        # save in flight".)
+        checker.last_progress = lambda: (time.monotonic(), 2, 0)
+        inject_checker(ls, checker, workspace=str(tmp_path), file_path=str(vfile))
+
+        ctx = _MockLspContext(ls)
+        result = await rocq_compile_lsp(
+            file_path=str(vfile), workspace=str(tmp_path), ctx=ctx
+        )
+
+        assert result["success"] is True
+        assert "lsp_restarted" not in result
+        assert not checker.stop.called
+        assert pool_checker(ls, workspace=str(tmp_path), file_path=str(vfile)) is checker
+        assert session_meta(ls, workspace=str(tmp_path), file_path=str(vfile))[
+            "peak_rss_mb"
+        ] >= 500.0
 
     @pytest.mark.asyncio
     async def test_low_lsp_rss_does_not_abort(self, tmp_path, monkeypatch):

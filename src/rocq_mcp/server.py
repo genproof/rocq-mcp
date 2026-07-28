@@ -55,9 +55,10 @@ ROCQ_OP_TIMEOUT: float = float(
 # is honest kernel verification of the proof term, not a diverging tactic, so a
 # long ``Qed`` is never reified as a "sentence timeout".  The progress-stall
 # backstop exempts them too (see ROCQ_PROGRESS_GRACE) -- a frontier parked on a
-# ``Qed`` is not treated as a hang -- so a long ``Qed`` is bounded only by
-# ``ROCQ_HARD_TIMEOUT`` (if set) and the RSS memory watchdog, never by the
-# sentence-timeout machinery.
+# ``Qed`` is not treated as a hang -- and so does the RSS memory watchdog (see
+# ROCQ_MAX_LSP_RSS_MB) -- a memory-hungry kernel check is not a leak -- so a
+# long ``Qed`` is bounded only by ``ROCQ_HARD_TIMEOUT`` (if set), never by the
+# sentence-timeout machinery or the RSS cap.
 ROCQ_SENTENCE_TIMEOUT: float = float(os.environ.get("ROCQ_SENTENCE_TIMEOUT", "120"))
 # Hard wall-clock backstop (seconds) for any single coq-lsp operation.  0 (the
 # default) disables it.  When > 0, an operation that runs longer is aborted by
@@ -79,7 +80,8 @@ ROCQ_HARD_TIMEOUT: float = float(os.environ.get("ROCQ_HARD_TIMEOUT", "0"))
 # keeps progressing is never killed.  Only armed when the effective
 # sentence_timeout > 0.  A frontier parked on a proof-closing command (``Qed`` /
 # ``Defined`` / ...) is exempt -- honest kernel verification, not a hang -- so a
-# long ``Qed`` is never killed here (only ROCQ_HARD_TIMEOUT / RSS bound it).
+# long ``Qed`` is never killed here (only ROCQ_HARD_TIMEOUT bounds it; the RSS
+# watchdog exempts it too).
 ROCQ_PROGRESS_GRACE: float = float(os.environ.get("ROCQ_PROGRESS_GRACE", "120"))
 ROCQ_COQC_BINARY: str = os.environ.get("ROCQ_COQC_BINARY", "coqc")
 ROCQ_MAX_SOURCE_SIZE: int = int(os.environ.get("ROCQ_MAX_SOURCE_SIZE", "1000000"))
@@ -104,7 +106,10 @@ def _default_max_rss_mb() -> int:
 
 # coq-lsp RSS cap.  Fires well above legitimate vm_compute ceilings but
 # below the OOM-killer / swap-thrash zone (large vm_compute, deep proof
-# terms, runaway typeclass search can all blow this up).
+# terms, runaway typeclass search can all blow this up).  A frontier parked
+# on a proof-closing command (``Qed`` / ``Defined`` / ...) is exempt from the
+# breach kill -- kernel verification of a deep proof term may legitimately
+# exceed the cap (see ``_rss_breach_exempt`` in :func:`_memory_watchdog`).
 ROCQ_MAX_LSP_RSS_MB: int = int(
     os.environ.get("ROCQ_MAX_LSP_RSS_MB", str(_default_max_rss_mb()))
 )
@@ -1249,9 +1254,10 @@ def _extract_sentence(
 
 # A proof-closing command (Qed / Defined / Save / Admitted), optionally under a
 # control wrapper (``Time Qed.``, ``Timeout 5 Qed.``, ``Fail Qed.`` ...).  Used
-# to exempt such a sentence from the progress-stall watchdog: its cost is honest
-# kernel verification, not a diverging tactic, so a long Qed must not be killed
-# for parking the frontier.  Matches the whitespace-collapsed text from
+# to exempt such a sentence from the progress-stall watchdog and from the RSS
+# breach kill: its cost is honest kernel verification, not a diverging tactic
+# or a leak, so a long or memory-hungry Qed must not be killed for parking the
+# frontier.  Matches the whitespace-collapsed text from
 # :func:`_extract_sentence`.
 _PROOF_CLOSING_RE = re.compile(
     r"^(?:(?:Time|Fail|Succeed|Timeout\s+\d+)\s+)*(?:Qed|Defined|Admitted|Save)\b"
@@ -1458,6 +1464,7 @@ async def _memory_watchdog(
     point: tuple[int, int] | None = None,
     op_start: float | None = None,
     stall_path: str | None = None,
+    get_save_phase: Callable[[], str | None] | None = None,
 ) -> None:
     """Watch one coq-lsp op: on RSS breach, hard-timeout, progress stall, *or*
     command stall, cancel *main_task*.
@@ -1468,7 +1475,13 @@ async def _memory_watchdog(
     and respawn just that session's subprocess:
 
     - **RSS:** when the process's RSS exceeds ``max_rss_mb`` MB, set
-      *event* (memory exhaustion).
+      *event* (memory exhaustion).  A frontier parked on a proof-closing
+      command (``Qed`` / ``Defined`` / ...) is exempt, mirroring the stall
+      exemption: kernel verification of a large proof term is honest,
+      possibly memory-hungry work that must be allowed to finish, so during
+      it a long ``Qed`` is bounded only by ``ROCQ_HARD_TIMEOUT`` (if set).
+      See the ``_rss_breach_exempt`` closure for the fail-closed gates
+      (fresh frontier, elaborate phase, no save in flight).
     - **Hard timeout:** when ``deadline`` (a ``time.monotonic()`` value) is
       reached, set *timeout_event*.  This is the only backstop that frees a
       *non-cooperative* divergence (one that ignores Coq's polled interrupt),
@@ -1499,7 +1512,9 @@ async def _memory_watchdog(
     to watch, or ``None`` if it is not yet spawned.  ``on_rss`` (if
     given) is called with each live RSS sample (MB) -- used to track the
     per-session peak.  ``deadline`` / ``timeout_event`` are omitted (None)
-    when no hard timeout is configured.
+    when no hard timeout is configured.  ``get_save_phase`` (if given)
+    reports the save request currently in flight (see
+    :func:`_save_phase_at_kill`); consulted only by the RSS Qed exemption.
 
     Tolerates:
     - ``psutil`` not installed -- RSS sampling is skipped, but the
@@ -1512,11 +1527,53 @@ async def _memory_watchdog(
     if interval is None:
         interval = _MEMORY_WATCHDOG_INTERVAL
 
+    def _rss_breach_exempt() -> bool:
+        """True when the breach lands while a proof-closing command (Qed /
+        Defined / ...) is elaborating -- the RSS twin of the stall exemption
+        below: kernel verification of a large proof term legitimately
+        allocates (a deep proof term can dwarf the cap), so it is honest work
+        to wait out, not a leak to kill.  Fail-closed: exempt only on a
+        positively identified Qed-family frontier that is
+
+        - *fresh* (from this op): a warm session's relic frontier could park
+          on a prior op's ``Qed`` while the current op hogs memory elsewhere;
+        - in the *elaborate* phase: a pretac's point may sit right before a
+          ``Qed`` in the file while the speculative command is what is
+          allocating;
+        - not during a save: while ``coq/saveVof`` marshals the document
+          (transiently ~the session's own RSS again -- the very incident this
+          cap caught) the frontier is a relic parked on the file's last
+          sentence, which is very often a ``Qed``.
+        """
+        if stall_path is None or get_progress is None:
+            return False
+        prog = get_progress()
+        if not (
+            isinstance(prog, tuple)
+            and len(prog) == 3
+            and isinstance(prog[0], (int, float))
+            and prog[0] >= (op_start if op_start is not None else 0.0)
+        ):
+            return False
+        if command_window is not None and (
+            point is None or (prog[1], prog[2]) >= point
+        ):
+            return False
+        if get_save_phase is not None and get_save_phase() is not None:
+            return False
+        return _is_proof_closing_sentence(
+            _extract_sentence(stall_path, prog[1], prog[2])
+        )
+
     # One psutil handle reused across samples: cpu_percent() reports CPU since
     # the previous call on the *same* object, so a fresh handle every tick would
     # always read 0.  Reset (re-prime) when the watched pid changes (restart).
     ps_proc = None
     ps_pid: int | None = None
+    # The Qed exemption is logged once per op (a long Qed over the cap would
+    # otherwise emit an event every tick), but re-CHECKED every breach tick so
+    # the cap re-arms the moment the frontier moves past the Qed.
+    rss_exempt_logged = False
 
     try:
         while not main_task.done():
@@ -1581,7 +1638,8 @@ async def _memory_watchdog(
                     # parked frontier there is not a hang.  Only the stall phase
                     # is exempt -- a pretac command (command phase) is never a
                     # Qed -- and a runaway Qed is still bounded by
-                    # ROCQ_HARD_TIMEOUT / the RSS watchdog.  Re-checked each tick
+                    # ROCQ_HARD_TIMEOUT (the RSS breach below applies the same
+                    # exemption; see _rss_breach_exempt).  Re-checked each tick
                     # (cheap) so the kill re-arms the moment the frontier moves.
                     exempt = (
                         frontier_event is stall_event
@@ -1633,6 +1691,14 @@ async def _memory_watchdog(
             dlog.verbose_event("watchdog", "rss_sample", proc=pid, rss_mb=rss_mb,
                                cpu_pct=cpu_pct, limit_mb=max_rss_mb)
             if rss_mb > max_rss_mb:
+                if _rss_breach_exempt():
+                    if not rss_exempt_logged:
+                        rss_exempt_logged = True
+                        dlog.event(
+                            "watchdog", "rss_breach_exempt_qed", proc=pid,
+                            rss_mb=rss_mb, cpu_pct=cpu_pct, limit_mb=max_rss_mb,
+                        )
+                    continue
                 dlog.event("watchdog", "rss_breach", proc=pid, rss_mb=rss_mb,
                            cpu_pct=cpu_pct, limit_mb=max_rss_mb)
                 event.set()
@@ -1664,7 +1730,10 @@ async def _run_with_lsp(
     against ``ROCQ_MAX_LSP_RSS_MB``.  On breach only that session's
     subprocess is killed and the unified ``memory_exhausted`` envelope is
     returned (see :func:`_build_lsp_memory_abort_response`); sibling
-    sessions keep running.  On success, soft-trims that session's global
+    sessions keep running.  A breach while the frontier is parked on a
+    proof-closing command (``Qed`` / ...) does NOT kill -- honest kernel
+    verification may legitimately exceed the cap (see
+    :func:`_memory_watchdog`).  On success, soft-trims that session's global
     memo tables when its RSS crosses ``ROCQ_LSP_TRIM_RSS_MB`` (see
     :func:`_maybe_trim_lsp_caches`).
 
@@ -1763,6 +1832,7 @@ async def _run_with_lsp(
             point=point,
             op_start=_t0,
             stall_path=key,
+            get_save_phase=lambda: _save_phase_at_kill(checker, _t0),
         )
     )
     try:
