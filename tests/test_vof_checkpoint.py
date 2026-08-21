@@ -325,44 +325,110 @@ class TestAsyncCheckpoint:
 
     @pytest.mark.slow
     def test_checkpoint_does_not_block_elaboration(self, tmp_path, monkeypatch):
-        """THE async requirement: while the checkpoint child is alive (held
-        open by the delay hook), the parent's checking frontier keeps
-        advancing -- elaboration was not paused for the marshal."""
-        monkeypatch.setenv("COQ_LSP_VOF_CHILD_DELAY_S", "6")
+        """THE async requirement: the check runs to COMPLETION while the
+        checkpoint child (held open by the delay hook) is still alive.
+
+        This is strictly stronger than "the frontier advanced while the
+        child ran": a blocking reap still lets exactly one sentence through
+        between the fork and the next boundary, which an advance check
+        mistakes for liveness (verified: an advance-based assertion passes
+        against a deliberately blocking reap; this one fails against it).
+        If any part of checking waited for the marshal, the check could not
+        finish ~4s of remaining work before the child's 8s sleep ends."""
+        monkeypatch.setenv("COQ_LSP_VOF_CHILD_DELAY_S", "8")
         monkeypatch.setattr(lsp_checker_mod, "ROCQ_VOF_CHECKPOINT_S", 0.5)
-        # Enough work after the first checkpoint that progress is observable
-        # while the child sleeps.
-        f = _project(tmp_path, _src(args=(30, 31, 32, 33, 34)))
+        f = _project(tmp_path, _src(args=(30, 31, 32, 33)))
         c = LspChecker(workspace=str(tmp_path))
         result: dict = {}
         th = threading.Thread(
             target=lambda: result.update(
-                c.check_up_to(f, _tail_line(5), 0, workspace=str(tmp_path))
+                c.check_up_to(f, _tail_line(4), 0, workspace=str(tmp_path))
             )
         )
         th.start()
         try:
             child = _find_fork_child(c, result)
             assert child is not None, "no checkpoint child appeared"
-            p1 = c.last_progress()
-            deadline = time.monotonic() + 10
-            advanced = False
-            while time.monotonic() < deadline and child.is_running():
-                time.sleep(0.3)
-                p2 = c.last_progress()
-                if p1 is not None and p2 is not None and p2[1:] > p1[1:]:
-                    advanced = True
-                    break
-                p1 = p2 or p1
-            assert advanced, (
-                "the checking frontier did not advance while the checkpoint "
-                "child was alive -- the marshal is blocking elaboration"
-            )
             th.join(timeout=120)
             assert not th.is_alive() and result.get("success") is True
+            assert child.is_running(), (
+                "the check only completed after the checkpoint child exited "
+                "-- elaboration is blocked on the marshal"
+            )
         finally:
             th.join(timeout=120)
             c.stop()
+
+    @pytest.mark.slow
+    def test_requests_are_served_while_child_is_alive(self, tmp_path, monkeypatch):
+        """The other half of the async requirement: the session answers NEW
+        requests promptly while the checkpoint child is still marshaling --
+        the parent holds no lock for the child, so a goals request must not
+        wait out the marshal."""
+        monkeypatch.setenv("COQ_LSP_VOF_CHILD_DELAY_S", "8")
+        monkeypatch.setattr(lsp_checker_mod, "ROCQ_VOF_CHECKPOINT_S", 0.5)
+        f = _project(tmp_path, _src(args=(30, 31, 32)))
+        c = LspChecker(workspace=str(tmp_path))
+        try:
+            # Positioned check (no auto-save, so nothing drains the child):
+            # a checkpoint child spawns mid-check and outlives it by ~6s.
+            r = c.check_up_to(f, _tail_line(3), 0, workspace=str(tmp_path))
+            assert r["success"] is True
+            child = _find_fork_child(c, {}, timeout=5.0)
+            assert child is not None and child.is_running(), (
+                "no live checkpoint child after the check -- the delay hook "
+                "did not hold it open"
+            )
+            t = time.monotonic()
+            g = c.goals(f, 1, 0)
+            answered_in = time.monotonic() - t
+            assert child.is_running(), (
+                "the child exited before the request completed -- the timing "
+                "proves nothing; raise the delay"
+            )
+            # A healthy proof/goals answer (the position is outside a
+            # proof, so there is no "goals" key -- "position" echoes the
+            # served request and an error would surface as _lsp_error).
+            assert isinstance(g, dict) and g.get("position"), g
+            assert "_lsp_error" not in g, g
+            assert answered_in < 3.0, (
+                f"goals took {answered_in:.2f}s while the checkpoint child "
+                f"was marshaling -- request serving is blocked on the child"
+            )
+        finally:
+            c.stop()
+
+    @pytest.mark.slow
+    def test_sync_save_drains_inflight_child(self, tmp_path, monkeypatch):
+        """The synchronous save path (auto-save after a clean full check)
+        racing an in-flight checkpoint child: both write the same
+        ``.vof.tmp``, so the sync save DRAINS the child first, then writes
+        the full snapshot.  The final state must be the full one -- saved,
+        ``partial: False``, valid, no temp left -- not a corrupted
+        interleaving of the two."""
+        monkeypatch.setenv("COQ_LSP_VOF_CHILD_DELAY_S", "6")
+        monkeypatch.setattr(lsp_checker_mod, "ROCQ_VOF_CHECKPOINT_S", 0.5)
+        f = _project(tmp_path, _src(args=(30, 31, 32)))
+        c = LspChecker(workspace=str(tmp_path))
+        try:
+            # Full clean check: a checkpoint child spawns mid-check (held
+            # open by the delay), and check_file's auto-save fires while it
+            # is still alive.
+            r = c.check_file(f, str(tmp_path), 0.0)
+            assert r["success"] is True
+            assert r.get("vof_saved") is True, r.get("vof_error")
+            # Session healthy after the drain + save.
+            g = c.goals(f, 1, 0)
+            assert isinstance(g, dict) and g.get("position"), g
+            assert "_lsp_error" not in g, g
+        finally:
+            c.stop()
+        assert (tmp_path / "Doc.vof").is_file()
+        assert not (tmp_path / "Doc.vof.tmp").exists()
+        meta = vc._read_meta(f)
+        assert meta is not None and meta.get("partial") is False
+        assert vc.is_valid(f, str(tmp_path)) is True
+        assert vc.load_mode(f, str(tmp_path)) == "exact"
 
     @pytest.mark.slow
     def test_child_kill_mid_checkpoint_is_survivable(self, tmp_path, monkeypatch):
