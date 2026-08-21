@@ -511,6 +511,100 @@ class TestAsyncCheckpoint:
 
 
 # ---------------------------------------------------------------------------
+# The kill-mid-run recovery drill, end to end through the tool path
+# ---------------------------------------------------------------------------
+
+
+@_needs
+class TestKillRecoveryDrill:
+    @pytest.mark.slow
+    @pytest.mark.asyncio
+    async def test_kill_mid_run_recovers_within_one_interval(
+        self, tmp_path, monkeypatch
+    ):
+        """The requirement, stated as its user story: a long check of many
+        slow sentences, coq-lsp SIGKILLed mid-run, must recover and finish
+        with an extra delay bounded by roughly one checkpoint interval --
+        NOT by re-running everything the kill threw away.
+
+        Through the real tool (``rocq_compile_lsp``): the killed call
+        reports ``crashed`` + ``lsp_restarted``, and the immediate re-call
+        warm-starts from the last periodic checkpoint.  The bound
+        ``interval + 10s`` (spawn + load + one lost sentence) is well below
+        the ``kill_at`` seconds a checkpoint-less recovery would repeat.
+        """
+        import asyncio
+        import os as _os
+        import signal as _signal
+
+        import rocq_mcp.server as _server
+        from tests.conftest import _MockContext, make_lifespan_state
+
+        ckpt_s, kill_at = 5.0, 24.0
+        monkeypatch.setattr(lsp_checker_mod, "ROCQ_VOF_CHECKPOINT_S", ckpt_s)
+        n = 18  # ~1.7s of vm_compute each: baseline ~30s, so kill_at is mid-run
+        src = "From Coq Require Import NArith.\n" + "".join(
+            f"Definition s{i} : bool := Eval vm_compute in N.even (\n"
+            f"{_FIB} 36).\n"
+            for i in range(n)
+        ) + "Theorem tail : True.\nProof. exact I. Qed.\n"
+        target = 1 + 2 * n
+        f = _project(tmp_path, src)
+        state = make_lifespan_state(full=True)
+        ctx = _MockContext(state)
+        key = _server._session_key(str(tmp_path), f)
+
+        async def check():
+            return await _server.rocq_compile_lsp(
+                file_path=f, workspace=str(tmp_path), line=target, ctx=ctx
+            )
+
+        try:
+            # Baseline, uninterrupted.
+            t = time.monotonic()
+            r = await check()
+            t0 = time.monotonic() - t
+            assert r["success"] is True, r
+            assert kill_at < t0 * 0.95, (
+                f"baseline {t0:.1f}s too fast for a kill at {kill_at}s -- "
+                f"the drill would not interrupt anything"
+            )
+            _server._invalidate_lsp(state, key)
+            for suffix in (".vof", ".vof.meta"):
+                Path(f[:-2] + suffix).unlink(missing_ok=True)
+
+            # Drill: kill coq-lsp mid-run, then re-run the same tool call.
+            async def killer():
+                await asyncio.sleep(kill_at)
+                proc = getattr(state["lsp_pool"].get(key), "_process", None)
+                assert proc is not None
+                _os.kill(proc.pid, _signal.SIGKILL)
+
+            kill_task = asyncio.create_task(killer())
+            t_start = time.monotonic()
+            r1 = await check()
+            await kill_task
+            assert r1["success"] is False
+            assert r1.get("reason") == "crashed", r1.get("reason")
+            assert r1.get("lsp_restarted") is True
+
+            r2 = await check()
+            total = time.monotonic() - t_start
+            assert r2["success"] is True, r2
+
+            extra = total - t0
+            assert extra < ckpt_s + 10.0, (
+                f"extra delay {extra:.1f}s over the {t0:.1f}s baseline -- "
+                f"more than one checkpoint interval ({ckpt_s}s) + overhead; "
+                f"the periodic snapshot was not used for recovery"
+            )
+        finally:
+            from tests.conftest import stop_all_checkers
+
+            stop_all_checkers(state)
+
+
+# ---------------------------------------------------------------------------
 # vof_cache unit tests (no coq-lsp needed)
 # ---------------------------------------------------------------------------
 
