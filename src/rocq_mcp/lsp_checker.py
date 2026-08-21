@@ -1091,8 +1091,12 @@ class LspChecker:
         from rocq_mcp import vof_cache
 
         resolved = str(Path(file_path).resolve())
-        mode = vof_cache.load_mode(resolved, self._workspace, content)
-        if mode is None:
+        # The sidecar gates on ENVIRONMENT only (toolchain + deps): whether
+        # the snapshot's embedded text matches is decided from the loadVof
+        # ack below, which reports the unmarshaled document's own version
+        # and content md5 -- sidecars can be left behind by a crash, the
+        # ack cannot lie about what was just restored.
+        if vof_cache.load_mode(resolved, self._workspace, None) is None and                 vof_cache.load_mode(resolved, self._workspace, content) is None:
             dlog.event("vof", "load.miss", file=resolved)
             return False
         with self._cv:
@@ -1118,16 +1122,31 @@ class LspChecker:
         # now-broken file reports a false success ("stale-green").  Legacy
         # snapshots without a recorded version fall back to a base high enough
         # that any plausible saved version is exceeded.
-        saved_ver = vof_cache.saved_version(resolved)
-        self._open_docs[uri] = saved_ver if saved_ver is not None else _VOF_RELOAD_BASE_VERSION
+        # Authoritative identity of what was restored, from the ack; fall
+        # back to the sidecar's recorded version for a pre-ack server.
+        ack_ver = resp.get("version") if isinstance(resp, dict) else None
+        ack_md5 = resp.get("contents_md5") if isinstance(resp, dict) else None
+        if ack_ver is None:
+            saved_ver = vof_cache.saved_version(resolved)
+            ack_ver = saved_ver if saved_ver is not None else _VOF_RELOAD_BASE_VERSION
+        self._open_docs[uri] = int(ack_ver)
+        import hashlib as _hashlib
+
+        want_md5 = _hashlib.md5(
+            content.encode("utf-8", errors="surrogateescape")
+        ).hexdigest()
+        mode = "exact" if (ack_md5 is not None and ack_md5 == want_md5) else "stale"
         if mode == "exact":
             self._last_content[uri] = content
         else:
-            # Stale snapshot: hand coq-lsp the current text.  The didChange
-            # (at saved version + 1) makes bump_version retain the common
-            # prefix and re-elaborate only from the first difference; it also
-            # drops any cached _doc_state, so the snapshot's diagnostics can
-            # never answer for the new content (the stale-green class).
+            # The snapshot embeds different text (or the server predates the
+            # ack payload): hand coq-lsp the current text.  The didChange
+            # (at ack version + 1) makes bump_version retain the common
+            # prefix -- compared against the snapshot's OWN embedded
+            # contents, so this path is self-validating -- and re-elaborate
+            # only from the first difference; it also drops any cached
+            # _doc_state, so the snapshot's diagnostics can never answer for
+            # the new content (the stale-green class).
             self._sync_document(uri, content)
         dlog.event(
             "vof", "load.hit", file=resolved, uri=uri, mode=mode,
@@ -1421,6 +1440,24 @@ class LspChecker:
                 self._sync_document(uri, content)
         else:
             self._sync_document(uri, content)
+        # Arm the crash-durable sidecar for THIS check's periodic
+        # checkpoints: the marshal child renames each snapshot into place
+        # itself, so it can outlive a watchdog kill -- but a
+        # notification-driven sidecar cannot.  Environment fingerprint only
+        # (coqdep runs off-thread; content identity comes from the loadVof
+        # ack at load time), skipped when a valid FULL snapshot already
+        # owns the sidecar, and AFTER the load/sync decision above so the
+        # write can never race this call's own meta read.
+        from rocq_mcp import vof_cache as _vc
+
+        if from_disk and _vc.enabled() and ROCQ_VOF_CHECKPOINT_S > 0:
+            threading.Thread(
+                target=_vc.record_env,
+                args=(resolved, self._workspace),
+                kwargs={"version": self._open_docs.get(uri, 1)},
+                name="vof-env-meta",
+                daemon=True,
+            ).start()
         settled, _, budget_hit = self._drive_barrier_locked(
             uri,
             len(content.splitlines()),

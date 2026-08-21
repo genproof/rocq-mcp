@@ -467,6 +467,81 @@ class TestAsyncCheckpoint:
             c.stop()
 
     @pytest.mark.slow
+    def test_checkpoint_inside_a_proof_resumes(self, tmp_path, monkeypatch):
+        """A checkpoint taken BETWEEN TACTICS of one long proof must resume
+        correctly: bullets and tactics only parse in proof mode, so a
+        snapshot that resumes from the wrong state (or the wrong node
+        order) dies with "illegal begin of vernac" -- exactly how the
+        liblzma lz_decoder drill failed before the node-order fix.  This is
+        the shape of every real VST proof."""
+        monkeypatch.setattr(lsp_checker_mod, "ROCQ_VOF_CHECKPOINT_S", 0.5)
+        # One Theorem whose proof is a chain of tactic sentences, each doing
+        # its vm_compute inside a transient `let r := eval` (one evaluation,
+        # no residual VM casts in the term -- the `assert ... by
+        # (vm_compute; reflexivity)` shape turned out to have a wildly
+        # different cost profile).  The HEAVY sentence comes first so the
+        # checkpoint taken at its boundary covers the bulk; the cheap tail
+        # is what a recovery re-elaborates.
+        body = "".join(
+            f"  assert (b{i} : True) by "
+            f"(let r := eval vm_compute in (N.even (\n{_FIB} {a})) in "
+            f"exact I).\n"
+            for i, a in enumerate((38, 25, 26))
+        )
+        src = (
+            "From Coq Require Import NArith.\n"
+            "Theorem slow_chain : True.\n"
+            "Proof.\n" + body + "  exact I.\nQed.\n"
+        )
+        n_lines = src.count("\n")
+        f = _project(tmp_path, src)
+        c = LspChecker(workspace=str(tmp_path))
+        t = time.monotonic()
+        r = c.check_up_to(
+            f, n_lines - 2, 0, workspace=str(tmp_path), timeout=240.0
+        )
+        first = time.monotonic() - t
+        assert r["success"] is True, r
+        # At least one checkpoint fires at a boundary at-or-after the heavy
+        # sentence (the first tick only arms the clock, so with a fast
+        # Require the single event IS the post-heavy one; on a slow spawn an
+        # earlier one may precede it).  The LAST checkpoint on disk always
+        # covers the heavy sentence -- wait for the first event, then give a
+        # possible later reap a moment to land.
+        c.goals(f, 1, 0)
+        assert c.wait_vof_saved(1, timeout=15), (
+            "no checkpoint fired inside the proof"
+        )
+        c.goals(f, 1, 0)
+        time.sleep(1.0)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if vc.load_mode(f, str(tmp_path)) is not None:
+                break
+            time.sleep(0.05)
+        c.force_kill()
+        c.stop()
+        assert vc.load_mode(f, str(tmp_path)) == "exact"
+        meta = vc._read_meta(f)
+        assert meta is not None and meta.get("partial") is True
+
+        c2 = LspChecker(workspace=str(tmp_path))
+        t = time.monotonic()
+        r2 = c2.check_up_to(
+            f, n_lines - 2, 0, workspace=str(tmp_path), timeout=240.0
+        )
+        recovery = time.monotonic() - t
+        c2.stop()
+        assert r2["success"] is True, (
+            f"resume from a mid-proof checkpoint failed: "
+            f"{[str(e.get('message'))[:120] for e in _errors(r2)]}"
+        )
+        assert recovery < first / 2, (
+            f"recovery {recovery:.2f}s not < half of {first:.2f}s -- the "
+            f"mid-proof checkpoint was not used"
+        )
+
+    @pytest.mark.slow
     def test_crash_recovery_from_periodic_checkpoint(self, tmp_path, monkeypatch):
         """The requirement end to end: checkpoints fire during a long check;
         the session is killed (as a watchdog would); a FRESH session
@@ -476,11 +551,24 @@ class TestAsyncCheckpoint:
         # already covers the bulk of the work, so what the recovery pays is
         # only the cheap tail.  (Checkpoints snapshot completed sentences --
         # a kill always loses the sentence in flight, so the fixture must
-        # put the value in the *checkpointed* prefix.)
-        f = _project(tmp_path, _src(args=(35, 30)))
+        # put the value in the *checkpointed* prefix.)  The tail REFERENCES
+        # the prefix's definitions: a resume from the wrong state (the
+        # marshaled-node-order regression, caught on liblzma) then fails
+        # loudly instead of succeeding by accident on independent sentences.
+        f = _project(
+            tmp_path,
+            _src(
+                args=(35, 30),
+                tail=(
+                    "Definition sum_all : bool := xorb e35 e30.\n"
+                    "Theorem tail : sum_all = sum_all.\n"
+                    "Proof. reflexivity. Qed.\n"
+                ),
+            ),
+        )
         c = LspChecker(workspace=str(tmp_path))
         t = time.monotonic()
-        r = c.check_up_to(f, _tail_line(2), 0, workspace=str(tmp_path))
+        r = c.check_up_to(f, _tail_line(2) + 1, 0, workspace=str(tmp_path))
         first = time.monotonic() - t
         assert r["success"] is True
         # Reap + sidecar, then the kill (the snapshot must already be on
@@ -500,7 +588,7 @@ class TestAsyncCheckpoint:
 
         c2 = LspChecker(workspace=str(tmp_path))
         t = time.monotonic()
-        r2 = c2.check_up_to(f, _tail_line(2), 0, workspace=str(tmp_path))
+        r2 = c2.check_up_to(f, _tail_line(2) + 1, 0, workspace=str(tmp_path))
         recovery = time.monotonic() - t
         c2.stop()
         assert r2["success"] is True
@@ -601,6 +689,181 @@ class TestKillRecoveryDrill:
         finally:
             from tests.conftest import stop_all_checkers
 
+            stop_all_checkers(state)
+
+
+# ---------------------------------------------------------------------------
+# The agent-loop scenarios, through the server tools
+# ---------------------------------------------------------------------------
+
+
+def _slow_defs(args):
+    """Top-level slow sentences; each definition consumes the previous one so
+    a resume from a wrong state cannot silently succeed.
+
+    ``Eval vm_compute in`` is what makes them slow: a plain Definition body
+    is only typechecked, never evaluated -- without it the whole "expensive
+    prefix" elaborates in milliseconds and no checkpoint interval ever
+    elapses (the way this fixture's first version silently tested nothing).
+    """
+    out = []
+    for i, a in enumerate(args):
+        dep = f"xorb d{i - 1} " if i > 0 else ""
+        out.append(
+            f"Definition d{i} : bool := Eval vm_compute in {dep}(N.even (\n"
+            f"{_FIB} {a})).\n"
+        )
+    return "From Coq Require Import NArith.\n" + "".join(out)
+
+
+class _Ctx:
+    def __init__(self, state):
+        self.lifespan_context = state
+
+
+@_needs
+class TestAgentLoopScenarios:
+    """The two flows an agent actually hits, end to end through the tools."""
+
+    @pytest.mark.slow
+    @pytest.mark.asyncio
+    async def test_get_state_after_external_kill_is_fast(
+        self, tmp_path, monkeypatch
+    ):
+        """compile_lsp to line N; coq-lsp dies (external SIGKILL -- OOM
+        killer, operator); rocq_get_state at N+1 must answer FAST from the
+        periodic checkpoint, with the correct goal, instead of re-elaborating
+        the prefix."""
+        import os as _os
+        import signal as _signal
+
+        import rocq_mcp.server as _server
+        from tests.conftest import make_lifespan_state, stop_all_checkers
+
+        monkeypatch.setattr(lsp_checker_mod, "ROCQ_VOF_CHECKPOINT_S", 1.0)
+        # ~7s of dependent defs, then a proof to inspect.
+        src = _slow_defs((34, 35)) + (
+            "Theorem t : d1 = d1.\n"   # line N = 5
+            "Proof.\n"                  # line N+1 = 6
+            "reflexivity.\nQed.\n"
+        )
+        f = _project(tmp_path, src)
+        state = make_lifespan_state(full=True)
+        ctx = _Ctx(state)
+        key = _server._session_key(str(tmp_path), f)
+        try:
+            t = time.monotonic()
+            r = await _server.rocq_compile_lsp(
+                file_path=f, workspace=str(tmp_path), line=5, ctx=ctx
+            )
+            first = time.monotonic() - t
+            assert r["success"] is True, r
+            # Let the last checkpoint's reap + sidecar land, then the kill.
+            checker = state["lsp_pool"][key]
+            checker.goals(f, 0, 0)
+            assert checker.wait_vof_saved(1, timeout=15)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if vc.load_mode(f, str(tmp_path)) is not None:
+                    break
+                time.sleep(0.05)
+            _os.kill(checker._process.pid, _signal.SIGKILL)
+
+            g = await _server.rocq_get_state(
+                file_path=f, workspace=str(tmp_path), line=6, character=0,
+                ctx=ctx,
+            )
+            if g.get("success") is not True:
+                # Signal delivery can race the liveness check: the first call
+                # may land on the dying process and report the crash (that IS
+                # the tool's contract -- crashed + respawn-on-next-call).
+                # The agent's retry is what must be fast.
+                assert g.get("reason") == "crashed", g
+            t = time.monotonic()
+            g = await _server.rocq_get_state(
+                file_path=f, workspace=str(tmp_path), line=6, character=0,
+                ctx=ctx,
+            )
+            got = time.monotonic() - t
+            assert g["success"] is True, g
+            assert g["in_proof"] is True
+            assert g["goals"] and g["goals"][0]["conclusion"] == "d1 = d1", g
+            assert got < first / 2, (
+                f"get_state after the kill took {got:.2f}s, not < half of "
+                f"the {first:.2f}s check -- the checkpoint was not used"
+            )
+        finally:
+            stop_all_checkers(state)
+
+    @pytest.mark.slow
+    @pytest.mark.asyncio
+    async def test_watchdog_kill_then_fix_then_get_state(
+        self, tmp_path, monkeypatch
+    ):
+        """The full production loop: a diverging NON-COOPERATIVE tactic in
+        the middle of the file wedges the check; the MCP's own stall
+        watchdog kills the session; the agent removes the bad tactic and
+        asks for the goals right after that point -- served fast via the
+        periodic checkpoint + STALE load (the file changed!), with only the
+        edited region re-elaborated."""
+        import rocq_mcp.server as _server
+        from tests.conftest import make_lifespan_state, stop_all_checkers
+
+        monkeypatch.setattr(lsp_checker_mod, "ROCQ_VOF_CHECKPOINT_S", 1.0)
+        monkeypatch.setattr(_server, "ROCQ_PROGRESS_GRACE", 2.0)
+
+        prefix = _slow_defs((34, 35))          # ~7s of dependent work
+        n_pref = prefix.count("\n")
+        good_mid = "Theorem mid : d1 = d1.\nProof.\nreflexivity.\nQed.\n"
+        # Non-cooperative divergence in a PLAIN sentence: vm_compute of an
+        # exponential Fixpoint ignores the polled interrupt, and -- unlike
+        # the exact_no_check/Qed recipe -- is not shielded by the stall
+        # watchdog's deliberate Qed exemption (a diverging Qed is honest
+        # kernel work and is never killed; a diverging Definition is).
+        bad_mid = (
+            "Fixpoint wedge (n : nat) : nat :=\n"
+            "  match n with 0 => 0 | S k => wedge k + wedge k end.\n"
+            "Definition boom : nat := Eval vm_compute in (wedge 45).\n"
+        )
+        tail = "Theorem after : True.\nProof. exact I. Qed.\n"
+
+        f = _project(tmp_path, prefix + bad_mid + tail)
+        state = make_lifespan_state(full=True)
+        ctx = _Ctx(state)
+        try:
+            t = time.monotonic()
+            r = await _server.rocq_compile_lsp(
+                file_path=f, workspace=str(tmp_path),
+                sentence_timeout=1.0, ctx=ctx,
+            )
+            wedged = time.monotonic() - t
+            assert r["success"] is False
+            assert r.get("reason") in ("stall_timeout", "hard_timeout"), r.get(
+                "reason"
+            )
+            assert r.get("lsp_restarted") is True
+
+            # The agent fixes the file: the diverging theorem is removed.
+            Path(f).write_text(prefix + good_mid + tail)
+            assert vc.load_mode(f, str(tmp_path)) == "stale"
+
+            t = time.monotonic()
+            g = await _server.rocq_get_state(
+                file_path=f, workspace=str(tmp_path),
+                line=n_pref + 1, character=0, ctx=ctx,
+            )
+            got = time.monotonic() - t
+            assert g["success"] is True, g
+            assert g["in_proof"] is True
+            assert g["goals"] and g["goals"][0]["conclusion"] == "d1 = d1", g
+            # The expensive prefix must come from the checkpoint via the
+            # stale load, not be re-elaborated: well under the wedged run's
+            # elaboration time (which included the full prefix).
+            assert got < wedged / 2, (
+                f"get_state after the fix took {got:.2f}s (wedged run "
+                f"{wedged:.2f}s) -- the checkpoint + stale load was not used"
+            )
+        finally:
             stop_all_checkers(state)
 
 

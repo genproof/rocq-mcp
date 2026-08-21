@@ -134,6 +134,19 @@ def _dep_fingerprint(resolved_file: str, workspace: str) -> list:
     return sorted(fp)
 
 
+def _write_meta(resolved_file: str, meta: dict) -> None:
+    """Atomically replace the sidecar (tmp + rename): a concurrent reader
+    must never see a torn JSON -- a torn read demotes a valid cache to a
+    cold check."""
+    path = _meta_path(resolved_file)
+    tmp = path + ".tmp"
+    try:
+        Path(tmp).write_text(json.dumps(meta))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def record(
     resolved_file: str, workspace: str, version: int = 1, partial: bool = False
 ) -> None:
@@ -160,10 +173,38 @@ def record(
         # save.
         "partial": bool(partial),
     }
-    try:
-        Path(_meta_path(resolved_file)).write_text(json.dumps(meta))
-    except OSError:
-        pass
+    _write_meta(resolved_file, meta)
+
+
+def record_env(resolved_file: str, workspace: str, *, version: int) -> None:
+    """Write the sidecar at CHECK START, before any checkpoint exists.
+
+    A checkpoint completed during a wedged run is renamed into place by the
+    marshal child itself, but the ``$/coq/vofSaved`` notification (and hence
+    a notification-driven sidecar) dies with the killed server -- exactly in
+    the scenario checkpoints exist for.  So the environment fingerprint
+    (toolchain + dependency ``.vo``s, which is what the client actually
+    knows) is recorded up front; the snapshot's own content identity comes
+    from the ``coq/loadVof`` ack at load time, which reads it from the
+    unmarshaled document itself.  ``content_md5`` here describes the text
+    being checked -- correct for any checkpoint this check produces --
+    and ``partial: True`` because mid-check snapshots are prefixes.
+    Best-effort.
+    """
+    if is_valid(resolved_file, workspace):
+        # A FULL snapshot for exactly this content is on disk: its sidecar
+        # is strictly better than an env stamp, and overwriting it with
+        # ``partial: True`` would both defeat the save-skip check (forcing
+        # a gratuitous ~1x-RSS re-marshal) and demote the warm-start.
+        return
+    meta = {
+        "content_md5": _file_md5(resolved_file),
+        "toolchain": toolchain_id(),
+        "deps": _dep_fingerprint(resolved_file, workspace),
+        "version": int(version),
+        "partial": True,
+    }
+    _write_meta(resolved_file, meta)
 
 
 def record_snapshot(
@@ -187,10 +228,7 @@ def record_snapshot(
         "version": int(version),
         "partial": True,
     }
-    try:
-        Path(_meta_path(resolved_file)).write_text(json.dumps(meta))
-    except OSError:
-        pass
+    _write_meta(resolved_file, meta)
 
 
 def saved_version(resolved_file: str) -> int | None:
