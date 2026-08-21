@@ -70,6 +70,18 @@ _SHUTDOWN_TIMEOUT: float = 5.0
 # ``coq/saveVo`` (writing the compiled library is the same order of work).
 _VOF_SAVE_TIMEOUT: float = float(os.environ.get("ROCQ_VOF_SAVE_TIMEOUT", "300"))
 
+# Interval (seconds) between asynchronous .vof checkpoints of the document
+# being checked, taken by the genproof fork's Doc.Checkpoint machinery: the
+# checking loop periodically forks a child that marshals the PARTIAL document
+# (Stopped at the current frontier) to <file>.vof while elaboration
+# continues, and announces the outcome via $/coq/vofSaved.  A later session
+# can then warm-start from the last checkpoint after a watchdog kill instead
+# of re-elaborating from sentence one.  0 disables.  Sent with the per-check
+# didChangeConfiguration (same posture as sentence_timeout: a stock coq-lsp
+# rejects the whole settings object, which is logged server-side and leaves
+# the initialize-time settings in force).
+ROCQ_VOF_CHECKPOINT_S: float = float(os.environ.get("ROCQ_VOF_CHECKPOINT_S", "300"))
+
 # Version baseline for a reloaded ``.vof`` whose sidecar predates the recorded
 # save-time version (no ``version`` field).  coq-lsp ignores a didChange whose
 # version is not strictly greater than the reloaded snapshot's, so we start
@@ -491,6 +503,9 @@ class LspChecker:
         # option, on by default).  Captured for :meth:`profile`; cleared per
         # (re)start alongside _doc_state.
         self._perf_data: dict[str, dict[str, Any]] = {}
+        # $/coq/vofSaved notifications observed this incarnation (async
+        # checkpoint outcomes; see _handle_vof_saved).  Guarded by _cv.
+        self._vof_saved: list[dict[str, Any]] = []
         # Latest $/coq/serverStatus status string ("Busy"/"Idle"/"Stopped").
         self._status: str = "Idle"
         # Latest $/coq/fileProgress frontier: (monotonic_time, line, char) or
@@ -540,6 +555,7 @@ class LspChecker:
             self._abandoned.clear()
             self._doc_state.clear()
             self._perf_data.clear()
+            self._vof_saved.clear()
             self._status = "Idle"
             self._last_progress = None
             self._saw_busy = False
@@ -942,10 +958,19 @@ class LspChecker:
             # version, which we track in _open_docs.  Capture it under the lock
             # so a reloading session can resume numbering above it.
             version = self._open_docs[uri]
+        # The fork reports whether the marshaled document was PARTIAL (a
+        # Stopped doc -- e.g. a positioned check's prefix); the sidecar must
+        # record that honestly so the save-skip check (is_valid) never lets
+        # a partial snapshot suppress a later full save.
+        partial = bool(isinstance(resp, dict) and resp.get("partial"))
         # Record the fingerprint outside the lock (pure filesystem work).
-        vof_cache.record(resolved, self._workspace, version)
-        dlog.event("vof", "save.ok", file=resolved)
-        return {"saved": True, "vof_file": vof_cache.vof_path(resolved)}
+        vof_cache.record(resolved, self._workspace, version, partial=partial)
+        dlog.event("vof", "save.ok", file=resolved, partial=partial)
+        return {
+            "saved": True,
+            "vof_file": vof_cache.vof_path(resolved),
+            "partial": partial,
+        }
 
     def save_vo(self, file_path: str) -> dict[str, Any]:
         """Compile the open, completed document to a real Coq ``<file>.vo``.
@@ -984,6 +1009,44 @@ class LspChecker:
         dlog.event("vo", "save.ok", file=resolved, vo=vo_file)
         return {"saved": True, "vo_file": vo_file}
 
+    def _record_checkpoint_meta(
+        self, uri: str, version: Any, contents_md5: str
+    ) -> None:
+        """Write the ``.vof.meta`` sidecar for an async checkpoint (worker
+        thread; best-effort)."""
+        try:
+            from urllib.parse import unquote, urlparse
+
+            from rocq_mcp import vof_cache
+
+            resolved = unquote(urlparse(uri).path)
+            vof_cache.record_snapshot(
+                resolved,
+                self._workspace,
+                version=int(version) if version is not None else 1,
+                content_md5=contents_md5,
+            )
+        except Exception:
+            pass
+
+    def vof_saved_events(self) -> list[dict[str, Any]]:
+        """Async-checkpoint outcomes observed this incarnation (thread-safe
+        snapshot)."""
+        with self._cv:
+            return list(self._vof_saved)
+
+    def wait_vof_saved(self, count: int = 1, timeout: float = 10.0) -> bool:
+        """Block until at least *count* ``$/coq/vofSaved`` notifications have
+        arrived (or the session dies / *timeout* expires)."""
+        deadline = time.monotonic() + timeout
+        with self._cv:
+            while len(self._vof_saved) < count and not self._dead:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self._cv.wait(timeout=min(left, 0.5))
+            return len(self._vof_saved) >= count
+
     def _try_load_vof(
         self, uri: str, file_path: str | None, content: str
     ) -> bool:
@@ -1005,16 +1068,31 @@ class LspChecker:
         notification form) we return ``False`` and the caller falls back to
         a cold ``didOpen``.
 
-        Only fires when *content* matches the on-disk file the snapshot was
-        taken from (``vof_cache.is_valid`` hashes that file), so the warm
-        state and the document text agree exactly.
+        Two load modes (``vof_cache.load_mode``):
+
+        - **exact**: the snapshot embeds exactly *content*.  Reload as-is;
+          a *partial* snapshot (async checkpoint / positioned-check save,
+          ``Stopped`` at its frontier) then resumes checking on the next
+          request past the stop point.
+        - **stale**: the snapshot is sound (toolchain + every dependency
+          ``.vo`` unchanged) but embeds *different* text -- e.g. the agent
+          edited the file after the snapshot.  Reload it, then immediately
+          ``didChange`` to *content*: Fleche's ``bump_version`` retains
+          every node before the first textual difference and re-elaborates
+          only from there, so an edit near the bottom of a heavy file keeps
+          almost the whole elaborated prefix.
+
+        Never fires when the toolchain or a dependency ``.vo`` changed --
+        the marshaled states embed the old library, so such a snapshot is
+        not sound under ANY content.
         """
         if file_path is None:
             return False
         from rocq_mcp import vof_cache
 
         resolved = str(Path(file_path).resolve())
-        if not vof_cache.is_valid(resolved, self._workspace):
+        mode = vof_cache.load_mode(resolved, self._workspace, content)
+        if mode is None:
             dlog.event("vof", "load.miss", file=resolved)
             return False
         with self._cv:
@@ -1042,8 +1120,19 @@ class LspChecker:
         # that any plausible saved version is exceeded.
         saved_ver = vof_cache.saved_version(resolved)
         self._open_docs[uri] = saved_ver if saved_ver is not None else _VOF_RELOAD_BASE_VERSION
-        self._last_content[uri] = content
-        dlog.event("vof", "load.hit", file=resolved, uri=uri, base=self._open_docs[uri])
+        if mode == "exact":
+            self._last_content[uri] = content
+        else:
+            # Stale snapshot: hand coq-lsp the current text.  The didChange
+            # (at saved version + 1) makes bump_version retain the common
+            # prefix and re-elaborate only from the first difference; it also
+            # drops any cached _doc_state, so the snapshot's diagnostics can
+            # never answer for the new content (the stale-green class).
+            self._sync_document(uri, content)
+        dlog.event(
+            "vof", "load.hit", file=resolved, uri=uri, mode=mode,
+            base=self._open_docs[uri],
+        )
         return True
 
     # ------------------------------------------------------------------
@@ -1402,6 +1491,13 @@ class LspChecker:
         settings: dict[str, Any] = {**_BASE_SETTINGS, "max_errors": n}
         if sentence_timeout > 0:
             settings["sentence_timeout"] = sentence_timeout
+        # Arm the fork's periodic async .vof checkpointing (see
+        # ROCQ_VOF_CHECKPOINT_S above).  Gated on the cache being enabled:
+        # with ROCQ_VOF_CACHE=0 nothing may write .vof files.
+        from rocq_mcp import vof_cache as _vc
+
+        if ROCQ_VOF_CHECKPOINT_S > 0 and _vc.enabled():
+            settings["vof_checkpoint_interval"] = ROCQ_VOF_CHECKPOINT_S
         self._notify(
             "workspace/didChangeConfiguration", {"settings": settings}
         )
@@ -2162,6 +2258,41 @@ class LspChecker:
                 line=frontier[0] if frontier else None,
                 character=frontier[1] if frontier else None,
             )
+        elif method == "$/coq/vofSaved":
+            # Outcome of an asynchronous periodic .vof checkpoint (the fork's
+            # Doc.Checkpoint).  On success, record the cache sidecar so a
+            # later session can validate and warm-start from the snapshot.
+            # The content id comes from the notification (md5 of the
+            # Contents.raw the snapshot embeds) -- hashing the on-disk file
+            # here would race edits made while the child was marshaling.
+            params = msg.get("params", {})
+            td = params.get("textDocument") or {}
+            uri = td.get("uri")
+            event = {
+                "uri": uri,
+                "version": td.get("version"),
+                "contents_md5": params.get("contents_md5"),
+                "error": params.get("error"),
+            }
+            with self._cv:
+                self._vof_saved.append(event)
+                self._cv.notify_all()
+            dlog.event(
+                "vof", "checkpoint.saved" if event["error"] is None
+                else "checkpoint.failed",
+                uri=uri, version=event["version"],
+                error=dlog.blob(event["error"]) if event["error"] else None,
+            )
+            if event["error"] is None and uri and event["contents_md5"]:
+                # Meta write off the reader thread: the dependency
+                # fingerprint runs coqdep, which must never stall message
+                # routing.  Rare (one per checkpoint interval).
+                threading.Thread(
+                    target=self._record_checkpoint_meta,
+                    args=(uri, event["version"], event["contents_md5"]),
+                    name="vof-meta",
+                    daemon=True,
+                ).start()
         elif method == "$/coq/filePerfData":
             # Per-sentence timing / memory data coq-lsp emits when a document
             # finishes checking (its send_perf_data option, on by default).

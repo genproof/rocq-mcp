@@ -75,6 +75,42 @@ def _file_sha(path: str) -> str | None:
         return None
 
 
+def _file_md5(path: str) -> str | None:
+    """MD5 of *path* -- the content id the coq-lsp fork's ``$/coq/vofSaved``
+    notification carries (OCaml's stdlib ``Digest``), so async-checkpoint
+    sidecars and on-disk files can be compared without the fork learning
+    sha256."""
+    try:
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _meta_matches_content(meta: dict, resolved_file: str, content: str | None) -> bool:
+    """Whether *content* (or the on-disk file when ``None``) is the exact text
+    the snapshot embeds, per whichever content id the sidecar carries
+    (``content_md5`` from an async checkpoint, ``content_sha`` from a
+    synchronous save -- both for new sidecars)."""
+    md5 = meta.get("content_md5")
+    sha = meta.get("content_sha")
+    if content is not None:
+        data = content.encode("utf-8", errors="surrogateescape")
+        if md5 is not None:
+            return hashlib.md5(data).hexdigest() == md5
+        if sha is not None:
+            return hashlib.sha256(data).hexdigest() == sha
+        return False
+    if md5 is not None:
+        return _file_md5(resolved_file) == md5
+    if sha is not None:
+        return _file_sha(resolved_file) == sha
+    return False
+
+
 def _dep_fingerprint(resolved_file: str, workspace: str) -> list:
     """A stable fingerprint of the file's compiled dependencies.
 
@@ -98,7 +134,9 @@ def _dep_fingerprint(resolved_file: str, workspace: str) -> list:
     return sorted(fp)
 
 
-def record(resolved_file: str, workspace: str, version: int = 1) -> None:
+def record(
+    resolved_file: str, workspace: str, version: int = 1, partial: bool = False
+) -> None:
     """Write the sidecar meta after a successful ``coq/saveVof``.
 
     Captures the content hash, toolchain id, and dependency fingerprint so
@@ -111,9 +149,43 @@ def record(resolved_file: str, workspace: str, version: int = 1) -> None:
     """
     meta = {
         "content_sha": _file_sha(resolved_file),
+        "content_md5": _file_md5(resolved_file),
         "toolchain": toolchain_id(),
         "deps": _dep_fingerprint(resolved_file, workspace),
         "version": int(version),
+        # Whether the snapshot is a Stopped (partial) document -- reported
+        # by the fork in the saveVof response.  Matters for the save-skip
+        # logic (``is_valid``): a partial snapshot is loadable (checking
+        # resumes at its frontier) but must never suppress a later full
+        # save.
+        "partial": bool(partial),
+    }
+    try:
+        Path(_meta_path(resolved_file)).write_text(json.dumps(meta))
+    except OSError:
+        pass
+
+
+def record_snapshot(
+    resolved_file: str, workspace: str, *, version: int, content_md5: str
+) -> None:
+    """Write the sidecar for an **asynchronous periodic checkpoint**.
+
+    Triggered by the fork's ``$/coq/vofSaved`` notification.  Unlike
+    :func:`record`, the content id comes from the notification (the md5 of
+    the ``Contents.raw`` the snapshot embeds), NOT from hashing the on-disk
+    file -- the file may have been edited while the child was marshaling.
+    Marked ``partial: True``: the snapshot is ``Stopped`` at whatever
+    frontier checking had reached, so it is loadable (a request past the
+    stop point resumes) but must not satisfy the save-skip check.
+    Best-effort.
+    """
+    meta = {
+        "content_md5": content_md5,
+        "toolchain": toolchain_id(),
+        "deps": _dep_fingerprint(resolved_file, workspace),
+        "version": int(version),
+        "partial": True,
     }
     try:
         Path(_meta_path(resolved_file)).write_text(json.dumps(meta))
@@ -148,14 +220,51 @@ def is_valid(resolved_file: str, workspace: str) -> bool:
     """
     if not enabled():
         return False
-    if not os.path.isfile(vof_path(resolved_file)):
-        return False
-    try:
-        meta = json.loads(Path(_meta_path(resolved_file)).read_text())
-    except (OSError, ValueError):
+    meta = _read_meta(resolved_file)
+    if meta is None:
         return False
     return (
-        meta.get("content_sha") == _file_sha(resolved_file)
+        not meta.get("partial", False)
+        and _meta_matches_content(meta, resolved_file, None)
         and meta.get("toolchain") == toolchain_id()
         and meta.get("deps") == _dep_fingerprint(resolved_file, workspace)
     )
+
+
+def _read_meta(resolved_file: str) -> dict | None:
+    if not os.path.isfile(vof_path(resolved_file)):
+        return None
+    try:
+        meta = json.loads(Path(_meta_path(resolved_file)).read_text())
+    except (OSError, ValueError):
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def load_mode(
+    resolved_file: str, workspace: str, content: str | None = None
+) -> str | None:
+    """How (whether) the snapshot can warm-start a session for *content*.
+
+    - ``"exact"``: the snapshot embeds exactly *content* (or the on-disk
+      file when ``None``).  Reload as-is; a *partial* snapshot then resumes
+      checking from its frontier on the next request past it.
+    - ``"stale"``: the snapshot is sound (toolchain and every dependency
+      ``.vo`` unchanged) but embeds *different* text.  Reload it and send a
+      ``didChange`` with the current text: Fleche's ``bump_version`` retains
+      every node before the first textual difference and re-elaborates only
+      from there -- the "discard what the edit invalidated" load.
+    - ``None``: no usable snapshot (missing, toolchain rebuilt, or a
+      dependency ``.vo`` changed -- the marshaled states embed the old
+      library, so a stale-dep snapshot is never sound).
+    """
+    if not enabled():
+        return None
+    meta = _read_meta(resolved_file)
+    if meta is None:
+        return None
+    if meta.get("toolchain") != toolchain_id():
+        return None
+    if meta.get("deps") != _dep_fingerprint(resolved_file, workspace):
+        return None
+    return "exact" if _meta_matches_content(meta, resolved_file, content) else "stale"

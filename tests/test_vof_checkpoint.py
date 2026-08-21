@@ -1,0 +1,515 @@
+"""Asynchronous periodic ``.vof`` checkpointing + partial/stale loading.
+
+The two requirements this covers (genproof/rocq-lsp ``Doc.Checkpoint`` +
+the client machinery in :mod:`rocq_mcp.vof_cache` / ``LspChecker``):
+
+1. **Periodic async saves** (``ROCQ_VOF_CHECKPOINT_S``): while a document
+   is being checked, coq-lsp forks a child every N seconds that marshals
+   the *partial* document (``Stopped`` at the current frontier) to
+   ``<file>.vof`` -- WITHOUT blocking elaboration or request serving.  The
+   outcome arrives as a ``$/coq/vofSaved`` notification, on which the
+   client records the ``.vof.meta`` sidecar.
+
+2. **Partial + stale loading**: a snapshot of an uncompleted document is
+   loadable (checking resumes from its frontier on the next request past
+   it), and a snapshot of *different* text is loadable when the toolchain
+   and dependencies are unchanged -- the client reloads it and sends a
+   ``didChange`` with the current text, so Fleche retains every node
+   before the first textual difference and re-elaborates only the rest.
+
+Wall-clock assertions use the same posture as test_vof_cache: an
+expensive ``vm_compute`` prefix and a `` < cold / 2`` bound, wide enough
+for CI noise while far below a full re-elaboration.
+"""
+
+from __future__ import annotations
+
+import shutil
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+import rocq_mcp.lsp_checker as lsp_checker_mod
+from rocq_mcp import vof_cache as vc
+from rocq_mcp.lsp_checker import LspChecker
+
+COQLSP = shutil.which("coq-lsp") is not None
+_needs = pytest.mark.skipif(not COQLSP, reason="coq-lsp not available")
+
+# ---------------------------------------------------------------------------
+# Fixture source: a multi-second vm_compute prefix and a cheap tail.
+# ---------------------------------------------------------------------------
+
+_FIB = (
+    "  (fix f (k:nat):N := match k with 0=>0%N|S m=>match m with 0=>1%N"
+    "|S j=>(f j+f m)%N end end)"
+)
+
+
+def _src(args=(33, 34, 35), tail="Theorem tail : True.\nProof. exact I. Qed.\n"):
+    defs = "".join(
+        f"Definition e{a} : bool := Eval vm_compute in N.even (\n{_FIB} {a}).\n"
+        for a in args
+    )
+    return "From Coq Require Import NArith.\n" + defs + tail
+
+
+# Line of "Theorem tail" for _src's default args: 1 header + 2 lines per def.
+def _tail_line(n_defs=3):
+    return 1 + 2 * n_defs
+
+
+def _project(tmp_path: Path, content: str, name: str = "Doc.v") -> str:
+    (tmp_path / "_CoqProject").write_text("-Q . Test\n")
+    f = tmp_path / name
+    f.write_text(content)
+    return str(f.resolve())
+
+
+def _errors(result: dict) -> list:
+    return result.get("errors") or []
+
+
+@pytest.fixture(autouse=True)
+def _no_auto_checkpoint(monkeypatch):
+    """Default the interval OFF for these tests; each test arms it
+    explicitly.  (The module default is 300 s -- effectively off for a
+    seconds-long test, but 0 keeps intent obvious.)"""
+    monkeypatch.setattr(lsp_checker_mod, "ROCQ_VOF_CHECKPOINT_S", 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Requirement 2a: partial snapshots (save a Stopped document, resume on load)
+# ---------------------------------------------------------------------------
+
+
+@_needs
+class TestPartialSnapshot:
+    def test_positioned_check_is_savable(self, tmp_path):
+        """The gate relax: ``coq/saveVof`` on a ``Stopped`` document (a
+        positioned check's prefix) succeeds and reports ``partial: True`` --
+        previously it errored with "Can't save document that failed to
+        check" / "Document is not ready"."""
+        f = _project(tmp_path, _src())
+        c = LspChecker(workspace=str(tmp_path))
+        try:
+            r = c.check_up_to(f, _tail_line(), 0, workspace=str(tmp_path))
+            assert r["success"] is True
+            sv = c.save_vof(f)
+            assert sv["saved"] is True, sv
+            assert sv["partial"] is True
+            assert (tmp_path / "Doc.vof").is_file()
+        finally:
+            c.stop()
+        # Honest sidecar: loadable, but NOT "valid" for the save-skip check
+        # (a partial snapshot must never suppress a later full save).
+        assert vc.load_mode(f, str(tmp_path)) == "exact"
+        assert vc.is_valid(f, str(tmp_path)) is False
+
+    @pytest.mark.slow
+    def test_fresh_session_resumes_from_partial(self, tmp_path):
+        """Loading a partial snapshot and driving to EOF re-elaborates ONLY
+        the un-snapshotted tail: the expensive prefix is skipped, and the
+        wall clock proves it."""
+        f = _project(tmp_path, _src())
+
+        # Cold reference (fresh file, no cache).
+        f_cold = _project(tmp_path, _src(), name="Cold.v")
+        c = LspChecker(workspace=str(tmp_path))
+        t = time.monotonic()
+        assert c.check_file(f_cold, str(tmp_path), 0.0)["success"] is True
+        cold = time.monotonic() - t
+        c.stop()
+
+        # Partial snapshot: prefix only (positioned check, then save).
+        c = LspChecker(workspace=str(tmp_path))
+        assert c.check_up_to(f, _tail_line(), 0, workspace=str(tmp_path))[
+            "success"
+        ]
+        assert c.save_vof(f)["saved"] is True
+        c.stop()
+
+        # Fresh session: full check resumes from the snapshot's frontier.
+        c2 = LspChecker(workspace=str(tmp_path))
+        t = time.monotonic()
+        r = c2.check_file(f, str(tmp_path), 0.0)
+        warm = time.monotonic() - t
+        c2.stop()
+        assert r["success"] is True
+        assert warm < cold / 2, (
+            f"resume from a partial snapshot took {warm:.2f}s, not < half of "
+            f"the cold check's {cold:.2f}s -- the prefix was re-elaborated"
+        )
+
+    def test_full_save_after_partial_is_not_skipped(self, tmp_path):
+        """A clean full check over a partial snapshot must RE-save (the
+        skip-if-valid logic sees ``partial`` and does not reuse)."""
+        f = _project(tmp_path, _src(args=(30,)))
+        c = LspChecker(workspace=str(tmp_path))
+        try:
+            c.check_up_to(f, _tail_line(1), 0, workspace=str(tmp_path))
+            assert c.save_vof(f)["partial"] is True
+            r = c.check_file(f, str(tmp_path), 0.0)
+            assert r["success"] is True
+            assert r.get("vof_saved") is True
+        finally:
+            c.stop()
+        meta = vc._read_meta(f)
+        assert meta is not None and meta.get("partial") is False
+        assert vc.is_valid(f, str(tmp_path)) is True
+
+
+# ---------------------------------------------------------------------------
+# Requirement 2b: stale loading (changed file; discard what the edit broke)
+# ---------------------------------------------------------------------------
+
+
+@_needs
+class TestStaleLoad:
+    def _snapshot(self, tmp_path, content, name="Doc.v"):
+        f = _project(tmp_path, content, name=name)
+        c = LspChecker(workspace=str(tmp_path))
+        r = c.check_file(f, str(tmp_path), 0.0)
+        assert r["success"] is True and r.get("vof_saved") is True
+        c.stop()
+        return f
+
+    @pytest.mark.slow
+    def test_tail_edit_keeps_prefix_and_reports_new_error(self, tmp_path):
+        """Edit AFTER the expensive prefix: the reload + didChange retains
+        the prefix (fast) and the edited tail's error is reported -- the
+        snapshot's clean diagnostics can never answer for the new text
+        (stale-green)."""
+        f = self._snapshot(tmp_path, _src())
+        cold = None  # cold reference on identical work
+        f_cold = _project(tmp_path, _src(), name="Cold.v")
+        c = LspChecker(workspace=str(tmp_path))
+        t = time.monotonic()
+        c.check_file(f_cold, str(tmp_path), 0.0)
+        cold = time.monotonic() - t
+        c.stop()
+
+        broken_tail = "Theorem tail : False.\nProof. exact I. Qed.\n"
+        Path(f).write_text(_src(tail=broken_tail))
+        assert vc.load_mode(f, str(tmp_path)) == "stale"
+
+        c2 = LspChecker(workspace=str(tmp_path))
+        t = time.monotonic()
+        r = c2.check_file(f, str(tmp_path), 0.0)
+        warm = time.monotonic() - t
+        c2.stop()
+
+        assert r["success"] is False
+        msgs = " ".join(str(e.get("message")) for e in _errors(r))
+        assert "True" in msgs and "False" in msgs, r
+        assert warm < cold / 2, (
+            f"stale-load recheck took {warm:.2f}s, not < half of the cold "
+            f"check's {cold:.2f}s -- the retained prefix was re-elaborated"
+        )
+
+    def test_prefix_edit_is_correct(self, tmp_path):
+        """Edit INSIDE the prefix: retention stops before the edit, so the
+        result equals a cold check (correctness over speed)."""
+        f = self._snapshot(tmp_path, _src(args=(30, 31)))
+        # Break the FIRST definition so everything after re-elaborates and
+        # a later sentence that uses it errors.
+        edited = _src(args=(30, 31)).replace(
+            "Definition e30 : bool :=",
+            "Definition e30 : nat :=",
+        )
+        Path(f).write_text(edited)
+        assert vc.load_mode(f, str(tmp_path)) == "stale"
+
+        c = LspChecker(workspace=str(tmp_path))
+        r = c.check_file(f, str(tmp_path), 0.0)
+        c.stop()
+        assert r["success"] is False
+        assert _errors(r), "the prefix edit's type error must be reported"
+
+    def test_dep_or_toolchain_change_disables_loading(self, tmp_path):
+        """A snapshot whose toolchain or dependency fingerprint no longer
+        matches is not loadable under ANY content -- the marshaled states
+        embed the old library."""
+        import json
+
+        f = self._snapshot(tmp_path, _src(args=(30,)))
+        meta_path = Path(vc._meta_path(f))
+        meta = json.loads(meta_path.read_text())
+
+        broken = dict(meta, toolchain="other-binary:0:0")
+        meta_path.write_text(json.dumps(broken))
+        assert vc.load_mode(f, str(tmp_path)) is None
+
+        broken = dict(meta, deps=[["/nonexistent.vo", 1, 1]])
+        meta_path.write_text(json.dumps(broken))
+        assert vc.load_mode(f, str(tmp_path)) is None
+
+        meta_path.write_text(json.dumps(meta))
+        assert vc.load_mode(f, str(tmp_path)) == "exact"
+
+
+# ---------------------------------------------------------------------------
+# Requirement 1: periodic asynchronous checkpoints
+# ---------------------------------------------------------------------------
+
+
+def _find_fork_child(c, result, timeout=30.0):
+    """The forked marshal child of *c*'s coq-lsp, or None (same pattern as
+    test_vof_cache's child-kill test)."""
+    import psutil
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        proc = c._process
+        if proc is not None:
+            try:
+                kids = psutil.Process(proc.pid).children()
+            except psutil.Error:
+                kids = []
+            if kids:
+                return kids[0]
+        if result:
+            return None
+        time.sleep(0.01)
+    return None
+
+
+@_needs
+class TestAsyncCheckpoint:
+    def test_checkpoints_fire_during_one_check(self, tmp_path, monkeypatch):
+        """A single positioned check with NO client traffic produces periodic
+        snapshots: $/coq/vofSaved arrives, the .vof exists, and the sidecar
+        makes it loadable.  No explicit save call anywhere."""
+        monkeypatch.setattr(lsp_checker_mod, "ROCQ_VOF_CHECKPOINT_S", 1.0)
+        f = _project(tmp_path, _src())
+        c = LspChecker(workspace=str(tmp_path))
+        try:
+            r = c.check_up_to(f, _tail_line(), 0, workspace=str(tmp_path))
+            assert r["success"] is True
+            # Nudge the server loop so a child that finished after the check
+            # is reaped (the reap runs per loop iteration).
+            c.goals(f, 1, 0)
+            assert c.wait_vof_saved(1, timeout=15), (
+                "no $/coq/vofSaved notification -- periodic checkpointing "
+                "did not fire during the check"
+            )
+            events = c.vof_saved_events()
+            assert all(e["error"] is None for e in events), events
+        finally:
+            c.stop()
+        assert (tmp_path / "Doc.vof").is_file()
+        # The reader thread wrote the sidecar (async; give it a moment).
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if vc.load_mode(f, str(tmp_path)) == "exact":
+                break
+            time.sleep(0.05)
+        assert vc.load_mode(f, str(tmp_path)) == "exact"
+        meta = vc._read_meta(f)
+        assert meta is not None and meta.get("partial") is True
+
+    def test_disabled_interval_takes_no_checkpoints(self, tmp_path):
+        """With the interval off (the autouse default), a positioned check
+        leaves no snapshot and no notification."""
+        f = _project(tmp_path, _src(args=(30, 31)))
+        c = LspChecker(workspace=str(tmp_path))
+        try:
+            c.check_up_to(f, _tail_line(2), 0, workspace=str(tmp_path))
+            c.goals(f, 1, 0)
+            assert c.wait_vof_saved(1, timeout=2) is False
+        finally:
+            c.stop()
+        assert not (tmp_path / "Doc.vof").exists()
+
+    @pytest.mark.slow
+    def test_checkpoint_does_not_block_elaboration(self, tmp_path, monkeypatch):
+        """THE async requirement: while the checkpoint child is alive (held
+        open by the delay hook), the parent's checking frontier keeps
+        advancing -- elaboration was not paused for the marshal."""
+        monkeypatch.setenv("COQ_LSP_VOF_CHILD_DELAY_S", "6")
+        monkeypatch.setattr(lsp_checker_mod, "ROCQ_VOF_CHECKPOINT_S", 0.5)
+        # Enough work after the first checkpoint that progress is observable
+        # while the child sleeps.
+        f = _project(tmp_path, _src(args=(30, 31, 32, 33, 34)))
+        c = LspChecker(workspace=str(tmp_path))
+        result: dict = {}
+        th = threading.Thread(
+            target=lambda: result.update(
+                c.check_up_to(f, _tail_line(5), 0, workspace=str(tmp_path))
+            )
+        )
+        th.start()
+        try:
+            child = _find_fork_child(c, result)
+            assert child is not None, "no checkpoint child appeared"
+            p1 = c.last_progress()
+            deadline = time.monotonic() + 10
+            advanced = False
+            while time.monotonic() < deadline and child.is_running():
+                time.sleep(0.3)
+                p2 = c.last_progress()
+                if p1 is not None and p2 is not None and p2[1:] > p1[1:]:
+                    advanced = True
+                    break
+                p1 = p2 or p1
+            assert advanced, (
+                "the checking frontier did not advance while the checkpoint "
+                "child was alive -- the marshal is blocking elaboration"
+            )
+            th.join(timeout=120)
+            assert not th.is_alive() and result.get("success") is True
+        finally:
+            th.join(timeout=120)
+            c.stop()
+
+    @pytest.mark.slow
+    def test_child_kill_mid_checkpoint_is_survivable(self, tmp_path, monkeypatch):
+        """SIGKILL the checkpoint child (what the OOM killer would do): the
+        check completes, the session keeps answering, a failure notification
+        names the signal, and no truncated snapshot is left behind."""
+        monkeypatch.setenv("COQ_LSP_VOF_CHILD_DELAY_S", "6")
+        monkeypatch.setattr(lsp_checker_mod, "ROCQ_VOF_CHECKPOINT_S", 0.5)
+        f = _project(tmp_path, _src(args=(30, 31, 32, 33)))
+        c = LspChecker(workspace=str(tmp_path))
+        result: dict = {}
+        th = threading.Thread(
+            target=lambda: result.update(
+                c.check_up_to(f, _tail_line(4), 0, workspace=str(tmp_path))
+            )
+        )
+        th.start()
+        try:
+            child = _find_fork_child(c, result)
+            assert child is not None, "no checkpoint child appeared"
+            child.kill()
+            th.join(timeout=120)
+            assert not th.is_alive() and result.get("success") is True
+            # Session alive; nudge the reap and collect the failure event.
+            g = c.goals(f, 1, 0)
+            assert "goals" in g or "error" not in g
+            assert c.wait_vof_saved(1, timeout=15)
+            failures = [
+                e for e in c.vof_saved_events() if e["error"] is not None
+            ]
+            assert failures, c.vof_saved_events()
+            assert "SIGKILL" in failures[0]["error"], failures[0]
+            assert not (tmp_path / "Doc.vof.tmp").exists()
+        finally:
+            th.join(timeout=120)
+            c.stop()
+
+    @pytest.mark.slow
+    def test_crash_recovery_from_periodic_checkpoint(self, tmp_path, monkeypatch):
+        """The requirement end to end: checkpoints fire during a long check;
+        the session is killed (as a watchdog would); a FRESH session
+        warm-starts from the last checkpoint instead of sentence one."""
+        monkeypatch.setattr(lsp_checker_mod, "ROCQ_VOF_CHECKPOINT_S", 0.7)
+        # Expensive definition FIRST: the checkpoint taken at its boundary
+        # already covers the bulk of the work, so what the recovery pays is
+        # only the cheap tail.  (Checkpoints snapshot completed sentences --
+        # a kill always loses the sentence in flight, so the fixture must
+        # put the value in the *checkpointed* prefix.)
+        f = _project(tmp_path, _src(args=(35, 30)))
+        c = LspChecker(workspace=str(tmp_path))
+        t = time.monotonic()
+        r = c.check_up_to(f, _tail_line(2), 0, workspace=str(tmp_path))
+        first = time.monotonic() - t
+        assert r["success"] is True
+        # Reap + sidecar, then the kill (the snapshot must already be on
+        # disk -- a real watchdog kill grants no grace).  The first tick only
+        # arms the clock, so the one event here is the checkpoint taken at
+        # the boundary AFTER the expensive definition -- the valuable one.
+        c.goals(f, 1, 0)
+        assert c.wait_vof_saved(1, timeout=15)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if vc.load_mode(f, str(tmp_path)) is not None:
+                break
+            time.sleep(0.05)
+        c.force_kill()
+        c.stop()
+        assert vc.load_mode(f, str(tmp_path)) == "exact"
+
+        c2 = LspChecker(workspace=str(tmp_path))
+        t = time.monotonic()
+        r2 = c2.check_up_to(f, _tail_line(2), 0, workspace=str(tmp_path))
+        recovery = time.monotonic() - t
+        c2.stop()
+        assert r2["success"] is True
+        assert recovery < first / 2, (
+            f"recovery took {recovery:.2f}s, not < half of the first check's "
+            f"{first:.2f}s -- the periodic checkpoint was not used"
+        )
+
+
+# ---------------------------------------------------------------------------
+# vof_cache unit tests (no coq-lsp needed)
+# ---------------------------------------------------------------------------
+
+
+class TestLoadModeUnit:
+    def _fake(self, tmp_path, content="Theorem t : True.\n", **meta_over):
+        import json
+
+        f = tmp_path / "U.v"
+        f.write_text(content)
+        resolved = str(f.resolve())
+        Path(vc.vof_path(resolved)).write_bytes(b"fake")
+        meta = {
+            "content_sha": vc._file_sha(resolved),
+            "content_md5": vc._file_md5(resolved),
+            "toolchain": vc.toolchain_id(),
+            "deps": vc._dep_fingerprint(resolved, str(tmp_path)),
+            "version": 3,
+            "partial": False,
+        }
+        meta.update(meta_over)
+        Path(vc._meta_path(resolved)).write_text(json.dumps(meta))
+        return resolved
+
+    def test_exact_and_stale_and_none(self, tmp_path):
+        r = self._fake(tmp_path)
+        assert vc.load_mode(r, str(tmp_path)) == "exact"
+        assert vc.load_mode(r, str(tmp_path), "Theorem u : True.\n") == "stale"
+        assert (
+            vc.load_mode(self._fake(tmp_path, toolchain="x:0:0"), str(tmp_path))
+            is None
+        )
+
+    def test_md5_only_meta_matches(self, tmp_path):
+        """An async-checkpoint sidecar carries only the md5 id."""
+        r = self._fake(tmp_path)
+        import json
+
+        meta = json.loads(Path(vc._meta_path(r)).read_text())
+        del meta["content_sha"]
+        meta["partial"] = True
+        Path(vc._meta_path(r)).write_text(json.dumps(meta))
+        assert vc.load_mode(r, str(tmp_path)) == "exact"
+        assert vc.is_valid(r, str(tmp_path)) is False  # partial
+
+    def test_partial_never_satisfies_is_valid(self, tmp_path):
+        r = self._fake(tmp_path, partial=True)
+        assert vc.load_mode(r, str(tmp_path)) == "exact"
+        assert vc.is_valid(r, str(tmp_path)) is False
+
+    def test_record_snapshot_writes_partial_md5_meta(self, tmp_path):
+        f = tmp_path / "S.v"
+        f.write_text("x")
+        resolved = str(f.resolve())
+        vc.record_snapshot(
+            resolved, str(tmp_path), version=7, content_md5="abc"
+        )
+        meta = vc._read_meta(resolved)  # no .vof file yet -> None
+        assert meta is None
+        Path(vc.vof_path(resolved)).write_bytes(b"fake")
+        meta = vc._read_meta(resolved)
+        assert meta == {
+            "content_md5": "abc",
+            "toolchain": vc.toolchain_id(),
+            "deps": vc._dep_fingerprint(resolved, str(tmp_path)),
+            "version": 7,
+            "partial": True,
+        }

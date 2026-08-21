@@ -122,6 +122,32 @@ By default a snapshot is saved only for a **clean** check: a file with errors st
 
 It is a latency win, not a memory one (the reload restores the full state). It helps only when the file **and its dependencies** are unchanged; editing the file or rebuilding a dependency `.vo` invalidates the snapshot, and the next full check re-saves a fresh one. A still-valid snapshot is **not re-marshaled** on subsequent clean checks (the response carries `vof_reused: true`): marshaling the whole document transiently costs ~1.07× the session's RSS (measured +6.7 GB on a 6.3 GB VST document), so gratuitous re-saves are the single most expensive memory event a session can repeat. On the `genproof/rocq-lsp` fork the marshal additionally runs in a **forked child** of coq-lsp (copy-on-write, written to `<file>.vof.tmp` and renamed atomically): under real memory pressure the kernel's OOM killer takes the child, the response reports `vof_saved: false` with the signal in `vof_error`, and the warm session — with the check verdict it just produced — survives.
 
+### Periodic checkpoints & partial / stale loading
+
+Three extensions turn the cache from a "clean full check" artifact into a **crash-recovery
+checkpoint**:
+
+- **Periodic asynchronous checkpoints** (`ROCQ_VOF_CHECKPOINT_S`, default 300 s, `0`
+  disables): while a document is being *checked*, coq-lsp forks a child every N seconds
+  that marshals the **partial** document — `Stopped` at the current frontier — to
+  `<file>.vof`, and keeps elaborating while the child writes (the fork's copy-on-write
+  snapshot is consistent by construction; the only pause is the fork itself). The outcome
+  arrives as a `$/coq/vofSaved` notification, on which the server records the sidecar. A
+  non-cooperative divergence that forces a watchdog kill therefore costs at most the work
+  since the last checkpoint, not the whole prefix.
+- **Partial snapshots load and resume**: `coq/saveVof` also accepts a `Stopped` document
+  (e.g. a positioned check's prefix), reported as `partial` in the response and the
+  sidecar. Loading one restores the prefix; the next request past its frontier resumes
+  checking from there. A partial snapshot never satisfies the save-skip check, so a later
+  clean full check re-saves a full one.
+- **Stale loading (edited file)**: a snapshot whose *content* no longer matches is still
+  loaded when the toolchain and every dependency `.vo` are unchanged — the server reloads
+  it and immediately sends a `didChange` with the current text, so Flèche retains every
+  node before the first textual difference and re-elaborates only from there. An edit near
+  the bottom of a heavy file keeps almost the entire elaborated prefix; a changed
+  dependency or toolchain still invalidates the snapshot outright (the marshaled states
+  embed the old library).
+
 **Requirements & notes:**
 - Requires a coq-lsp build exposing the `coq/saveVof` / `coq/loadVof` methods (the [`genproof/rocq-lsp`](https://github.com/genproof/rocq-lsp) fork). On a stock coq-lsp the save silently no-ops and every other tool still works.
 - `.vof` / `.vof.meta` are toolchain-locked binary caches (invalid after any coq-lsp / Coq / plugin rebuild) — add `*.vof` and `*.vof.meta` to `.gitignore`; never commit them.
@@ -141,6 +167,7 @@ It is a latency win, not a memory one (the reload restores the full state). It h
 | `ROCQ_MAX_LSP_RSS_MB` | `min(50% of system RAM, 16384)` | Maximum coq-lsp subprocess RSS (MB). On breach the call aborts; response includes `reason: "memory_exhausted"` and `lsp_restarted: True`. Exempt while the checking frontier is parked on a proof-closing command (`Qed` / `Defined` / …): kernel verification of a deep proof term may legitimately exceed the cap, so — like the sentence-timeout and stall exemptions — a long `Qed` is never killed for memory; only `ROCQ_HARD_TIMEOUT` (if set) bounds it. The cap re-arms as soon as the frontier moves past the `Qed`. |
 | `ROCQ_LSP_TRIM_RSS_MB` | `½ × ROCQ_MAX_LSP_RSS_MB` | Soft cap: above it, a successful check sends `coq/trimCaches` to free coq-lsp's memo tables without killing it. Set to `0` to disable. |
 | `ROCQ_VOF_CACHE` | `1` | Enable the [`.vof` warm-start cache](#warm-start-cache-vof). After a full file check the document's coq-lsp state is saved as `<file>.vof` (+ `<file>.vof.meta`) and a later *fresh* session reloads it via `coq/loadVof` instead of re-checking. Set to `0` to disable (no `.vof` written or read). Requires the `coq/saveVof` / `coq/loadVof` methods (the `genproof/rocq-lsp` fork); on stock coq-lsp saving silently no-ops. |
+| `ROCQ_VOF_CHECKPOINT_S` | `300` | Interval (seconds) between [periodic asynchronous `.vof` checkpoints](#periodic-checkpoints--partial--stale-loading) of the document being checked. Each checkpoint is a *partial* snapshot (`Stopped` at the frontier) marshaled by a forked child while elaboration continues; the outcome arrives as `$/coq/vofSaved` and the server records the sidecar. `0` disables. Requires the `genproof/rocq-lsp` fork; sent with the per-check `didChangeConfiguration` (same posture as `sentence_timeout` on stock servers). Only active when `ROCQ_VOF_CACHE` is enabled. |
 | `ROCQ_VOF_SAVE_TIMEOUT` | `300` | Timeout (seconds) for the `coq/saveVof` request that writes a `.vof` snapshot — generous because marshaling a heavy document is slow (~70 s for a large VST file). |
 | `ROCQ_COQC_BINARY` | `coqc` | Path to the `coqc` binary |
 | `ROCQ_MAX_SOURCE_SIZE` | `1000000` | Maximum source size in bytes |
