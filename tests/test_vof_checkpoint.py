@@ -693,6 +693,80 @@ class TestKillRecoveryDrill:
 
 
 # ---------------------------------------------------------------------------
+# Changed-state dedupe: identical state is never re-marshaled
+# ---------------------------------------------------------------------------
+
+
+@_needs
+class TestCheckpointDedupe:
+    @pytest.mark.slow
+    def test_identical_content_version_bump_does_not_resave(
+        self, tmp_path, monkeypatch
+    ):
+        """The marshal is expensive (seconds + hundreds of MB on a heavy
+        doc), so a checkpoint must fire only when the STATE changed.  An
+        identical-content version bump (timeout-relic bump, identical
+        didChange) replays the same nodes from the memo cache: the
+        content-hash dedupe must skip it -- and must also never overwrite
+        the snapshot with a shorter mid-rebuild prefix.  Extending the file
+        (new content) must checkpoint again."""
+        monkeypatch.setattr(lsp_checker_mod, "ROCQ_VOF_CHECKPOINT_S", 0.5)
+        src = _src(args=(35, 36), tail="Theorem tail : True.\n")
+        f = _project(tmp_path, src)
+        vof = Path(f[:-2] + ".vof")
+        c = LspChecker(workspace=str(tmp_path))
+        try:
+            r = c.check_up_to(f, _tail_line(2), 0, workspace=str(tmp_path))
+            assert r["success"] is True
+            c.goals(f, 1, 0)
+            assert c.wait_vof_saved(1, timeout=15)
+            # Quiesce: later LEGITIMATE checkpoints from the same check (each
+            # sentence advance is a new state) may still be landing; sample
+            # the mtime only once events stop arriving.
+            n_events = len(c.vof_saved_events())
+            settle = time.monotonic() + 20
+            while time.monotonic() < settle:
+                c.goals(f, 1, 0)
+                time.sleep(1.0)
+                now_events = len(c.vof_saved_events())
+                if now_events == n_events:
+                    break
+                n_events = now_events
+            mtime = vof.stat().st_mtime_ns
+
+            # Identical-content version bump; the re-drive replays the same
+            # nodes from the memo cache (fast), with ticks firing throughout.
+            uri = Path(f).resolve().as_uri()
+            with c._lock:
+                c._sync_document(uri, src)
+            r = c.check_up_to(f, _tail_line(2), 0, workspace=str(tmp_path))
+            assert r["success"] is True
+            c.goals(f, 1, 0)
+            time.sleep(1.5)  # give any (wrong) checkpoint time to land
+            assert vof.stat().st_mtime_ns == mtime, (
+                "an identical-content version bump re-marshaled the snapshot"
+            )
+            assert len(c.vof_saved_events()) == n_events, c.vof_saved_events()
+
+            # NEW content past the old frontier: must checkpoint again.
+            extended = src + (
+                f"Definition d9 : bool := Eval vm_compute in (N.even (\n"
+                f"{_FIB} 36)).\nTheorem t2 : True.\n"
+            )
+            Path(f).write_text(extended)
+            r = c.check_up_to(
+                f, _tail_line(2) + 3, 0, workspace=str(tmp_path)
+            )
+            assert r["success"] is True
+            c.goals(f, 1, 0)
+            assert c.wait_vof_saved(n_events + 1, timeout=15), (
+                "extending the file did not produce a new checkpoint"
+            )
+        finally:
+            c.stop()
+
+
+# ---------------------------------------------------------------------------
 # The agent-loop scenarios, through the server tools
 # ---------------------------------------------------------------------------
 
