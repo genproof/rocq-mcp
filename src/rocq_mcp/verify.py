@@ -930,6 +930,29 @@ def _parse_assumptions_raw(stdout: str) -> list[tuple[str, str]]:
     """
     lines = stdout.split("\n")
 
+    # --- Drop Rocq 9's "Theory:" sections ---
+    # Rocq 9's Print Assumptions can emit a "Theory:" section listing
+    # typing-theory facts in force ("Set is impredicative", "Definitional
+    # UIP", ...).  Those are flags of the ambient theory, not axioms the
+    # proof depends on; left in place, the section header and its entries
+    # fall through the name-parsing heuristics below as fake assumptions
+    # ("Theory: : ").  8.20 never prints the section, so this is a no-op
+    # there.  The raw output (returned alongside) still shows the section.
+    cleaned: list[str] = []
+    in_theory = False
+    for _line in lines:
+        _s = _line.strip()
+        if _s == "Theory:":
+            in_theory = True
+            continue
+        if in_theory:
+            if _s == "Axioms:" or _s == "Closed under the global context":
+                in_theory = False  # fall through: keep this marker line
+            else:
+                continue
+        cleaned.append(_line)
+    lines = cleaned
+
     # --- Find the LAST Print Assumptions output marker ---
     # Markers are "Closed under the global context" or "Axioms:".
     # We parse from the last marker to ignore any injected output from

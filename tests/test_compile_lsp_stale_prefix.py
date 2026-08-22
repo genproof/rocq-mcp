@@ -51,7 +51,9 @@ import rocq_mcp.server as _server
 from tests.conftest import make_lifespan_state, stop_all_checkers
 
 COQLSP = shutil.which("coq-lsp") is not None
-COQC = shutil.which(getattr(_server, "ROCQ_COQC_BINARY", "coqc") or "coqc")
+COQC = shutil.which(
+    getattr(_server, "ROCQ_COQC_BINARY", "coqc") or "coqc"
+) or shutil.which("rocq")
 _needs = pytest.mark.skipif(
     not (COQLSP and COQC), reason="needs both coq-lsp and coqc"
 )

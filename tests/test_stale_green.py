@@ -31,8 +31,10 @@ from rocq_mcp.staleness import (
 from tests.conftest import make_lifespan_state, stop_all_checkers
 
 COQLSP = shutil.which("coq-lsp") is not None
-COQC = shutil.which(getattr(_server, "ROCQ_COQC_BINARY", "coqc") or "coqc")
-COQDEP = shutil.which(ROCQ_COQDEP_BINARY)
+COQC = shutil.which(
+    getattr(_server, "ROCQ_COQC_BINARY", "coqc") or "coqc"
+) or shutil.which("rocq")
+COQDEP = shutil.which(ROCQ_COQDEP_BINARY) or shutil.which("rocq")
 _needs_lsp = pytest.mark.skipif(
     not (COQLSP and COQC), reason="needs both coq-lsp and coqc"
 )
@@ -75,8 +77,10 @@ class _Ctx:
 
 
 def _coqc(ws: Path, name: str) -> subprocess.CompletedProcess:
+    from rocq_mcp.server import coqc_argv
+
     return subprocess.run(
-        [COQC, "-R", ".", "Top", f"{name}.v"],
+        [*coqc_argv(), "-R", ".", "Top", f"{name}.v"],
         cwd=str(ws), capture_output=True, text=True,
     )
 

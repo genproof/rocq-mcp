@@ -72,7 +72,7 @@ def _run_coqc_process(file_path: str, workspace: Path, timeout: int) -> dict[str
     try:
         proc = subprocess.Popen(
             [
-                _server.ROCQ_COQC_BINARY,
+                *_server.coqc_argv(),
                 *_server._parse_project_flags(workspace),
                 file_path,
             ],

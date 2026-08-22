@@ -14,7 +14,12 @@ import rocq_mcp.server  # noqa: F401
 # Availability flags
 # ---------------------------------------------------------------------------
 
-COQC_AVAILABLE: bool = shutil.which("coqc") is not None
+# coqc exists on Coq <= 8.20; Rocq 9's opam packages install only the
+# unified `rocq` binary (the tools resolve to `rocq compile` there -- see
+# server.coqc_argv), so either name means the batch tools are usable.
+COQC_AVAILABLE: bool = (
+    (shutil.which("coqc") is not None or shutil.which("rocq") is not None) or shutil.which("rocq") is not None
+)
 PET_AVAILABLE: bool = shutil.which("pet") is not None
 COQLSP_AVAILABLE: bool = shutil.which("coq-lsp") is not None
 

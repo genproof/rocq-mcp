@@ -18,8 +18,12 @@ import rocq_mcp.server as _server
 import rocq_mcp.staleness as staleness
 from tests.conftest import make_lifespan_state
 
-COQC_AVAILABLE = shutil.which("coqc") is not None
-COQDEP_AVAILABLE = shutil.which("coqdep") is not None
+COQC_AVAILABLE = (
+    shutil.which("coqc") is not None or shutil.which("rocq") is not None
+)
+COQDEP_AVAILABLE = (
+    shutil.which("coqdep") is not None or shutil.which("rocq") is not None
+)
 _needs_coq = pytest.mark.skipif(
     not (COQC_AVAILABLE and COQDEP_AVAILABLE),
     reason="coqc/coqdep not available",
@@ -197,7 +201,7 @@ class TestRealCoqdep:
         import subprocess
 
         subprocess.run(
-            ["coqc", "-R", ".", "Top", "Bar.v"], cwd=str(tmp_path), check=True
+            [*__import__("rocq_mcp.server", fromlist=["coqc_argv"]).coqc_argv(), "-R", ".", "Top", "Bar.v"], cwd=str(tmp_path), check=True
         )
         # coqdep should list Bar.vo; freshly built -> no warning.
         deps = staleness._dependency_vo_files(
@@ -211,7 +215,7 @@ class TestRealCoqdep:
         import subprocess
 
         subprocess.run(
-            ["coqc", "-R", ".", "Top", "Bar.v"], cwd=str(tmp_path), check=True
+            [*__import__("rocq_mcp.server", fromlist=["coqc_argv"]).coqc_argv(), "-R", ".", "Top", "Bar.v"], cwd=str(tmp_path), check=True
         )
         # Make Bar.v newer than Bar.vo.
         future = time.time() + 10

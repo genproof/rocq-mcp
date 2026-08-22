@@ -85,7 +85,13 @@ def _dependency_vo_files(resolved_file: str, workspace: str) -> list[str]:
         flags = _coqdep_loadpath_flags(_server._parse_project_flags(ws))
     except Exception:
         return []
-    cmd = [ROCQ_COQDEP_BINARY, *flags, resolved_file]
+    from rocq_mcp.server import _resolve_tool_argv
+
+    cmd = [
+        *_resolve_tool_argv(ROCQ_COQDEP_BINARY, "coqdep", "dep"),
+        *flags,
+        resolved_file,
+    ]
     try:
         proc = subprocess.run(
             cmd,

@@ -1160,3 +1160,25 @@ class TestCollectTocNames:
         toc = [("x", [_e("x", 2)])]
         names = _collect_toc_names(toc, source=source)
         assert names == ["Real.x"]
+
+
+class TestRocq9TheorySection:
+    """Rocq 9's Print Assumptions emits a "Theory:" section for ambient
+    typing-theory facts (e.g. under -impredicative-set).  They are not
+    axioms and must not surface as (mangled) assumptions."""
+
+    def test_theory_only_output_is_closed(self):
+        from rocq_mcp.verify import _parse_assumptions_raw
+
+        out = "Theory:\nSet is impredicative"
+        assert _parse_assumptions_raw(out) == []
+
+    def test_theory_section_before_axioms_is_dropped(self):
+        from rocq_mcp.verify import _parse_assumptions_raw
+
+        out = (
+            "Theory:\nSet is impredicative\nDefinitional UIP\n"
+            "Axioms:\nclassic : forall P : Prop, P \\/ ~ P"
+        )
+        parsed = _parse_assumptions_raw(out)
+        assert [n for n, _ in parsed] == ["classic"]

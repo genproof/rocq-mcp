@@ -84,6 +84,32 @@ ROCQ_HARD_TIMEOUT: float = float(os.environ.get("ROCQ_HARD_TIMEOUT", "0"))
 # watchdog exempts it too).
 ROCQ_PROGRESS_GRACE: float = float(os.environ.get("ROCQ_PROGRESS_GRACE", "120"))
 ROCQ_COQC_BINARY: str = os.environ.get("ROCQ_COQC_BINARY", "coqc")
+
+
+def _resolve_tool_argv(env_value: str, legacy: str, rocq_sub: str) -> list[str]:
+    """Argv for a Coq batch tool, Rocq-9-aware.
+
+    Rocq 9's opam packages install only the unified ``rocq`` binary -- no
+    ``coqc`` / ``coqdep`` shims -- so when the legacy name is absent but
+    ``rocq`` is present, fall back to ``rocq <subcommand>``.  An explicit
+    env override wins and may be multi-word (``ROCQ_COQC_BINARY="rocq
+    compile"``), split with shlex.
+    """
+    import shlex
+    import shutil as _shutil
+
+    if env_value != legacy:  # explicitly overridden
+        return shlex.split(env_value)
+    if _shutil.which(legacy):
+        return [legacy]
+    if _shutil.which("rocq"):
+        return ["rocq", rocq_sub]
+    return [legacy]  # let the subprocess error name the missing binary
+
+
+def coqc_argv() -> list[str]:
+    """Argv prefix for batch compilation (``coqc`` or ``rocq compile``)."""
+    return _resolve_tool_argv(ROCQ_COQC_BINARY, "coqc", "compile")
 ROCQ_MAX_SOURCE_SIZE: int = int(os.environ.get("ROCQ_MAX_SOURCE_SIZE", "1000000"))
 # Max characters per rendered term in the structured goal output of the
 # goals-driven tools (rocq_get_state / rocq_step / rocq_step_multi) -- each
