@@ -82,6 +82,19 @@ _VOF_SAVE_TIMEOUT: float = float(os.environ.get("ROCQ_VOF_SAVE_TIMEOUT", "300"))
 # the initialize-time settings in force).
 ROCQ_VOF_CHECKPOINT_S: float = float(os.environ.get("ROCQ_VOF_CHECKPOINT_S", "300"))
 
+# Wall-clock budget (seconds) for PROOF-CLOSING sentences (Qed / Defined /
+# Save / Admitted).  Those are exempt from ROCQ_SENTENCE_TIMEOUT -- their
+# cost is honest kernel verification, not a tactic that might diverge -- but
+# a fully unbounded exemption lets one pathological Qed wedge a session
+# forever (previously only ROCQ_HARD_TIMEOUT, default off, bounded it).
+# Enforced at BOTH layers: coq-lsp re-arms its per-sentence watchdog with
+# this budget for proof-closing sentences (cooperative abort, reported as a
+# self-identifying "rocq-lsp: sentence timeout ... qed_timeout" error), and
+# the MCP-side stall watchdog's Qed exemption EXPIRES after this budget +
+# ROCQ_PROGRESS_GRACE (kill + restart, recoverable from the periodic
+# checkpoint).  0 disables both, restoring the unbounded exemption.
+ROCQ_QED_TIMEOUT: float = float(os.environ.get("ROCQ_QED_TIMEOUT", "600"))
+
 # Version baseline for a reloaded ``.vof`` whose sidecar predates the recorded
 # save-time version (no ``version`` field).  coq-lsp ignores a didChange whose
 # version is not strictly greater than the reloaded snapshot's, so we start
@@ -1535,6 +1548,11 @@ class LspChecker:
 
         if ROCQ_VOF_CHECKPOINT_S > 0 and _vc.enabled():
             settings["vof_checkpoint_interval"] = ROCQ_VOF_CHECKPOINT_S
+        # Bound proof-closing sentences with their own budget (see
+        # ROCQ_QED_TIMEOUT above); same stock-server posture as
+        # sentence_timeout.
+        if ROCQ_QED_TIMEOUT > 0:
+            settings["qed_timeout"] = ROCQ_QED_TIMEOUT
         self._notify(
             "workspace/didChangeConfiguration", {"settings": settings}
         )

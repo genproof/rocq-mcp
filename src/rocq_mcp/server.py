@@ -1675,6 +1675,23 @@ async def _memory_watchdog(
                             _extract_sentence(stall_path, prog[1], prog[2])
                         )
                     )
+                    if exempt:
+                        # The exemption is BOUNDED: past ROCQ_QED_TIMEOUT (+
+                        # grace for the coq-side abort to land first), even a
+                        # proof-closing sentence is killed -- an unbounded
+                        # exemption let one pathological Qed wedge the session
+                        # forever.  last_activity is when the frontier reached
+                        # the Qed (published before elaboration), so this is
+                        # the Qed's own wall-clock.  ROCQ_QED_TIMEOUT=0
+                        # restores the unbounded exemption.
+                        from rocq_mcp.lsp_checker import ROCQ_QED_TIMEOUT
+
+                        if (
+                            ROCQ_QED_TIMEOUT > 0
+                            and time.monotonic() - last_activity
+                            > ROCQ_QED_TIMEOUT + ROCQ_PROGRESS_GRACE
+                        ):
+                            exempt = False
                     if not exempt:
                         if frontier_event is not None:
                             frontier_event.set()
